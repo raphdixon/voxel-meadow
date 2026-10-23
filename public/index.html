@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Voxel Meadow — Add One Thing to Our Living World</title>
+    <meta
+      name="description"
+      content="Drop an image or describe anything to sculpt a detailed 3D voxel miniature with Argon, then place your one creation into a sunlit, ever-growing grass world."
+    />
+    <meta name="theme-color" content="#ffffff" />
+
+    <!-- Favicons & App Icons -->
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+
+    <!-- Open Graph / Apple Messages / WhatsApp / Discord -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Voxel Meadow" />
+    <meta property="og:locale" content="en_US" />
+    <meta property="og:url" content="https://voxel-meadow.raphaeldixon.workers.dev/" />
+    <meta property="og:title" content="Voxel Meadow — Add One Thing to Our Living World" />
+    <meta
+      property="og:description"
+      content="Upload a photo or describe anything to sculpt an intricate 3D voxel creation and watch it come alive in a shared sunlit meadow."
+    />
+    <meta property="og:image" content="https://voxel-meadow.raphaeldixon.workers.dev/og-vertical.jpg" />
+    <meta property="og:image:type" content="image/jpeg" />
+    <meta property="og:image:width" content="768" />
+    <meta property="og:image:height" content="1376" />
+    <meta property="og:image:alt" content="A sunlit green voxel meadow with a yellow school bus, windmill bakery, and walking villagers" />
+
+    <meta property="og:image" content="https://voxel-meadow.raphaeldixon.workers.dev/og-square.jpg" />
+    <meta property="og:image:type" content="image/jpeg" />
+    <meta property="og:image:width" content="1024" />
+    <meta property="og:image:height" content="1024" />
+    <meta property="og:image:alt" content="Voxel Meadow shared 3D voxel world" />
+
+    <meta property="og:image" content="https://voxel-meadow.raphaeldixon.workers.dev/og-image.jpg" />
+    <meta property="og:image:type" content="image/jpeg" />
+    <meta property="og:image:width" content="1376" />
+    <meta property="og:image:height" content="768" />
+    <meta property="og:image:alt" content="Panoramic sunlit voxel grass world" />
+
+    <!-- X / Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Voxel Meadow — Add One Thing to Our Living World" />
+    <meta
+      name="twitter:description"
+      content="Upload a photo or describe anything to sculpt an intricate 3D voxel creation and watch it come alive in a shared sunlit meadow."
+    />
+    <meta name="twitter:image" content="https://voxel-meadow.raphaeldixon.workers.dev/og-image.jpg" />
+    <meta name="twitter:image:alt" content="Sunlit 3D voxel meadow with animated creations" />
+
+    <!-- Apple Web App -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Voxel Meadow" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <!-- Endless Animated Sunlit Grass Voxel Canvas -->
+    <canvas id="world-canvas" aria-label="Shared animated 3D voxel grass world"></canvas>
+
+    <!-- Whisper-quiet hover nameplate on creations in the meadow -->
+    <div id="hover-card" class="hover-card" hidden>
+      <div id="hover-name" class="hover-name"></div>
+      <div id="hover-status" class="hover-status"></div>
+    </div>
+
+    <!-- Placement spot-picker hint banner (only visible while choosing an exact patch of grass) -->
+    <div id="placement-banner" class="placement-banner" hidden>
+      <span>Click a sunny patch of grass to place <strong id="placement-target-name"></strong></span>
+      <button type="button" id="cancel-spot-btn" class="text-btn">Back</button>
+    </div>
+
+    <!-- Quiet transient note when Argon weaves new life into the world -->
+    <div id="weave-toast" class="weave-toast" role="status" aria-live="polite" hidden></div>
+
+    <!-- Single minimal floating pill when modal is closed -->
+    <div class="bottom-dock">
+      <button
+        type="button"
+        id="open-create-btn"
+        class="dock-pill"
+        commandfor="create-modal"
+        command="showModal"
+      >
+        + Add your one thing
+      </button>
+      <button type="button" id="locate-mine-btn" class="dock-pill dock-pill-placed" hidden>
+        <span class="live-dot" aria-hidden="true"></span>
+        <span id="locate-mine-label">Locate yours</span>
+      </button>
+    </div>
+
+    <!-- Pure White Creation Modal floating in front of the live animated meadow -->
+    <dialog id="create-modal" class="create-modal" closedby="any" aria-labelledby="modal-title">
+      <div class="modal-card">
+        <button
+          type="button"
+          id="close-modal-btn"
+          class="modal-close"
+          commandfor="create-modal"
+          command="close"
+          aria-label="Close and explore the world"
+          title="Close and scroll around the world"
+        >
+          &times;
+        </button>
+
+        <!-- Step 1: Compose (Image Upload and/or Description) -->
+        <section id="step-compose" class="modal-step">
+          <h1 id="modal-title" class="modal-title">Add one thing to the meadow</h1>
+          <p class="modal-subtitle">
+            Drop an image to extract something, or describe anything. Once placed, it comes alive forever.
+          </p>
+
+          <label id="drop-zone" class="drop-zone" for="image-input">
+            <input id="image-input" type="file" accept="image/*" hidden />
+            <div id="drop-empty" class="drop-empty">
+              <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                <rect x="3" y="4" width="18" height="16" rx="3" />
+                <circle cx="8.5" cy="9.5" r="1.5" />
+                <path d="M21 15l-4.5-4.5L9 18" />
+              </svg>
+              <span>Drop an image or click to upload</span>
+            </div>
+            <div id="drop-preview-wrap" class="drop-preview-wrap" hidden>
+              <img id="drop-preview-img" alt="Selected subject preview" />
+              <button type="button" id="clear-image-btn" class="clear-img-btn" aria-label="Remove image">
+                &times;
+              </button>
+            </div>
+          </label>
+
+          <div class="prompt-wrap">
+            <textarea
+              id="prompt-input"
+              rows="2"
+              maxlength="480"
+              placeholder="Or describe something — a yellow school bus, ramen cart, golden retriever..."
+              aria-label="Describe what to sculpt in voxels"
+            ></textarea>
+          </div>
+
+          <p id="form-error" class="form-error" role="alert" hidden></p>
+
+          <button type="button" id="sculpt-btn" class="primary-btn">
+            <span id="sculpt-btn-label">Create voxel version</span>
+          </button>
+        </section>
+
+        <!-- Step 2: Pure White 3D Voxel Turntable Preview & Permanent Placement -->
+        <section id="step-preview" class="modal-step" hidden>
+          <div class="preview-stage-wrap">
+            <canvas id="preview-canvas" aria-label="3D voxel preview"></canvas>
+            <span class="spin-hint">Drag to turn</span>
+          </div>
+
+          <div class="preview-meta">
+            <h2 id="preview-title" class="preview-title"></h2>
+            <p id="preview-desc" class="preview-desc"></p>
+          </div>
+
+          <p id="place-error" class="form-error" role="alert" hidden></p>
+
+          <div class="preview-actions">
+            <button type="button" id="back-compose-btn" class="secondary-btn">Try another</button>
+            <button type="button" id="pick-spot-btn" class="secondary-btn">Pick spot</button>
+            <button type="button" id="place-now-btn" class="primary-btn">Place in world</button>
+          </div>
+          <p class="permanent-note">Each visitor places one permanent creation — once placed, it cannot be edited.</p>
+        </section>
+      </div>
+    </dialog>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,18 @@
+node_modules/
+.wrangler/
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+.DS_Store
+dist/
+*.log
+# --- github-sync defaults ---
+!.env.example
+.firebase/
+__pycache__/
+.venv/
+venv/
+*.pem
+*.key
+service-account*.json

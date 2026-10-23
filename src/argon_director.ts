@@ -119,13 +119,13 @@ export function buildInitialIntegration(
       { id: shortId("stop"), name: `${target.name} Meadow Stop`, x: stopB[0], z: stopB[1], dwellSec: 3.8 },
     ];
     newPaths.push({
-      id: shortId("road"),
+      id: `initroad-${target.id}`,
       kind: "road",
       points: rawPts,
       closed: true,
     });
     newProps.push({
-      id: shortId("prop-stop"),
+      id: `initstop-${target.id}`,
       kind: "bus_stop",
       x: Number((stopA[0] + 2.6).toFixed(1)),
       z: Number((stopA[1] + 2.2).toFixed(1)),
@@ -134,7 +134,7 @@ export function buildInitialIntegration(
     });
     newVillagers.push({
       id: shortId("villager"),
-      name: "omi",
+      name: "Omi",
       role: "commuter",
       hatColor: "#f5b82e",
       shirtColor: "#47b0a3",

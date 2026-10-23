@@ -280,6 +280,7 @@ export class WorldDO extends DurableObject<Env> {
 
   private applyWorldPatch(patch: WorldPatch): void {
     const sql = this.ctx.storage.sql;
+    const hasCustomRoad = patch.newPaths.some((p) => p.kind === "road");
 
     for (const upd of patch.updatedBehaviors) {
       const rows = sql.exec(`SELECT json FROM creations WHERE id = ?`, upd.creationId).toArray();
@@ -291,6 +292,12 @@ export class WorldDO extends DurableObject<Env> {
       }
       if (typeof upd.integratedLevel === "number") {
         existing.integratedLevel = Math.max(existing.integratedLevel, upd.integratedLevel);
+      }
+      if ((upd.integratedLevel ?? 0) >= 2 && (hasCustomRoad || upd.behavior.type === "vehicle_route")) {
+        sql.exec(`DELETE FROM paths WHERE id = ?`, `initroad-${upd.creationId}`);
+        if (patch.newProps.some((pr) => pr.kind === "bus_stop")) {
+          sql.exec(`DELETE FROM props WHERE id = ?`, `initstop-${upd.creationId}`);
+        }
       }
       sql.exec(
         `UPDATE creations SET integrated_level = ?, json = ? WHERE id = ?`,

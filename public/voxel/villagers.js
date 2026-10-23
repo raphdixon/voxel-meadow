@@ -115,7 +115,8 @@ export class VillagerAgent {
     this.data = data;
   }
 
-  step(dt, t, activeVehicles) {
+  step(dt, t, activeVehicles, ponds = []) {
+    this.ponds = ponds;
     const stops = this.data.stops && this.data.stops.length >= 2 ? this.data.stops : [[this.x, this.z], [0, -16]];
     let movingSpeed = 0;
 
@@ -256,6 +257,16 @@ export class VillagerAgent {
     const stepLen = Math.min(dist, speed * dt);
     this.x += (dx / dist) * stepLen;
     this.z += (dz / dist) * stepLen;
+    for (const pond of this.ponds || []) {
+      const pr = (pond.radius || 6.4) + 0.85;
+      const pdx = this.x - pond.x;
+      const pdz = this.z - pond.z;
+      const pd = Math.hypot(pdx, pdz);
+      if (pd < pr && pd > 0.01) {
+        this.x = pond.x + (pdx / pd) * pr;
+        this.z = pond.z + (pdz / pd) * pr;
+      }
+    }
     const targetYaw = Math.atan2(dx, dz);
     let diff = targetYaw - this.yaw;
     while (diff > Math.PI) diff -= Math.PI * 2;

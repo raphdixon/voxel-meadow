@@ -187,7 +187,7 @@ const SCULPTOR_SYSTEM_PROMPT = `You are Master Voxel Sculptor Argon, creating br
   "safe": true,
   "extractedSubject": "concise phrase of what was extracted/sculpted",
   "name": "Charming 2-4 Word Title",
-  "description": "Warm 1-sentence visual description",
+  "description": "Warm, concise 1-sentence visual description (under 125 characters)",
   "category": "vehicle" | "creature" | "building" | "prop" | "aircraft" | "watercraft",
   "scaleClass": "small" | "medium" | "large",
   "palette": { "body": "#...", "bodyShade": "#...", "trim": "#...", "accent": "#...", "glass": "#...", "glow": "#..." },

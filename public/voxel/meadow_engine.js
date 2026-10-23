@@ -118,15 +118,21 @@ function buildEndlessGrassMaterial(uniforms) {
 
 function buildRibbonMesh(curve, sampleCount, halfWidth, yOffset, colorHex, receiveShadow = true) {
   const pts = curve.getSpacedPoints(sampleCount);
+  const isClosed = Boolean(curve.closed);
+  const ringCount = isClosed ? pts.length - 1 : pts.length;
   const positions = [];
   const normals = [];
   const uvs = [];
   const indices = [];
 
   for (let i = 0; i < pts.length; i++) {
-    const p = pts[i];
-    const prev = pts[Math.max(0, i - 1)];
-    const next = pts[Math.min(pts.length - 1, i + 1)];
+    const p = isClosed && i === pts.length - 1 ? pts[0] : pts[i];
+    const prev = isClosed
+      ? pts[(i - 1 + ringCount) % ringCount]
+      : pts[Math.max(0, i - 1)];
+    const next = isClosed
+      ? pts[(i + 1) % ringCount]
+      : pts[Math.min(pts.length - 1, i + 1)];
     let tx = next.x - prev.x;
     let tz = next.z - prev.z;
     const len = Math.hypot(tx, tz) || 1;
@@ -261,7 +267,7 @@ class CreationSimEntity {
     }
   }
 
-  step(dt, t) {
+  step(dt, t, allEntities = [], ponds = []) {
     // Springy arrival pop when freshly placed!
     if (this.spawnScale < 1.0) {
       this.spawnScale = Math.min(1.0, this.spawnScale + dt * 3.2);
@@ -299,6 +305,24 @@ class CreationSimEntity {
               this.dwellTimer = sp.stop.dwellSec || 4.0;
               speedScale = 0;
               break;
+            }
+          }
+        }
+
+        // Polite vehicle-to-vehicle spacing & intersection yielding
+        if (speedScale > 0) {
+          const fwdX = Math.sin(this.yaw);
+          const fwdZ = Math.cos(this.yaw);
+          for (const other of allEntities) {
+            if (other === this || other.data.behavior?.type !== "vehicle_route") continue;
+            const dx = other.x - this.x;
+            const dz = other.z - this.z;
+            const dist = Math.hypot(dx, dz);
+            if (dist < 8.2 && dist > 0.01) {
+              const dot = (dx * fwdX + dz * fwdZ) / dist;
+              if (dot > 0.35 || (dot > -0.15 && this.id > other.id)) {
+                speedScale = Math.min(speedScale, Math.max(0, (dist - 5.4) / 2.8));
+              }
             }
           }
         }
@@ -352,6 +376,16 @@ class CreationSimEntity {
           const stepLen = Math.min(dist, (b.speed || 2.5) * dt);
           this.x += (dx / dist) * stepLen;
           this.z += (dz / dist) * stepLen;
+          for (const pond of ponds) {
+            const pr = (pond.radius || 6.4) + 0.9;
+            const pdx = this.x - pond.x;
+            const pdz = this.z - pond.z;
+            const pd = Math.hypot(pdx, pdz);
+            if (pd < pr && pd > 0.01) {
+              this.x = pond.x + (pdx / pd) * pr;
+              this.z = pond.z + (pdz / pd) * pr;
+            }
+          }
           this.wheelAngle += stepLen / 0.45;
           this.moveFactor = 1.0;
 
@@ -1143,9 +1177,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     pollenGeo.attributes.position.needsUpdate = true;
 
     // Step all creations & collect active transit vehicles for villager boarding
+    const allEnts = Array.from(creationEntities.values());
+    const ponds = (currentWorld?.props || []).filter((p) => p.kind === "pond");
     const activeVehicles = [];
-    for (const ent of creationEntities.values()) {
-      ent.step(dt, t);
+    for (const ent of allEnts) {
+      ent.step(dt, t, allEnts, ponds);
       if (ent.data.behavior?.type === "vehicle_route") {
         activeVehicles.push(ent);
       }
@@ -1153,7 +1189,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
 
     // Step all villagers
     for (const ag of villagerAgents.values()) {
-      ag.step(dt, t, activeVehicles);
+      ag.step(dt, t, activeVehicles, ponds);
     }
 
     // Update subtle halo under visitor's own creation

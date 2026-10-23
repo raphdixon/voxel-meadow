@@ -1067,10 +1067,15 @@ export function normalizeAndGroundBlueprint(
   const scaleClass: ScaleClass = SCALES[scaleRaw as ScaleClass] ? (scaleRaw as ScaleClass) : defaultScale;
 
   const name = typeof raw.name === "string" && raw.name.trim() ? raw.name.trim().slice(0, 48) : fallbackName;
-  const description =
+  let description =
     typeof raw.description === "string" && raw.description.trim()
-      ? raw.description.trim().slice(0, 160)
+      ? raw.description.trim()
       : `A handcrafted micro-voxel ${name.toLowerCase()}.`;
+  if (description.length > 220) {
+    const cut = description.slice(0, 217);
+    const lastSpace = cut.lastIndexOf(" ");
+    description = `${(lastSpace > 120 ? cut.slice(0, lastSpace) : cut).replace(/[,;:\s]+$/, "")}…`;
+  }
 
   return {
     version: 1,

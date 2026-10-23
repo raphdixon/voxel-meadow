@@ -86,6 +86,9 @@ function openModal() {
   hoverCard.hidden = true;
   if (!modal.open) {
     modal.showModal();
+    if (stepCompose && !stepCompose.hidden && window.innerWidth > 640) {
+      promptInput.focus({ preventScroll: true });
+    }
   }
   if (!stepPreview.hidden && draftBlueprint) {
     requestAnimationFrame(() => previewStage.syncSize());

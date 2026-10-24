@@ -114,6 +114,9 @@ function createContributorSignboard(maxAniso = 4) {
     map: tex,
     roughness: 0.56,
     metalness: 0.04,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1,
   });
 
   const frontPlaque = new THREE.Mesh(plaqueGeo, plaqueMat);
@@ -194,9 +197,12 @@ function buildPlotMarkerGroup() {
     transparent: true,
     opacity: 0.92,
     side: THREE.DoubleSide,
+    polygonOffset: true,
+    polygonOffsetFactor: -4,
+    polygonOffsetUnits: -4,
   });
   const ring = new THREE.Mesh(ringGeo, ringMat);
-  ring.position.y = 0.11;
+  ring.position.y = 0.122;
   group.add(ring);
 
   // 4 chunky voxel corner stakes (oak + brass cap)
@@ -281,6 +287,9 @@ function buildEndlessGrassMaterial(uniforms) {
     roughness: 0.88,
     metalness: 0.0,
     dithering: true,
+    polygonOffset: true,
+    polygonOffsetFactor: 2,
+    polygonOffsetUnits: 2,
   });
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.uTime = uniforms.uTime;
@@ -377,7 +386,15 @@ function buildEndlessGrassMaterial(uniforms) {
   return mat;
 }
 
-function buildRibbonMesh(curve, sampleCount, halfWidth, yOffset, colorHex, receiveShadow = true) {
+function buildRibbonMesh(
+  curve,
+  sampleCount,
+  halfWidth,
+  yOffset,
+  colorHex,
+  receiveShadow = true,
+  polyOffset = -1,
+) {
   const pts = curve.getSpacedPoints(sampleCount);
   const isClosed = Boolean(curve.closed);
   const ringCount = isClosed ? pts.length - 1 : pts.length;
@@ -463,7 +480,8 @@ function buildRibbonMesh(curve, sampleCount, halfWidth, yOffset, colorHex, recei
     roughness: 0.86,
     metalness: 0.02,
     polygonOffset: true,
-    polygonOffsetFactor: -1,
+    polygonOffsetFactor: polyOffset,
+    polygonOffsetUnits: polyOffset * 1.5,
   });
   const mesh = new THREE.Mesh(geo, mat);
   mesh.receiveShadow = receiveShadow;
@@ -500,17 +518,28 @@ function buildMeadowBushMesh(variant = 0) {
   return buildVoxelMesh(v, { scale: 0.24 });
 }
 
+function computeBlueprintSignature(bp) {
+  if (!bp) return "";
+  const opsSig = (bp.ops || []).length;
+  const partsSig = (bp.parts || [])
+    .map((p) => `${p.name}:${(p.pivot || []).join(",")}:${(p.ops || []).length}`)
+    .join("|");
+  return `${opsSig}#${partsSig}`;
+}
+
 class CreationSimEntity {
   constructor(creation, index = 0) {
     this.id = creation.id;
+    this.index = index;
     this.data = creation;
+    this.blueprintSig = computeBlueprintSignature(creation.blueprint);
     this.group = buildCreationGroup(creation.blueprint, {
       seed: 17 + index * 13,
       useWorldScale: true,
     });
 
     this.x = creation.x;
-    this.y = 0;
+    this.y = 0.004;
     this.z = creation.z;
     this.yaw = creation.yaw || 0;
     this.wheelAngle = 0;
@@ -584,8 +613,31 @@ class CreationSimEntity {
     }
   }
 
-  rebuildBehavior(creation) {
+  rebuildBehavior(creation, creationsGroup = null) {
     this.data = creation;
+    const nextSig = computeBlueprintSignature(creation.blueprint);
+    if (creationsGroup && nextSig && nextSig !== this.blueprintSig) {
+      // Live hot-swap when the orchestrator auto-repairs a creation's blueprint!
+      this.blueprintSig = nextSig;
+      if (this.feedMesh) {
+        this.group.remove(this.feedMesh);
+      }
+      creationsGroup.remove(this.group);
+      this.group.userData.dispose?.();
+      this.group = buildCreationGroup(creation.blueprint, {
+        seed: 17 + this.index * 13,
+        useWorldScale: true,
+      });
+      const worldUnit = creation.scaleClass === "large" ? 0.34 : creation.scaleClass === "medium" ? 0.24 : 0.18;
+      this.topY = Math.max(2.2, (creation.blueprint?.stats?.maxY || 14) * worldUnit);
+      if (this.feedMesh) {
+        this.feedMesh.position.set(0, this.topY + 1.15, 0);
+        this.group.add(this.feedMesh);
+      }
+      this.group.position.set(this.x, this.y, this.z);
+      this.group.rotation.y = this.yaw;
+      creationsGroup.add(this.group);
+    }
     const b = creation.behavior;
     if (b?.type === "vehicle_route" && Array.isArray(b.waypoints) && b.waypoints.length >= 3) {
       const vecs = b.waypoints.map(([wx, wz]) => new THREE.Vector3(wx, 0, wz));
@@ -785,7 +837,7 @@ class CreationSimEntity {
       rollZ = -0.22;
       this.moveFactor = 1.0;
     } else {
-      this.y = 0;
+      this.y = 0.004;
       if (typeof b?.facingYaw === "number") {
         this.yaw = b.facingYaw;
       }
@@ -854,8 +906,8 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     BASE_FRUSTUM * aspect0,
     BASE_FRUSTUM,
     -BASE_FRUSTUM,
-    1,
-    900,
+    18,
+    520,
   );
 
   const composer = isSoftwareGpu ? null : new EffectComposer(renderer);
@@ -958,7 +1010,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     fv.box(-2, 0, -2, 2, 1, 2, cMain);
     fv.put(-2, 0, -2, cEdge);
     fv.put(1, 0, 1, cEdge);
-    return buildVoxelMesh(fv, { scale: 0.24, castShadow: false });
+    return buildVoxelMesh(fv, { scale: 0.24, castShadow: false, depthLayer: 1 });
   });
 
   const pathsGroup = new THREE.Group();
@@ -975,9 +1027,12 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     transparent: true,
     opacity: 0.72,
     side: THREE.DoubleSide,
+    polygonOffset: true,
+    polygonOffsetFactor: -4,
+    polygonOffsetUnits: -4,
   });
   const selectionHalo = new THREE.Mesh(haloGeo, haloMat);
-  selectionHalo.position.y = 0.11;
+  selectionHalo.position.y = 0.122;
   selectionHalo.visible = false;
   scene.add(selectionHalo);
 
@@ -1133,22 +1188,23 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
 
       if (p.kind === "road") {
         const samples = Math.min(200, Math.max(36, Math.round(len * 1.4)));
-        pathsGroup.add(buildRibbonMesh(curve, samples, 2.52, 0.055, "#dfd7c5"));
-        pathsGroup.add(buildRibbonMesh(curve, samples, 2.1, 0.088, "#4b505c"));
+        pathsGroup.add(buildRibbonMesh(curve, samples, 2.52, 0.052, "#dfd7c5", true, -1));
+        pathsGroup.add(buildRibbonMesh(curve, samples, 2.1, 0.088, "#4b505c", true, -2));
 
         const dashCount = Math.floor(len / 3.4);
-        const dashGeo = new THREE.BoxGeometry(0.2, 0.03, 1.3);
+        const dashGeo = new THREE.BoxGeometry(0.2, 0.026, 1.3);
         const dashMat = new THREE.MeshBasicMaterial({
           color: "#f6eed8",
           polygonOffset: true,
           polygonOffsetFactor: -3,
+          polygonOffsetUnits: -4,
         });
         for (let i = 0; i < dashCount; i++) {
           const u = (i + 0.5) / dashCount;
           const pt = curve.getPointAt(u);
           const tan = curve.getTangentAt(u);
           const dash = new THREE.Mesh(dashGeo, dashMat);
-          dash.position.set(pt.x, 0.105, pt.z);
+          dash.position.set(pt.x, 0.106, pt.z);
           dash.rotation.y = Math.atan2(tan.x, tan.z);
           pathsGroup.add(dash);
         }
@@ -1160,7 +1216,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
           const tan = curve.getTangentAt(u);
           const stone = flagstoneProtos[i % flagstoneProtos.length].clone();
           stone.userData.sharedProto = true;
-          stone.position.set(pt.x, -0.17, pt.z);
+          stone.position.set(pt.x, -0.185, pt.z);
           stone.rotation.y = Math.atan2(tan.x, tan.z) + (((i % 3) - 1) * 0.08);
           stone.scale.set(1.0 + (i % 2) * 0.12, 1, 0.92 + ((i + 1) % 2) * 0.12);
           pathsGroup.add(stone);
@@ -1194,7 +1250,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
       seenIds.add(c.id);
       const existing = creationEntities.get(c.id);
       if (existing) {
-        existing.rebuildBehavior(c);
+        existing.rebuildBehavior(c, creationsGroup);
         existing.setLiveFeedReading(liveFeedsById[c.id] || null, maxAniso);
       } else {
         const ent = new CreationSimEntity(c, idx);
@@ -1538,7 +1594,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     if (highlightedId && creationEntities.has(highlightedId)) {
       const myEnt = creationEntities.get(highlightedId);
       selectionHalo.visible = true;
-      selectionHalo.position.set(myEnt.x, 0.1, myEnt.z);
+      selectionHalo.position.set(myEnt.x, 0.122, myEnt.z);
       selectionHalo.scale.setScalar(1 + Math.sin(t * 2.5) * 0.05);
     } else {
       selectionHalo.visible = false;

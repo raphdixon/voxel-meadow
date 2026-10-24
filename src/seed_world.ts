@@ -39,16 +39,13 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
       { op: "roundedBox", x0: -5, y0: 11, z0: -12, x1: 5, y1: 13, z1: 8, radius: 1.4, color: "roofCream" },
       // Front engine hood (+Z is front)
       { op: "roundedBox", x0: -5, y0: 3, z0: 8, x1: 5, y1: 8, z1: 14, radius: 1.5, color: "busYellow" },
-      // Carve wheel wells
-      { op: "clear", x0: 4, y0: 1, z0: 7, x1: 7, y1: 5, z1: 12, mirrorX: true },
-      { op: "clear", x0: 4, y0: 1, z0: -11, x1: 7, y1: 5, z1: -6, mirrorX: true },
-      // Front grille & chrome bumpers
+      //Front grille & chrome bumpers
       { op: "box", x0: -4, y0: 4, z0: 13, x1: 4, y1: 7, z1: 14, color: "trimBlack" },
       { op: "box", x0: -3, y0: 5, z0: 13, x1: 3, y1: 6, z1: 14, color: "bumper" },
       { op: "box", x0: -6, y0: 2, z0: 13, x1: 6, y1: 3, z1: 15, color: "bumper" },
       { op: "box", x0: -6, y0: 2, z0: -14, x1: 6, y1: 3, z1: -13, color: "bumper" },
-      // Black rub-rails along sides
-      { op: "box", x0: 6, y0: 5, z0: -13, x1: 7, y1: 6, z1: 8, color: "trimBlack", mirrorX: true },
+      // Black rub-rails along sides (above wheel arches)
+      { op: "box", x0: 6, y0: 6, z0: -13, x1: 7, y1: 7, z1: 8, color: "trimBlack", mirrorX: true },
       // Panoramic windshield & rear window
       { op: "box", x0: -5, y0: 7, z0: 8, x1: 5, y1: 11, z1: 9, color: "glass" },
       { op: "box", x0: 0, y0: 7, z0: 8, x1: 1, y1: 11, z1: 9, color: "trimBlack" },
@@ -62,6 +59,9 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
       // Folding passenger boarding door on starboard side (-X / +X curb side)
       { op: "box", x0: 5, y0: 3, z0: 5, x1: 6, y1: 10, z1: 8, color: "trimBlack" },
       { op: "box", x0: 5, y0: 4, z0: 6, x1: 6, y1: 9, z1: 7, color: "glass" },
+      // Carve clean wheel arches after side details so rolling tires have full clearance
+      { op: "clear", x0: 4, y0: 0, z0: 6, x1: 8, y1: 6, z1: 13, mirrorX: true },
+      { op: "clear", x0: 4, y0: 0, z0: -12, x1: 8, y1: 6, z1: -5, mirrorX: true },
       // Side mirrors & red octagon stop sign on driver side
       { op: "box", x0: 6, y0: 8, z0: 9, x1: 8, y1: 10, z1: 10, color: "trimBlack", mirrorX: true },
       { op: "box", x0: -7, y0: 6, z0: 4, x1: -6, y1: 8, z1: 6, color: "stopRed" },
@@ -119,47 +119,48 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
     },
     ops: [
       { op: "plinth", sizeX: 22, heightY: 2, sizeZ: 20, base: "stoneDark", top: "stone", corner: "timber" },
-      { op: "stairs", x0: -3, y0: 0, z0: 9, steps: 2, width: 6, dir: "+z", color: "stone" },
-      // Main bakery cottage body
-      { op: "hollowBox", x0: -9, y0: 2, z0: -7, x1: 9, y1: 13, z1: 8, wall: 1, color: "plaster", trim: "timber" },
-      { op: "roofGable", x0: -10, yBase: 13, z0: -8, x1: 10, y1: 19, z1: 9, rise: 5, axis: "x", color: "terracotta", trim: "timber" },
-      // Octagonal/cylindrical windmill tower rising above cottage
-      { op: "cylinder", axis: "y", cx: 0, y0: 12, y1: 26, cz: -1, radius: 5.2, color: "plaster" },
-      { op: "ring", axis: "y", cx: 0, y0: 19, y1: 20, cz: -1, outerR: 5.6, innerR: 4.2, color: "timber" },
-      { op: "dome", cx: 0, yBase: 26, cz: -1, radius: 5.5, color: "terracotta" },
-      { op: "sphere", cx: 0, cy: 32, cz: -1, rx: 1.2, ry: 1.2, rz: 1.2, color: "gold" },
+      { op: "stairs", x0: -3, y0: 0, z0: 8, steps: 2, width: 6, dir: "+z", color: "stone" },
+      // Main bakery cottage body (set slightly back so overhead windmill sails spin cleanly in front of the eaves)
+      { op: "hollowBox", x0: -9, y0: 2, z0: -8, x1: 9, y1: 12, z1: 6, wall: 1, color: "plaster", trim: "timber" },
+      { op: "roofGable", x0: -10, yBase: 12, z0: -9, x1: 10, z1: 7, rise: 4, axis: "x", color: "terracotta", trim: "timber" },
+      // Cylindrical windmill tower rising cleanly above cottage + timber sail drive-shaft stub
+      { op: "cylinder", axis: "y", cx: 0, y0: 12, y1: 28, cz: 0, radius: 5.0, color: "plaster" },
+      { op: "ring", axis: "y", cx: 0, y0: 20, y1: 21, cz: 0, outerR: 5.4, innerR: 4.0, color: "timber" },
+      { op: "dome", cx: 0, yBase: 28, cz: 0, radius: 5.2, color: "terracotta" },
+      { op: "sphere", cx: 0, cy: 34, cz: 0, rx: 1.2, ry: 1.2, rz: 1.2, color: "gold" },
+      { op: "cylinder", axis: "z", cx: 0, cy: 25, z0: 3, z1: 7, radius: 1.2, color: "timber" },
       // Brick bread oven + chimney on left (-X)
-      { op: "box", x0: -11, y0: 2, z0: -4, x1: -8, y1: 10, z1: 3, color: "brick" },
-      { op: "box", x0: -10, y0: 10, z0: -2, x1: -8, y1: 22, z1: 1, color: "brick" },
-      { op: "box", x0: -11, y0: 3, z0: -1, x1: -10, y1: 6, z1: 1, color: "hearth", emit: 1.45 },
+      { op: "box", x0: -11, y0: 2, z0: -5, x1: -8, y1: 10, z1: 2, color: "brick" },
+      { op: "box", x0: -10, y0: 10, z0: -3, x1: -8, y1: 21, z1: 0, color: "brick" },
+      { op: "box", x0: -11, y0: 3, z0: -2, x1: -10, y1: 6, z1: 0, color: "hearth", emit: 1.45 },
       // Front door arch & glowing bakery windows
-      { op: "arch", cx: 0, y0: 2, cz: 7, halfSpan: 2, height: 6, depth: 2, axis: "z", color: "timber" },
-      { op: "box", x0: -1, y0: 2, z0: 7, x1: 1, y1: 7, z1: 8, color: "timber" },
-      { op: "box", x0: 4, y0: 5, z0: 7, x1: 7, y1: 9, z1: 8, color: "windowGlow", emit: 1.05, mirrorX: true },
+      { op: "arch", cx: 0, y0: 2, cz: 5, halfSpan: 2, height: 6, depth: 2, axis: "z", color: "timber" },
+      { op: "box", x0: -1, y0: 2, z0: 5, x1: 1, y1: 7, z1: 6, color: "timber" },
+      { op: "box", x0: 4, y0: 5, z0: 5, x1: 7, y1: 9, z1: 6, color: "windowGlow", emit: 1.05, mirrorX: true },
       // Flowerboxes under front windows
-      { op: "box", x0: 4, y0: 4, z0: 8, x1: 7, y1: 5, z1: 9, color: "timber", mirrorX: true },
-      { op: "box", x0: 4, y0: 5, z0: 8, x1: 7, y1: 6, z1: 9, color: "leaf", mirrorX: true },
+      { op: "box", x0: 4, y0: 4, z0: 6, x1: 7, y1: 5, z1: 7, color: "timber", mirrorX: true },
+      { op: "box", x0: 4, y0: 5, z0: 6, x1: 7, y1: 6, z1: 7, color: "leaf", mirrorX: true },
       // Striped red & cream bakery awning over front entrance
-      { op: "box", x0: -8, y0: 9, z0: 8, x1: 8, y1: 10, z1: 11, color: "awningRed" },
-      { op: "box", x0: -6, y0: 9, z0: 8, x1: -4, y1: 10, z1: 11, color: "sailCloth", mirrorX: true },
-      { op: "box", x0: -1, y0: 9, z0: 8, x1: 1, y1: 10, z1: 11, color: "sailCloth" },
+      { op: "box", x0: -8, y0: 9, z0: 6, x1: 8, y1: 10, z1: 9, color: "awningRed" },
+      { op: "box", x0: -6, y0: 9, z0: 6, x1: -4, y1: 10, z1: 9, color: "sailCloth", mirrorX: true },
+      { op: "box", x0: -1, y0: 9, z0: 6, x1: 1, y1: 10, z1: 9, color: "sailCloth" },
     ],
     parts: [
       {
         name: "windmill-sails",
         kind: "spinZ",
         speed: 0.65,
-        pivot: [0, 23, 5],
+        pivot: [0, 25, 8],
         ops: [
-          { op: "cylinder", axis: "z", cx: 0, cy: 0, z0: -2, z1: 2, radius: 1.5, color: "timber" },
-          // Vertical & horizontal sail spars
-          { op: "box", x0: -1, y0: -12, z0: 0, x1: 1, y1: 12, z1: 1, color: "timber" },
-          { op: "box", x0: -12, y0: -1, z0: 0, x1: 12, y1: 1, z1: 1, color: "timber" },
+          { op: "cylinder", axis: "z", cx: 0, cy: 0, z0: 0, z1: 2, radius: 1.5, color: "timber" },
+          // Vertical & horizontal sail spars (100% clear of cottage roof, awning, and tower)
+          { op: "box", x0: -1, y0: -11, z0: 0, x1: 1, y1: 11, z1: 1, color: "timber" },
+          { op: "box", x0: -11, y0: -1, z0: 0, x1: 11, y1: 1, z1: 1, color: "timber" },
           // Four woven canvas sails
-          { op: "box", x0: 1, y0: 3, z0: 1, x1: 4, y1: 11, z1: 2, color: "sailCloth" },
-          { op: "box", x0: -4, y0: -11, z0: 1, x1: -1, y1: -3, z1: 2, color: "sailCloth" },
-          { op: "box", x0: 3, y0: -4, z0: 1, x1: 11, y1: -1, z1: 2, color: "sailCloth" },
-          { op: "box", x0: -11, y0: 1, z0: 1, x1: -3, y1: 4, z1: 2, color: "sailCloth" },
+          { op: "box", x0: 1, y0: 3, z0: 1, x1: 4, y1: 10, z1: 2, color: "sailCloth" },
+          { op: "box", x0: -4, y0: -10, z0: 1, x1: -1, y1: -3, z1: 2, color: "sailCloth" },
+          { op: "box", x0: 3, y0: -4, z0: 1, x1: 10, y1: -1, z1: 2, color: "sailCloth" },
+          { op: "box", x0: -10, y0: 1, z0: 1, x1: -3, y1: 4, z1: 2, color: "sailCloth" },
         ],
       },
     ],
@@ -212,7 +213,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
         name: "weathervane",
         kind: "spinY",
         speed: 0.8,
-        pivot: [0, 36, 0],
+        pivot: [0, 37, 0],
         ops: [
           { op: "box", x0: 0, y0: 0, z0: 0, x1: 1, y1: 3, z1: 1, color: "gold" },
           { op: "box", x0: -3, y0: 2, z0: 0, x1: 3, y1: 3, z1: 1, color: "gold" },
@@ -223,9 +224,9 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
         kind: "swingZ",
         speed: 1.8,
         amp: 0.35,
-        pivot: [0, 26, 0],
+        pivot: [0, 25, 0],
         ops: [
-          { op: "cone", cx: 0, y0: -3, y1: 0, cz: 0, rBottom: 1.8, rTop: 0.7, color: "gold", emit: 0.4 },
+          { op: "cone", cx: 0, y0: -3, y1: 0, cz: 0, rBottom: 1.6, rTop: 0.6, color: "gold", emit: 0.4 },
         ],
       },
     ],
@@ -273,7 +274,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
         kind: "swingZ",
         speed: 1.4,
         amp: 0.25,
-        pivot: [2, 10, 7],
+        pivot: [2, 11.5, 7.5],
         ops: [
           { op: "box", x0: 0, y0: 0, z0: 0, x1: 1, y1: 1, z1: 3, color: "woodDark" },
           { op: "box", x0: -1, y0: -3, z0: 1, x1: 2, y1: 0, z1: 3, color: "gold" },
@@ -299,9 +300,9 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
       tongue: "#f0788c",
     },
     ops: [
-      // Plump torso & fluffy chest
-      { op: "roundedBox", x0: -3, y0: 4, z0: -5, x1: 3, y1: 9, z1: 4, radius: 1.6, color: "coat" },
-      { op: "sphere", cx: 0, cy: 6.5, cz: 3.5, rx: 3.2, ry: 2.8, rz: 2.5, color: "coatLight" },
+      // Plump torso & fluffy chest (raised 1 voxel above hip joints so trotting legs swing freely)
+      { op: "roundedBox", x0: -3, y0: 5, z0: -5, x1: 3, y1: 9, z1: 4, radius: 1.5, color: "coat" },
+      { op: "sphere", cx: 0, cy: 7.0, cz: 3.5, rx: 3.0, ry: 2.1, rz: 2.3, color: "coatLight" },
       // Red collar + brass bell tag
       { op: "ring", axis: "z", cx: 0, cy: 7.5, z0: 3, z1: 5, outerR: 3.1, innerR: 2.0, color: "collarRed" },
       { op: "box", x0: -1, y0: 5, z0: 5, x1: 1, y1: 6, z1: 6, color: "brass", emit: 0.5 },
@@ -318,9 +319,9 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
         name: "front-left-leg",
         kind: "swingX",
         speed: 2.6,
-        amp: 0.5,
+        amp: 0.45,
         phase: 0,
-        pivot: [2, 4, 3],
+        pivot: [2.2, 4, 2.5],
         ops: [
           { op: "box", x0: -1, y0: -4, z0: -1, x1: 1, y1: 0, z1: 1, color: "coat" },
           { op: "box", x0: -1, y0: -4, z0: 0, x1: 1, y1: -3, z1: 2, color: "coatLight" },
@@ -330,9 +331,9 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
         name: "front-right-leg",
         kind: "swingX",
         speed: 2.6,
-        amp: 0.5,
+        amp: 0.45,
         phase: 3.14,
-        pivot: [-2, 4, 3],
+        pivot: [-2.2, 4, 2.5],
         ops: [
           { op: "box", x0: -1, y0: -4, z0: -1, x1: 1, y1: 0, z1: 1, color: "coat" },
           { op: "box", x0: -1, y0: -4, z0: 0, x1: 1, y1: -3, z1: 2, color: "coatLight" },
@@ -342,27 +343,27 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
         name: "back-left-leg",
         kind: "swingX",
         speed: 2.6,
-        amp: 0.5,
+        amp: 0.45,
         phase: 3.14,
-        pivot: [2, 4, -3.5],
+        pivot: [2.2, 4, -3.5],
         ops: [{ op: "box", x0: -1, y0: -4, z0: -1, x1: 1, y1: 0, z1: 1, color: "coatDark" }],
       },
       {
         name: "back-right-leg",
         kind: "swingX",
         speed: 2.6,
-        amp: 0.5,
+        amp: 0.45,
         phase: 0,
-        pivot: [-2, 4, -3.5],
+        pivot: [-2.2, 4, -3.5],
         ops: [{ op: "box", x0: -1, y0: -4, z0: -1, x1: 1, y1: 0, z1: 1, color: "coatDark" }],
       },
       {
         name: "wagging-tail",
         kind: "swingY",
         speed: 3.4,
-        amp: 0.55,
-        pivot: [0, 7, -5],
-        ops: [{ op: "line", x0: 0, y0: 0, z0: 0, x1: 0, y1: 3, z1: -4, radius: 1.1, color: "coatLight" }],
+        amp: 0.5,
+        pivot: [0, 7.5, -6.5],
+        ops: [{ op: "line", x0: 0, y0: 0, z0: 0, x1: 0, y1: 3, z1: -3, radius: 1.0, color: "coatLight" }],
       },
     ],
   });
@@ -382,8 +383,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
       eye: "#181a20",
     },
     ops: [
-      { op: "sphere", cx: 0, cy: 3.5, cz: -0.5, rx: 3.6, ry: 2.8, rz: 5.0, color: "feather" },
-      { op: "roundedBox", x0: 3, y0: 3, z0: -3, x1: 4, y1: 5, z1: 2, radius: 0.8, color: "wing", mirrorX: true },
+      { op: "sphere", cx: 0, cy: 3.5, cz: -0.5, rx: 3.4, ry: 2.8, rz: 5.0, color: "feather" },
       { op: "cone", cx: 0, y0: 3, y1: 6, cz: -5, rBottom: 2.0, rTop: 0.6, color: "feather" },
       { op: "cylinder", axis: "y", cx: 0, y0: 5, y1: 8, cz: 3, radius: 1.8, color: "collarWhite" },
       { op: "sphere", cx: 0, cy: 9, cz: 3.2, rx: 2.4, ry: 2.3, rz: 2.5, color: "emerald" },
@@ -396,8 +396,17 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
         kind: "swingZ",
         speed: 1.6,
         amp: 0.14,
-        pivot: [3.5, 4.5, 0],
+        pivot: [4.2, 4.5, -0.5],
         ops: [{ op: "box", x0: 0, y0: -1, z0: -2, x1: 1, y1: 1, z1: 2, color: "wing" }],
+      },
+      {
+        name: "right-wing",
+        kind: "swingZ",
+        speed: 1.6,
+        amp: 0.14,
+        phase: 3.14,
+        pivot: [-4.2, 4.5, -0.5],
+        ops: [{ op: "box", x0: -1, y0: -1, z0: -2, x1: 0, y1: 1, z1: 2, color: "wing" }],
       },
     ],
   });

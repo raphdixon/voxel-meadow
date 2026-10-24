@@ -25,9 +25,9 @@ export function buildVillagerRig(villager, index = 0) {
   torso.position.y = 4 * s;
   root.add(torso);
 
-  // Head + eyes + hat/cap
+  // Head + eyes + hat/cap (slight clearance above torso collar + depthLayer 1)
   const headPivot = new THREE.Group();
-  headPivot.position.set(0, 9 * s, 0);
+  headPivot.position.set(0, 9.06 * s, 0);
   const headVox = new Vox(201 + index);
   headVox.box(-2, 0, -2, 2, 4, 2, skin);
   headVox.put(-1, 1.5, 2, "#181a20");
@@ -35,37 +35,37 @@ export function buildVillagerRig(villager, index = 0) {
   // Hat with brim
   headVox.box(-2, 3.5, -2, 2, 5, 2, hat);
   headVox.box(-2, 3.5, 2, 2, 4.2, 3, hat);
-  headPivot.add(buildVoxelMesh(headVox, { scale: s }));
+  headPivot.add(buildVoxelMesh(headVox, { scale: s, depthLayer: 1 }));
   root.add(headPivot);
 
-  // Left & Right Legs
+  // Left & Right Legs (clean hip gap + depthLayer 2)
   const makeLeg = (seedOff) => {
     const piv = new THREE.Group();
     const lv = new Vox(301 + index + seedOff);
     lv.box(-1, -4, -1, 1, 0, 1, pants);
     lv.box(-1, -4, 0, 1, -3, 2, "#24272e");
-    piv.add(buildVoxelMesh(lv, { scale: s }));
+    piv.add(buildVoxelMesh(lv, { scale: s, depthLayer: 2 }));
     return piv;
   };
   const leftLeg = makeLeg(1);
-  leftLeg.position.set(1.1 * s, 4 * s, 0);
+  leftLeg.position.set(1.08 * s, 3.94 * s, 0);
   const rightLeg = makeLeg(2);
-  rightLeg.position.set(-1.1 * s, 4 * s, 0);
+  rightLeg.position.set(-1.08 * s, 3.94 * s, 0);
   root.add(leftLeg, rightLeg);
 
-  // Left & Right Arms
-  const makeArm = (seedOff) => {
+  // Left & Right Arms (clean 1-voxel wide shoulder clearance outside [-2..2] torso + depthLayer 3)
+  const makeArm = (seedOff, x0, x1) => {
     const piv = new THREE.Group();
     const av = new Vox(401 + index + seedOff);
-    av.box(-0.8, -3.5, -0.8, 0.8, 0, 0.8, shirt);
-    av.box(-0.8, -4.2, -0.8, 0.8, -3.5, 0.8, skin);
-    piv.add(buildVoxelMesh(av, { scale: s }));
+    av.box(x0, -3, -1, x1, 0, 1, shirt);
+    av.box(x0, -4, -1, x1, -3, 1, skin);
+    piv.add(buildVoxelMesh(av, { scale: s, depthLayer: 3 }));
     return piv;
   };
-  const leftArm = makeArm(1);
-  leftArm.position.set(2.6 * s, 8.5 * s, 0);
-  const rightArm = makeArm(2);
-  rightArm.position.set(-2.6 * s, 8.5 * s, 0);
+  const leftArm = makeArm(1, 0, 1);
+  leftArm.position.set(2.08 * s, 8.6 * s, 0);
+  const rightArm = makeArm(2, -1, 0);
+  rightArm.position.set(-2.08 * s, 8.6 * s, 0);
   root.add(leftArm, rightArm);
 
   root.userData.dispose = () => {
@@ -405,16 +405,20 @@ export function buildWorldPropMesh(prop) {
     const rimMesh = buildVoxelMesh(pondVox, { scale: ps });
     group.add(rimMesh);
 
-    const waterGeo = new THREE.CylinderGeometry(r - 0.12, r - 0.12, 0.24, 32);
+    const waterR = Math.max(1.2, (gr - 0.85) * ps);
+    const waterGeo = new THREE.CylinderGeometry(waterR, waterR, 0.2, 32);
     const waterMat = new THREE.MeshStandardMaterial({
       color: "#4daee0",
       roughness: 0.18,
       metalness: 0.08,
       emissive: new THREE.Color("#1a5b7d"),
       emissiveIntensity: 0.16,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
     });
     const water = new THREE.Mesh(waterGeo, waterMat);
-    water.position.y = 0.1;
+    water.position.y = 0.11;
     water.receiveShadow = true;
     group.add(water);
 

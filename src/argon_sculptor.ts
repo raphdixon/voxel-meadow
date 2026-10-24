@@ -1,4 +1,9 @@
 import type { VoxelBlueprint } from "./types";
+import {
+  auditBlueprintOverlaps,
+  autoRepairBlueprintOverlaps,
+  formatAuditFeedbackForArgon,
+} from "./voxel_audit";
 import { normalizeAndGroundBlueprint } from "./voxel_dsl";
 
 export interface SculptRequest {
@@ -152,8 +157,13 @@ const SCULPTOR_SYSTEM_PROMPT = `You are Master Voxel Sculptor Argon, creating br
      * Creatures/Animals: Use \`sphere\` / \`roundedBox\` for organic torso, chest, head, snout, cheeks, ears (\`mirrorX: true\`), pixel eyes/nose via \`voxels\` or \`box\`, collar/saddle/markings, 2 or 4 articulated legs in \`parts\` with \`"kind": "swingX"\` (give left legs \`phase: 0\` and right legs \`phase: 3.14\`!), and a wagging tail (\`"kind": "swingY"\`) or flapping wings (\`"kind": "swingZ"\`)!
      * Buildings/Shops/Monuments: Grounded \`plinth\` + \`stairs\` at +Z, multi-volume \`hollowBox\` / \`cylinder\` tower, \`roofGable\` / \`dome\` / \`cone\` with overhang eaves, \`arch\` doorway, window frames + flowerboxes, awnings, chimneys, signage, glowing interior windows (\`emit: 0.95\`), and 1-2 animated \`parts\` (\`spinY\`, \`spinZ\` windmill sails, \`bob\` smoke/lantern, \`swingZ\` sign/bell)!
 
-5. PIVOT-LOCAL ANIMATED \`parts\` (CRITICAL):
+5. PIVOT-LOCAL ANIMATED \`parts\` & ZERO Z-FIGHTING CLEARANCE LAW (CRITICAL):
    - Every item in \`parts\` has \`"pivot": [px, py, pz]\` in model coordinates, and ALL \`ops\` inside \`part.ops\` MUST BE AUTHORED AROUND LOCAL \`[0, 0, 0]\`!
+   - Animated \`parts\` render as separate moving meshes — NEVER let a \`part\` intersect or sit coplanar/flush with \`ops\` across its spin/swing arc (that causes Z-fighting flicker!):
+     * Windmill sails / propellers (\`spinZ\`): Place \`pivot[2]\` >= 1 full voxel in front of the furthest roof eave, wall, or awning that the blades sweep past, with local \`z0 >= 0\`.
+     * Vehicle \`wheel\` axles: Carve matching \`clear\` wheel-arch boxes in \`ops\` at least 1 voxel wider and taller than the tire radius!
+     * Rooftop \`spinY\` weathervanes / rotors: Set \`pivot[1]\` >= 1 full voxel ABOVE the highest roof/cone voxel beneath it.
+     * Swinging legs / signs / wings (\`swingX\`, \`swingY\`, \`swingZ\`): Leave a 1-voxel gap between the limb/sign and the body/wall so it swings freely without clipping.
    - Example wheel axle at \`pivot: [0, 3, 8]\`:
      \`{"name":"front-wheels","kind":"wheel","speed":1.0,"pivot":[0,3,8],"ops":[{"op":"cylinder","axis":"x","x0":5,"x1":7,"cy":0,"cz":0,"radius":3.0,"color":"rubber","mirrorX":true},{"op":"cylinder","axis":"x","x0":6,"x1":8,"cy":0,"cz":0,"radius":1.5,"color":"chrome","mirrorX":true}]}\`
      Notice \`cy: 0, cz: 0\` is local to \`pivot: [0, 3, 8]\`, so the bottom of the radius-3 tire touches \`3 - 3 = 0\` (ground Y=0) and spins around its exact center!
@@ -262,27 +272,46 @@ export async function sculptWithArgon(
     return { ok: false, unsafe: true, error: reason };
   }
 
-  let bp = normalizeAndGroundBlueprint(first.json, promptText || "Meadow Creation");
+  const rawDraft = normalizeAndGroundBlueprint(first.json, promptText || "Meadow Creation", {
+    skipAutoRepair: true,
+  });
+  const draftAudit = auditBlueprintOverlaps(rawDraft);
+  const needsVolumeRefinement = rawDraft.stats.voxels < 160;
+  const needsStructuralCollisionPass = draftAudit.overlapCells >= 42;
 
-  // If round 1 was unexpectedly sparse (< 160 voxels), run one targeted Argon enrichment pass
-  if (bp.stats.voxels < 160) {
+  let bp = autoRepairBlueprintOverlaps(rawDraft).blueprint;
+
+  // If round 1 was sparse (< 160 voxels) OR had a major structural collision (e.g. sails slicing through a roof),
+  // run one targeted Argon self-repair pass before final deterministic clearance enforcement.
+  if (needsVolumeRefinement || needsStructuralCollisionPass) {
+    const notes: string[] = [];
+    if (needsVolumeRefinement) {
+      notes.push(
+        `Your previous draft only produced ${rawDraft.stats.voxels} voxels, which is too sparse. Expand the body volume using roundedBox/sphere/hollowBox/cylinder across [-12..12] so it has 600 to 3000 crisp micro-voxels and at least 1 animated part in \`parts\`.`,
+      );
+    }
+    if (needsStructuralCollisionPass) {
+      notes.push(
+        `VOXEL Z-FIGHTING / COLLISION DETECTED IN ANIMATED PARTS:\n${formatAuditFeedbackForArgon(draftAudit)}\nReposition the colliding part pivots or adjust the base roof/wall ops so every animated part spins/swings with >= 1 full voxel of clearance.`,
+      );
+    }
     const second = await callGeminiArgon({
       apiKey,
       primaryModel,
       fallbackModel,
       systemPrompt: SCULPTOR_SYSTEM_PROMPT,
-      userText: `${userDirective}\n\nIMPORTANT REFINEMENT: Your previous draft only produced ${bp.stats.voxels} voxels, which is too tiny/sparse. Expand the body volume using roundedBox/sphere/hollowBox/cylinder across [-12..12] so it has 600 to 3000 crisp micro-voxels and at least 1 animated part in \`parts\`. Previous JSON:\n${JSON.stringify(first.json)}`,
+      userText: `${userDirective}\n\nIMPORTANT ORCHESTRATOR REFINEMENT:\n${notes.join("\n\n")}\n\nPrevious JSON:\n${JSON.stringify(first.json)}`,
       imageBase64: req.imageBase64,
       imageMimeType: req.imageMimeType,
-      temperature: 0.4,
-      thinkingBudget: 2048,
+      temperature: 0.38,
+      thinkingBudget: 1536,
       maxOutputTokens: 16384,
     });
     if (second.json.safe === false) {
       return { ok: false, unsafe: true, error: "Please try creating something family-friendly." };
     }
     const enriched = normalizeAndGroundBlueprint(second.json, bp.name);
-    if (enriched.stats.voxels > bp.stats.voxels) {
+    if (enriched.stats.voxels >= Math.min(160, bp.stats.voxels)) {
       bp = enriched;
     }
   }

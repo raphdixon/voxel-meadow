@@ -1,4 +1,5 @@
 import { sanitizeLiveFeed } from "./live_feeds";
+import { autoRepairBlueprintOverlaps } from "./voxel_audit";
 import type {
   CreationCategory,
   ScaleClass,
@@ -952,6 +953,7 @@ export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string,
 export function normalizeAndGroundBlueprint(
   raw: Record<string, unknown>,
   fallbackName = "Meadow Creation",
+  options?: { skipAutoRepair?: boolean },
 ): VoxelBlueprint {
   const palette: Record<string, string> = {};
   if (raw.palette && typeof raw.palette === "object") {
@@ -1080,7 +1082,7 @@ export function normalizeAndGroundBlueprint(
 
   const liveFeed = sanitizeLiveFeed(raw.liveFeed);
 
-  return {
+  const normalized: VoxelBlueprint = {
     version: 1,
     name,
     description,
@@ -1097,4 +1099,9 @@ export function normalizeAndGroundBlueprint(
       maxY: Math.max(2, b.maxY),
     },
   };
+
+  if (options?.skipAutoRepair) {
+    return normalized;
+  }
+  return autoRepairBlueprintOverlaps(normalized).blueprint;
 }

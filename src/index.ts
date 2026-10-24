@@ -1,5 +1,7 @@
 import { sculptWithArgon } from "./argon_sculptor";
 import { resolveWorldLiveFeeds } from "./live_feeds";
+import { autoRepairBlueprintOverlaps } from "./voxel_audit";
+import { normalizeAndGroundBlueprint } from "./voxel_dsl";
 import { WorldDO } from "./world_do";
 
 export { WorldDO };
@@ -111,6 +113,13 @@ export default {
       const snapshot = await stub.getWorldSnapshot("", "");
       const feeds = await resolveWorldLiveFeeds(snapshot.creations);
       return jsonResponse({ ok: true, feeds }, 200);
+    }
+
+    // Automated voxel & spatial Z-fighting audit status across the entire live world
+    if (url.pathname === "/api/audit" && request.method === "GET") {
+      const stub = getWorldStub(env);
+      const report = await stub.getWorldAuditReport();
+      return jsonResponse(report, 200);
     }
 
     // Atomic background build + permanent placement at visitor's chosen grass spot
@@ -327,6 +336,38 @@ export default {
       const stub = getWorldStub(env);
       const res = await stub.runCronWeaver();
       return jsonResponse(res, 200);
+    }
+
+    // Local dev helper to verify automated voxel overlap detection & orchestrator auto-repair (localhost only)
+    if (
+      url.pathname === "/api/dev/audit-repair" &&
+      request.method === "POST" &&
+      (url.hostname === "localhost" || url.hostname === "127.0.0.1")
+    ) {
+      let body: Record<string, unknown> = {};
+      try {
+        body = (await request.json()) as Record<string, unknown>;
+      } catch {
+        // empty body runs world-level orchestrator repair
+      }
+      if (body.blueprint && typeof body.blueprint === "object") {
+        const rawBp = normalizeAndGroundBlueprint(
+          body.blueprint as Record<string, unknown>,
+          "Test Overlapping Creation",
+          { skipAutoRepair: true },
+        );
+        const result = autoRepairBlueprintOverlaps(rawBp);
+        return jsonResponse({
+          ok: true,
+          reportBefore: result.reportBefore,
+          reportAfter: result.reportAfter,
+          repairsApplied: result.repairsApplied,
+          repairedBlueprint: result.blueprint,
+        });
+      }
+      const stub = getWorldStub(env);
+      const worldRepair = await stub.runWorldAuditAndRepair();
+      return jsonResponse({ ok: true, ...worldRepair });
     }
 
     return env.ASSETS.fetch(request);

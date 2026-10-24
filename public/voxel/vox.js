@@ -575,14 +575,22 @@ export function applyOps(vox, ops = [], customPalette = {}) {
   return vox;
 }
 
-let sharedVoxelMat = null;
-export function getSharedVoxelMaterial() {
-  if (sharedVoxelMat) return sharedVoxelMat;
+const voxelLayerMaterials = new Map();
+
+function createVoxelStandardMaterial(layerIndex = 0) {
+  const layer = Math.max(0, Math.min(7, layerIndex | 0));
   const mat = new THREE.MeshStandardMaterial({
     vertexColors: true,
     roughness: 0.72,
     metalness: 0.06,
     dithering: true,
+    ...(layer > 0
+      ? {
+          polygonOffset: true,
+          polygonOffsetFactor: -layer,
+          polygonOffsetUnits: -layer * 1.5,
+        }
+      : {}),
   });
   mat.onBeforeCompile = (shader) => {
     shader.vertexShader = shader.vertexShader
@@ -641,8 +649,19 @@ export function getSharedVoxelMaterial() {
       );
   };
   mat.customProgramCacheKey = () => "meadow-voxel-bevel-ao-v1";
-  sharedVoxelMat = mat;
   return mat;
+}
+
+export function getVoxelMaterialForLayer(layerIndex = 0) {
+  const layer = Math.max(0, Math.min(7, layerIndex | 0));
+  if (!voxelLayerMaterials.has(layer)) {
+    voxelLayerMaterials.set(layer, createVoxelStandardMaterial(layer));
+  }
+  return voxelLayerMaterials.get(layer);
+}
+
+export function getSharedVoxelMaterial() {
+  return getVoxelMaterialForLayer(0);
 }
 
 let ghostMat = null;
@@ -669,6 +688,7 @@ export function buildVoxelMesh(vox, options = {}) {
     castShadow = true,
     receiveShadow = true,
     ghost = false,
+    depthLayer = 0,
   } = options;
 
   const positions = [];
@@ -732,7 +752,10 @@ export function buildVoxelMesh(vox, options = {}) {
   geo.setIndex(indices);
   geo.computeBoundingSphere();
 
-  const mesh = new THREE.Mesh(geo, ghost ? getGhostVoxelMaterial() : getSharedVoxelMaterial());
+  const mesh = new THREE.Mesh(
+    geo,
+    ghost ? getGhostVoxelMaterial() : getVoxelMaterialForLayer(depthLayer),
+  );
   mesh.castShadow = castShadow && !ghost;
   mesh.receiveShadow = receiveShadow && !ghost;
   return mesh;
@@ -768,7 +791,13 @@ export function buildCreationGroup(blueprint, options = {}) {
     const pivot = new THREE.Group();
     const [px, py, pz] = part.pivot || [0, 0, 0];
     pivot.position.set(px * voxScale, py * voxScale, pz * voxScale);
-    const pMesh = buildVoxelMesh(pv, { scale: voxScale, ghost });
+    const pMesh = buildVoxelMesh(pv, {
+      scale: voxScale,
+      ghost,
+      depthLayer: (i % 6) + 1,
+    });
+    // Microscopic scale inset + per-part polygonOffset prevents coplanar depth shimmer on grazing joints
+    pMesh.scale.setScalar(0.9985);
     pivot.add(pMesh);
     group.add(pivot);
 

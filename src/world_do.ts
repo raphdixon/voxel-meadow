@@ -14,7 +14,34 @@ import type {
   WorldStateSnapshot,
   WorldVillager,
 } from "./types";
+import {
+  auditAndRepairWorldSpatial,
+  auditBlueprintOverlaps,
+  autoRepairBlueprintOverlaps,
+} from "./voxel_audit";
 import { normalizeAndGroundBlueprint } from "./voxel_dsl";
+
+export interface WorldCreationAuditEntry {
+  id: string;
+  name: string;
+  clean: boolean;
+  overlapCells: number;
+  coplanarFaces: number;
+  groundClips: number;
+  partsCount: number;
+}
+
+export interface WorldAuditSummary {
+  ok: true;
+  clean: boolean;
+  creationsChecked: number;
+  blueprintConflicts: number;
+  spatialConflicts: number;
+  totalAutoRepairs: number;
+  lastAuditAt: number;
+  lastAuditNote: string;
+  creations: WorldCreationAuditEntry[];
+}
 
 export interface PlaceCreationInput {
   ipHash: string;
@@ -228,6 +255,140 @@ export class WorldDO extends DurableObject<Env> {
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v4', '1')`);
       this.bumpVersion();
     }
+
+    // Non-destructive v5 upgrade: refresh seed blueprints (fixes Windmill Bakery sail/roof Z-fighting)
+    // and run full kinematic voxel overlap + spatial plinth audit across all creations, paths, and props.
+    const upgradedV5 = sql.exec(`SELECT value FROM meta WHERE key = 'upgrade_v5_voxel_audit'`).toArray();
+    if (upgradedV5.length === 0) {
+      const freshSeed = buildSeedWorld();
+      const seedBlueprintMap = new Map(freshSeed.creations.map((c) => [c.id, c.blueprint]));
+
+      const existingRows = sql.exec(`SELECT id, json FROM creations`).toArray();
+      for (const row of existingRows) {
+        const cid = String(row.id);
+        const cleanSeedBp = seedBlueprintMap.get(cid);
+        if (cleanSeedBp) {
+          const parsed = JSON.parse(String(row.json)) as WorldCreation;
+          parsed.blueprint = cleanSeedBp;
+          sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(parsed), cid);
+        }
+      }
+
+      this.auditAndRepairWorld();
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v5_voxel_audit', '1')`);
+      this.bumpVersion();
+    } else {
+      // Lightweight startup self-check (< 3ms, zero LLM calls) so the world stays overlap-free across restarts
+      this.auditAndRepairWorld();
+    }
+  }
+
+  private auditAndRepairWorld(): { repairedCount: number; repairs: string[] } {
+    const sql = this.ctx.storage.sql;
+    const repairs: string[] = [];
+
+    const creationRows = sql.exec(`SELECT id, json FROM creations ORDER BY created_at ASC`).toArray();
+    const creations: WorldCreation[] = [];
+
+    for (const row of creationRows) {
+      const cid = String(row.id);
+      const parsed = JSON.parse(String(row.json)) as WorldCreation;
+      const audit = auditBlueprintOverlaps(parsed.blueprint);
+      if (!audit.clean) {
+        const healed = autoRepairBlueprintOverlaps(parsed.blueprint);
+        parsed.blueprint = healed.blueprint;
+        sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(parsed), cid);
+        repairs.push(
+          `${parsed.name} (${cid}): ${healed.repairsApplied.join("; ") || "cleared voxel overlap"}`,
+        );
+      }
+      creations.push(parsed);
+    }
+
+    const pathRows = sql.exec(`SELECT id, json FROM paths`).toArray();
+    const paths = pathRows.map((r) => JSON.parse(String(r.json)) as WorldPath);
+    const propRows = sql.exec(`SELECT id, json FROM props`).toArray();
+    const props = propRows.map((r) => JSON.parse(String(r.json)) as WorldProp);
+
+    const spatial = auditAndRepairWorldSpatial(creations, paths, props);
+    if (!spatial.report.clean) {
+      for (const p of spatial.paths) {
+        sql.exec(`INSERT OR REPLACE INTO paths (id, json) VALUES (?, ?)`, p.id, JSON.stringify(p));
+      }
+      for (const pr of spatial.props) {
+        sql.exec(`INSERT OR REPLACE INTO props (id, json) VALUES (?, ?)`, pr.id, JSON.stringify(pr));
+      }
+      repairs.push(...spatial.report.details);
+    }
+
+    const now = Date.now();
+    this.setMeta("lastAuditAt", String(now));
+    if (repairs.length > 0) {
+      const prevTotal = Number(this.getMeta("totalAutoRepairs", "0")) || 0;
+      this.setMeta("totalAutoRepairs", String(prevTotal + repairs.length));
+      this.setMeta("lastAuditNote", `Auto-repaired ${repairs.length} overlap(s): ${repairs.slice(0, 3).join(" | ")}`);
+      this.bumpVersion();
+    } else if (!this.getMeta("lastAuditNote")) {
+      this.setMeta("lastAuditNote", "All voxel blueprints, parts, paths, and plinths verified overlap-free.");
+    }
+
+    return { repairedCount: repairs.length, repairs };
+  }
+
+  public getWorldAuditReport(): WorldAuditSummary {
+    const world = this.readBaseWorld();
+    let blueprintConflicts = 0;
+    const creationEntries: WorldCreationAuditEntry[] = [];
+
+    for (const c of world.creations) {
+      const r = auditBlueprintOverlaps(c.blueprint);
+      blueprintConflicts += r.totalConflicts;
+      creationEntries.push({
+        id: c.id,
+        name: c.name,
+        clean: r.clean,
+        overlapCells: r.overlapCells,
+        coplanarFaces: r.coplanarFaces,
+        groundClips: r.groundClips,
+        partsCount: c.blueprint.parts.length,
+      });
+    }
+
+    const spatial = auditAndRepairWorldSpatial(world.creations, world.paths, world.props);
+    const spatialConflicts = spatial.report.footpathTrimCount + spatial.report.propNudgeCount;
+
+    return {
+      ok: true,
+      clean: blueprintConflicts === 0 && spatialConflicts === 0,
+      creationsChecked: world.creations.length,
+      blueprintConflicts,
+      spatialConflicts,
+      totalAutoRepairs: Number(this.getMeta("totalAutoRepairs", "0")) || 0,
+      lastAuditAt: Number(this.getMeta("lastAuditAt", String(Date.now()))) || Date.now(),
+      lastAuditNote: this.getMeta("lastAuditNote", "Verified clean"),
+      creations: creationEntries,
+    };
+  }
+
+  public runWorldAuditAndRepair(): {
+    repairedCount: number;
+    repairs: string[];
+    audit: WorldAuditSummary;
+  } {
+    const res = this.auditAndRepairWorld();
+    if (res.repairedCount > 0) {
+      const refreshed = this.readBaseWorld();
+      this.broadcast({
+        type: "world_updated",
+        note: `Orchestrator repaired ${res.repairedCount} voxel overlap(s).`,
+        world: { ...refreshed, myCreationId: null },
+      });
+    }
+    return {
+      repairedCount: res.repairedCount,
+      repairs: res.repairs,
+      audit: this.getWorldAuditReport(),
+    };
   }
 
   private getMeta(key: string, fallback = ""): string {
@@ -549,6 +710,7 @@ export class WorldDO extends DurableObject<Env> {
     const worldWithNew = this.readBaseWorld();
     const initialPatch = buildInitialIntegration(worldWithNew, creation);
     this.applyWorldPatch(initialPatch);
+    this.auditAndRepairWorld();
 
     // Reload enriched creation & snapshot
     const finalBase = this.readBaseWorld();
@@ -602,6 +764,7 @@ export class WorldDO extends DurableObject<Env> {
         );
         if (patch) {
           this.applyWorldPatch(patch);
+          this.auditAndRepairWorld();
           const refreshed = this.readBaseWorld();
           this.broadcast({
             type: "world_updated",
@@ -621,6 +784,17 @@ export class WorldDO extends DurableObject<Env> {
   }
 
   public async runCronWeaver(): Promise<{ ok: boolean; note: string }> {
+    // Always run deterministic voxel & spatial overlap check + auto-repair on every orchestrator tick
+    const auditRes = this.auditAndRepairWorld();
+    if (auditRes.repairedCount > 0) {
+      const healedWorld = this.readBaseWorld();
+      this.broadcast({
+        type: "world_updated",
+        note: `Orchestrator auto-repaired ${auditRes.repairedCount} voxel overlap(s).`,
+        world: { ...healedWorld, myCreationId: null },
+      });
+    }
+
     if (!this.env.GEMINI_API_KEY) {
       return { ok: false, note: "Missing GEMINI_API_KEY" };
     }
@@ -629,9 +803,15 @@ export class WorldDO extends DurableObject<Env> {
     const lastWeaveCount = Number(this.getMeta("lastWeaveCount", "0")) || 0;
     const hasNewCreations = world.creations.length > lastWeaveCount;
 
-    // Only run background Cron World-Weaver when unintegrated or newly added creations exist!
+    // Only run background Cron World-Weaver LLM call when unintegrated or newly added creations exist!
     if (!hasUnintegrated && !hasNewCreations) {
-      return { ok: true, note: "Skipped — no new creations since last weave" };
+      return {
+        ok: true,
+        note:
+          auditRes.repairedCount > 0
+            ? `Auto-repaired ${auditRes.repairedCount} overlap(s); no new creations to weave`
+            : "Verified 0 voxel overlaps — no new creations since last weave",
+      };
     }
 
     try {
@@ -643,6 +823,7 @@ export class WorldDO extends DurableObject<Env> {
       );
       if (patch) {
         this.applyWorldPatch(patch);
+        this.auditAndRepairWorld();
         this.setMeta("lastWeaveCount", String(world.creations.length));
         const refreshed = this.readBaseWorld();
         this.broadcast({

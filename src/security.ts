@@ -330,7 +330,7 @@ export async function readBoundedJsonBody(
   }
 
   try {
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(merged);
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(merged);
     const parsed = JSON.parse(text);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       return { ok: false, status: 400, error: "Expected a JSON object." };

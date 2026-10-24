@@ -79,13 +79,12 @@ export function safeLogError(
 }
 
 /**
- * True ONLY when running locally in `wrangler dev` on loopback without Cloudflare edge metadata.
+ * True ONLY when running locally in `wrangler dev` over HTTP loopback (`localhost` / `127.0.0.1`).
+ * Impossible on production (`https://geminisland.raph.plus` with `workers_dev: false`).
  */
 export function isLocalDevRequest(request: Request): boolean {
-  const reqWithCf = request as Request & { cf?: unknown };
-  if (reqWithCf.cf) return false;
   const url = new URL(request.url);
-  return url.hostname === "localhost" || url.hostname === "127.0.0.1";
+  return url.protocol === "http:" && (url.hostname === "localhost" || url.hostname === "127.0.0.1");
 }
 
 function isAllowedOrigin(origin: string, isLocal: boolean): boolean {

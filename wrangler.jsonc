@@ -6,6 +6,9 @@
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": false,
   "preview_urls": false,
+  "dev": {
+    "host": "localhost"
+  },
   "routes": [
     {
       "pattern": "geminisland.raph.plus",

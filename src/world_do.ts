@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   buildInitialIntegration,
+  CITY_SIGN_POS,
   integrateCreationWithArgon,
   weaveWorldCronWithArgon,
   type WorldPatch,
@@ -114,6 +115,119 @@ export class WorldDO extends DurableObject<Env> {
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('lastWeaveAt', ?)`, String(Date.now()));
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('seeded', '1')`);
     }
+
+    // Non-destructive v3 upgrade: backfill liveFeed on seed landmarks & trim excess cron-spawned villagers
+    const upgradedV3 = sql.exec(`SELECT value FROM meta WHERE key = 'upgrade_v3'`).toArray();
+    if (upgradedV3.length === 0) {
+      const seedFeedDefaults: Record<string, WorldCreation["liveFeed"]> = {
+        "seed-windmill-bakery": { kind: "wind", place: "Meadow", lat: -33.87, lon: 151.21 },
+        "seed-clocktower-station": { kind: "time", place: "Meadow", timezone: "Australia/Sydney" },
+      };
+      for (const [seedId, feed] of Object.entries(seedFeedDefaults)) {
+        const rows = sql.exec(`SELECT json FROM creations WHERE id = ?`, seedId).toArray();
+        if (rows.length > 0) {
+          const parsed = JSON.parse(String(rows[0].json)) as WorldCreation;
+          if (!parsed.liveFeed) {
+            parsed.liveFeed = feed;
+            sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(parsed), seedId);
+          }
+        }
+      }
+
+      const allCreations = sql
+        .exec(`SELECT json FROM creations`)
+        .toArray()
+        .map((r) => JSON.parse(String(r.json)) as WorldCreation);
+      const contributors = allCreations.filter((c) => !c.isSeed).length;
+      const cap = Math.min(18, 6 + contributors * 2);
+
+      const allVillagers = sql
+        .exec(`SELECT id, json FROM villagers`)
+        .toArray()
+        .map((r) => ({ id: String(r.id), v: JSON.parse(String(r.json)) as WorldVillager }));
+
+      if (allVillagers.length > cap) {
+        const seedIds = new Set([
+          "villager-milo",
+          "villager-clara",
+          "villager-theo",
+          "villager-hana",
+          "villager-pip",
+          "villager-iris",
+        ]);
+        const kept: string[] = [];
+        for (const item of allVillagers) {
+          if (seedIds.has(item.id)) kept.push(item.id);
+        }
+        for (let i = allVillagers.length - 1; i >= 0 && kept.length < cap; i--) {
+          if (!seedIds.has(allVillagers[i].id)) {
+            kept.push(allVillagers[i].id);
+          }
+        }
+        const keepSet = new Set(kept);
+        for (const item of allVillagers) {
+          if (!keepSet.has(item.id)) {
+            sql.exec(`DELETE FROM villagers WHERE id = ?`, item.id);
+          }
+        }
+      }
+
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v3', '1')`);
+      this.bumpVersion();
+    }
+
+    // Non-destructive v4 cleanup: trim excess idle-cron footpath/prop/villager clutter while preserving all creations & roads
+    const upgradedV4 = sql.exec(`SELECT value FROM meta WHERE key = 'upgrade_v4'`).toArray();
+    if (upgradedV4.length === 0) {
+      const allCreations = sql
+        .exec(`SELECT json FROM creations`)
+        .toArray()
+        .map((r) => JSON.parse(String(r.json)) as WorldCreation);
+      const contributors = allCreations.filter((c) => !c.isSeed).length;
+
+      // Trim excess footpaths (keep seed paths, all roads, and up to 4 footpaths per contributor)
+      const allPaths = sql
+        .exec(`SELECT id, json FROM paths`)
+        .toArray()
+        .map((r) => ({ id: String(r.id), p: JSON.parse(String(r.json)) as WorldPath }));
+      const maxExtraFootpaths = Math.max(4, contributors * 4);
+      const removableFootpaths = allPaths.filter(
+        (x) => x.p.kind === "footpath" && !x.id.startsWith("path-"),
+      );
+      if (removableFootpaths.length > maxExtraFootpaths) {
+        const toDelete = removableFootpaths.slice(0, removableFootpaths.length - maxExtraFootpaths);
+        for (const item of toDelete) {
+          sql.exec(`DELETE FROM paths WHERE id = ?`, item.id);
+        }
+      }
+
+      // Trim excess minor props (keep seed props, ponds, bus stops, and up to 5 accent props per contributor)
+      const allProps = sql
+        .exec(`SELECT id, json FROM props`)
+        .toArray()
+        .map((r) => ({ id: String(r.id), pr: JSON.parse(String(r.json)) as WorldProp }));
+      const maxExtraProps = Math.max(5, contributors * 5);
+      const removableProps = allProps.filter(
+        (x) =>
+          !x.id.startsWith("prop-central-") &&
+          !x.id.startsWith("prop-stop-") &&
+          !x.id.startsWith("prop-lamp-") &&
+          !x.id.startsWith("prop-bench-pond") &&
+          !x.id.startsWith("prop-flowers-") &&
+          x.pr.kind !== "pond" &&
+          x.pr.kind !== "bus_stop",
+      );
+      if (removableProps.length > maxExtraProps) {
+        const toDelete = removableProps.slice(0, removableProps.length - maxExtraProps);
+        for (const item of toDelete) {
+          sql.exec(`DELETE FROM props WHERE id = ?`, item.id);
+        }
+      }
+
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('lastWeaveCount', ?)`, String(allCreations.length));
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v4', '1')`);
+      this.bumpVersion();
+    }
   }
 
   private getMeta(key: string, fallback = ""): string {
@@ -149,6 +263,7 @@ export class WorldDO extends DurableObject<Env> {
       .exec(`SELECT json FROM villagers`)
       .toArray()
       .map((r) => JSON.parse(String(r.json)) as WorldVillager);
+    const contributorCount = creations.filter((c) => !c.isSeed).length;
 
     return {
       version: parseInt(this.getMeta("version", "1"), 10) || 1,
@@ -156,6 +271,7 @@ export class WorldDO extends DurableObject<Env> {
       paths,
       props,
       villagers,
+      contributorCount,
       lastWeaveNote: this.getMeta("lastWeaveNote", "Meadow humming quietly in the sun."),
     };
   }
@@ -213,6 +329,7 @@ export class WorldDO extends DurableObject<Env> {
     world: Omit<WorldStateSnapshot, "myCreationId">,
   ): boolean {
     if (Math.abs(x) > 135 || Math.abs(z) > 135) return false;
+    if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < 5.0) return false;
     const minBuildingSep = category === "building" ? 11.0 : 6.8;
     for (const c of world.creations) {
       const sep = c.category === "building" || category === "building" ? minBuildingSep : 6.0;
@@ -293,6 +410,9 @@ export class WorldDO extends DurableObject<Env> {
       if (typeof upd.integratedLevel === "number") {
         existing.integratedLevel = Math.max(existing.integratedLevel, upd.integratedLevel);
       }
+      if (upd.liveFeed && !existing.liveFeed) {
+        existing.liveFeed = upd.liveFeed;
+      }
       if ((upd.integratedLevel ?? 0) >= 2 && (hasCustomRoad || upd.behavior.type === "vehicle_route")) {
         sql.exec(`DELETE FROM paths WHERE id = ?`, `initroad-${upd.creationId}`);
         if (patch.newProps.some((pr) => pr.kind === "bus_stop")) {
@@ -321,10 +441,29 @@ export class WorldDO extends DurableObject<Env> {
       }
     }
 
-    const villagerCount = Number(sql.exec(`SELECT COUNT(*) AS c FROM villagers`).toArray()[0]?.c ?? 0);
-    if (villagerCount < 30) {
+    const allCreations = sql
+      .exec(`SELECT json FROM creations`)
+      .toArray()
+      .map((r) => JSON.parse(String(r.json)) as WorldCreation);
+    const contributors = allCreations.filter((c) => !c.isSeed).length;
+    const maxVillagers = Math.min(18, 6 + contributors * 2);
+
+    const existingVillagers = sql
+      .exec(`SELECT json FROM villagers`)
+      .toArray()
+      .map((r) => JSON.parse(String(r.json)) as WorldVillager);
+    let villagerCount = existingVillagers.length;
+
+    if (villagerCount < maxVillagers) {
       for (const v of patch.newVillagers) {
+        if (villagerCount >= maxVillagers) break;
+        const tooClose = existingVillagers.some(
+          (ev) => Math.hypot((ev.homeX ?? 0) - v.homeX, (ev.homeZ ?? 0) - v.homeZ) < 2.2,
+        );
+        if (tooClose) continue;
         sql.exec(`INSERT OR REPLACE INTO villagers (id, json) VALUES (?, ?)`, v.id, JSON.stringify(v));
+        existingVillagers.push(v);
+        villagerCount++;
       }
     }
 
@@ -371,6 +510,7 @@ export class WorldDO extends DurableObject<Env> {
       z,
       yaw,
       blueprint: bp,
+      ...(bp.liveFeed ? { liveFeed: bp.liveFeed } : {}),
       behavior: {
         type: "landmark",
         facingYaw: yaw,
@@ -486,16 +626,12 @@ export class WorldDO extends DurableObject<Env> {
     }
     const world = this.readBaseWorld();
     const hasUnintegrated = world.creations.some((c) => c.integratedLevel < 2);
-    const lastWeaveAt = Number(this.getMeta("lastWeaveAt", "0")) || 0;
-    const elapsedMs = Date.now() - lastWeaveAt;
+    const lastWeaveCount = Number(this.getMeta("lastWeaveCount", "0")) || 0;
+    const hasNewCreations = world.creations.length > lastWeaveCount;
 
-    // Always run immediately if any creation has integratedLevel < 2; otherwise weave periodically
-    // when at least 110s elapsed and world still has room to evolve connections.
-    if (!hasUnintegrated && elapsedMs < 110_000) {
-      return { ok: true, note: "Skipped — recently woven" };
-    }
-    if (!hasUnintegrated && world.paths.length >= 48 && world.villagers.length >= 26) {
-      return { ok: true, note: "Meadow ecosystem at harmonious capacity" };
+    // Only run background Cron World-Weaver when unintegrated or newly added creations exist!
+    if (!hasUnintegrated && !hasNewCreations) {
+      return { ok: true, note: "Skipped — no new creations since last weave" };
     }
 
     try {
@@ -507,6 +643,7 @@ export class WorldDO extends DurableObject<Env> {
       );
       if (patch) {
         this.applyWorldPatch(patch);
+        this.setMeta("lastWeaveCount", String(world.creations.length));
         const refreshed = this.readBaseWorld();
         this.broadcast({
           type: "world_updated",

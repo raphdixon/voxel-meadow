@@ -1,4 +1,5 @@
 import { sculptWithArgon } from "./argon_sculptor";
+import { resolveWorldLiveFeeds } from "./live_feeds";
 import { WorldDO } from "./world_do";
 
 export { WorldDO };
@@ -102,6 +103,114 @@ export default {
       const stub = getWorldStub(env);
       const snapshot = await stub.getWorldSnapshot(id.ipHash, id.cookieId);
       return jsonResponse(snapshot, 200, id.setCookieHeader ? { "Set-Cookie": id.setCookieHeader } : undefined);
+    }
+
+    // Resolve simple cached live feeds (weather, surf, wind, time, moon, ISS) for creations that opted in
+    if (url.pathname === "/api/feeds" && request.method === "GET") {
+      const stub = getWorldStub(env);
+      const snapshot = await stub.getWorldSnapshot("", "");
+      const feeds = await resolveWorldLiveFeeds(snapshot.creations);
+      return jsonResponse({ ok: true, feeds }, 200);
+    }
+
+    // Atomic background build + permanent placement at visitor's chosen grass spot
+    if (url.pathname === "/api/build" && request.method === "POST") {
+      if (!env.GEMINI_API_KEY) {
+        return jsonResponse({ ok: false, error: "Server is missing GEMINI_API_KEY configuration." }, 500);
+      }
+
+      const id = await resolveVisitorIdentity(request, env);
+      const stub = getWorldStub(env);
+
+      const already = await stub.lookupCreatorCreation(id.ipHash, id.cookieId);
+      if (already) {
+        return jsonResponse(
+          {
+            ok: false,
+            alreadyPlaced: true,
+            myCreationId: already,
+            error: "You have already placed your one creation in the shared meadow!",
+          },
+          403,
+          id.setCookieHeader ? { "Set-Cookie": id.setCookieHeader } : undefined,
+        );
+      }
+
+      const quota = await stub.checkGenerateQuota(id.ipHash);
+      if (!quota.allowed) {
+        return jsonResponse(
+          {
+            ok: false,
+            error: `Please wait ${quota.retryAfterSec ?? 60}s before building again.`,
+          },
+          429,
+        );
+      }
+
+      let body: Record<string, unknown>;
+      try {
+        body = (await request.json()) as Record<string, unknown>;
+      } catch {
+        return jsonResponse({ ok: false, error: "Invalid JSON request body." }, 400);
+      }
+
+      const prompt = typeof body.prompt === "string" ? body.prompt.trim().slice(0, 600) : "";
+      let imageBase64: string | undefined;
+      let imageMimeType: string | undefined;
+
+      if (typeof body.imageDataUrl === "string" && body.imageDataUrl.startsWith("data:image/")) {
+        const commaIdx = body.imageDataUrl.indexOf(",");
+        if (commaIdx !== -1) {
+          const header = body.imageDataUrl.slice(5, commaIdx);
+          const mime = header.split(";")[0]?.trim() || "image/jpeg";
+          const b64 = body.imageDataUrl.slice(commaIdx + 1).trim();
+          if (b64.length > 5_500_000) {
+            return jsonResponse({ ok: false, error: "Image is too large — please use an image under 4 MB." }, 413);
+          }
+          imageMimeType = mime;
+          imageBase64 = b64;
+        }
+      }
+
+      try {
+        const sculpted = await sculptWithArgon(
+          { prompt, imageBase64, imageMimeType },
+          env.GEMINI_API_KEY,
+          env.ARGON_MODEL,
+          env.FALLBACK_MODEL,
+        );
+        if (!sculpted.ok) {
+          const status = sculpted.unsafe ? 422 : 400;
+          return jsonResponse(sculpted, status, id.setCookieHeader ? { "Set-Cookie": id.setCookieHeader } : undefined);
+        }
+
+        const placed = await stub.placeCreation({
+          ipHash: id.ipHash,
+          cookieId: id.cookieId,
+          blueprintRaw: sculpted.blueprint as unknown as Record<string, unknown>,
+          x: typeof body.x === "number" ? body.x : null,
+          z: typeof body.z === "number" ? body.z : null,
+          yaw: typeof body.yaw === "number" ? body.yaw : null,
+        });
+
+        if (!placed.ok) {
+          const status = placed.alreadyPlaced ? 409 : 400;
+          return jsonResponse(placed, status, id.setCookieHeader ? { "Set-Cookie": id.setCookieHeader } : undefined);
+        }
+
+        const feeds = await resolveWorldLiveFeeds(placed.world.creations);
+        return jsonResponse(
+          { ...placed, feeds },
+          200,
+          id.setCookieHeader ? { "Set-Cookie": id.setCookieHeader } : undefined,
+        );
+      } catch (err) {
+        console.error("Argon build error:", err);
+        return jsonResponse(
+          { ok: false, error: "Argon took a moment too long building that — please try once more." },
+          502,
+        );
+      }
     }
 
     // Generate high-detail micro-voxel blueprint from image upload and/or text description via Gemini 4 Argon

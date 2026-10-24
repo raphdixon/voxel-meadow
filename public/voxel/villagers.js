@@ -1,5 +1,5 @@
-// Articulated Voxel Villagers (with real Bus-Stop Queueing, Boarding, Riding & Alighting)
-// and Tactile World Props (Bus Stops, Ponds, Warm Lantern Posts, Benches, Flower Patches, Signposts).
+// Articulated Voxel Villagers (with Personal-Space Steering, Right-Hand Passing, Bus-Stop Queueing,
+// Boarding, Riding & Alighting) and Tactile World Props.
 
 import * as THREE from "../vendor/three-bundle.js";
 import { Vox, buildVoxelMesh } from "./vox.js";
@@ -92,18 +92,20 @@ export class VillagerAgent {
     this.rig = buildVillagerRig(data, index);
     this.group = this.rig.root;
 
-    const qAngle = (index * 2.1) % (Math.PI * 2);
-    this.queueOffsetX = Math.cos(qAngle) * 0.9;
-    this.queueOffsetZ = Math.sin(qAngle) * 0.9;
+    // Golden-angle staggered personal queue offset so villagers never target the exact same point
+    const qAngle = (index * 2.399963) % (Math.PI * 2);
+    const qRadius = 1.55 + (index % 5) * 0.65;
+    this.queueOffsetX = Math.cos(qAngle) * qRadius;
+    this.queueOffsetZ = Math.sin(qAngle) * qRadius;
 
     this.x = (data.homeX ?? 0) + this.queueOffsetX;
     this.z = (data.homeZ ?? 0) + this.queueOffsetZ;
-    this.yaw = 0;
+    this.yaw = qAngle;
     this.scale = 1.0;
 
-    this.stopIndex = 0;
+    this.stopIndex = index % Math.max(1, (data.stops || []).length);
     this.state = data.usesTransit ? "WALK_TO_STOP" : "STROLL";
-    this.timer = (index * 1.7) % 4.0;
+    this.timer = (index * 1.9) % 4.5;
     this.ridingVehicleId = null;
     this.boardedStopId = null;
     this.phase = index * 1.37;
@@ -115,30 +117,31 @@ export class VillagerAgent {
     this.data = data;
   }
 
-  step(dt, t, activeVehicles, ponds = []) {
+  step(dt, t, activeVehicles, ponds = [], allVillagers = [], obstacles = []) {
     this.ponds = ponds;
+    this.allVillagers = allVillagers;
+    this.obstacles = obstacles;
+
     const stops = this.data.stops && this.data.stops.length >= 2 ? this.data.stops : [[this.x, this.z], [0, -16]];
     let movingSpeed = 0;
 
     if (this.state === "RIDING") {
       const bus = activeVehicles.find((v) => v.id === this.ridingVehicleId);
       if (!bus) {
-        // Vehicle disappeared or reset; step onto grass safely
         this.state = "STROLL";
         this.group.visible = true;
         this.scale = 1.0;
       } else {
         this.x = bus.doorX;
         this.z = bus.doorZ;
-        // Alight as soon as the bus dwells at a DIFFERENT stop than where we boarded!
         if (bus.dwellingStop && bus.dwellingStop.id !== this.boardedStopId) {
           this.ridingVehicleId = null;
           this.group.visible = true;
           this.scale = 0.25;
-          this.x = bus.doorX;
-          this.z = bus.doorZ;
+          // Step off with slight per-villager fan-out so alighting passengers don't stack
+          this.x = bus.doorX + this.queueOffsetX * 0.35;
+          this.z = bus.doorZ + this.queueOffsetZ * 0.35;
           this.yaw = bus.yaw + Math.PI / 2;
-          // Pick a scenic spot or landmark stop to walk to after stepping off!
           this.stopIndex = (this.stopIndex + 1) % stops.length;
           this.state = "ALIGHT_VISIT";
           this.timer = 6.5 + (this.index % 4);
@@ -149,7 +152,6 @@ export class VillagerAgent {
       }
     }
 
-    // Smooth scale-in when stepping off bus
     if (this.scale < 1.0 && this.state !== "BOARDING") {
       this.scale = Math.min(1.0, this.scale + dt * 3.8);
     }
@@ -158,7 +160,7 @@ export class VillagerAgent {
       const target = stops[this.stopIndex % stops.length];
       const tx = target[0] + this.queueOffsetX;
       const tz = target[1] + this.queueOffsetZ;
-      const arrived = this.walkToward(tx, tz, 2.35, dt);
+      const arrived = this.walkToward(tx, tz, 2.25, dt, false);
       movingSpeed = arrived ? 0 : 1;
       if (arrived) {
         this.state = "WAIT_FOR_BUS";
@@ -166,31 +168,28 @@ export class VillagerAgent {
       }
     } else if (this.state === "WAIT_FOR_BUS") {
       this.timer += dt;
-      // Look gently down the road for an approaching bus
       this.rig.headPivot.rotation.y = Math.sin(t * 1.6 + this.phase) * 0.35;
 
-      // Check if any transit vehicle is currently dwelling at a stop within 7.5 units
       const nearbyStoppedBus = activeVehicles.find(
-        (v) => v.dwellingStop && Math.hypot(v.x - this.x, v.z - this.z) < 7.8,
+        (v) => v.dwellingStop && Math.hypot(v.x - this.x, v.z - this.z) < 8.8,
       );
       if (nearbyStoppedBus) {
         this.ridingVehicleId = nearbyStoppedBus.id;
         this.boardedStopId = nearbyStoppedBus.dwellingStop.id;
         this.state = "BOARDING";
-      } else if (this.timer > 24) {
-        // If no bus serves this spot yet, take a pleasant stroll to the next waypoint
+      } else if (this.timer > 20) {
         this.stopIndex = (this.stopIndex + 1) % stops.length;
         this.state = "STROLL";
+        this.timer = 4.0 + (this.index % 3);
       }
     } else if (this.state === "BOARDING") {
       const bus = activeVehicles.find((v) => v.id === this.ridingVehicleId);
       if (!bus || !bus.dwellingStop) {
-        // Missed the door before it pulled away — wait at curb
         this.state = "WAIT_FOR_BUS";
         this.scale = 1.0;
       } else {
-        const arrivedDoor = this.walkToward(bus.doorX, bus.doorZ, 3.4, dt);
-        movingSpeed = 1.25;
+        const arrivedDoor = this.walkToward(bus.doorX, bus.doorZ, 3.35, dt, true);
+        movingSpeed = 1.2;
         if (arrivedDoor) {
           this.scale = Math.max(0.15, this.scale - dt * 4.5);
           if (this.scale <= 0.2) {
@@ -202,35 +201,39 @@ export class VillagerAgent {
       }
     } else if (this.state === "ALIGHT_VISIT") {
       const visitSpot = stops[this.stopIndex % stops.length];
-      const tx = visitSpot[0] + this.queueOffsetX * 1.3;
-      const tz = visitSpot[1] + this.queueOffsetZ * 1.3;
-      const arrived = this.walkToward(tx, tz, 2.25, dt);
+      const tx = visitSpot[0] + this.queueOffsetX * 1.15;
+      const tz = visitSpot[1] + this.queueOffsetZ * 1.15;
+      const arrived = this.walkToward(tx, tz, 2.15, dt, false);
       movingSpeed = arrived ? 0 : 1;
       if (arrived) {
         this.timer -= dt;
         this.rig.headPivot.rotation.y = Math.sin(t * 1.8 + this.phase) * 0.3;
         if (this.timer <= 0) {
-          this.stopIndex = 0;
+          this.stopIndex = (this.stopIndex + 1) % stops.length;
           this.state = this.data.usesTransit ? "WALK_TO_STOP" : "STROLL";
         }
       }
     } else {
-      // STROLL mode for gardeners/strollers
       const target = stops[this.stopIndex % stops.length];
       const tx = target[0] + this.queueOffsetX;
       const tz = target[1] + this.queueOffsetZ;
-      const arrived = this.walkToward(tx, tz, 1.95, dt);
+      const arrived = this.walkToward(tx, tz, 1.9, dt, false);
       movingSpeed = arrived ? 0 : 0.85;
       if (arrived) {
         this.timer -= dt;
         if (this.timer <= 0) {
           this.stopIndex = (this.stopIndex + 1) % stops.length;
-          this.timer = 3.5 + (this.index % 3);
+          this.timer = 3.8 + (this.index % 3);
           if (this.data.usesTransit && this.stopIndex === 0) {
             this.state = "WALK_TO_STOP";
           }
         }
       }
+    }
+
+    // Enforce hard personal-space separation even while standing/waiting
+    if (this.state !== "BOARDING") {
+      this.resolveCollisions(dt);
     }
 
     // Animate gait (swinging limbs + cheerful walk bounce)
@@ -249,30 +252,122 @@ export class VillagerAgent {
     this.group.scale.setScalar(this.scale);
   }
 
-  walkToward(tx, tz, speed, dt) {
+  walkToward(tx, tz, speed, dt, isBoarding = false) {
     const dx = tx - this.x;
     const dz = tz - this.z;
     const dist = Math.hypot(dx, dz);
-    if (dist < 0.35) return true;
+    const arriveTol = isBoarding ? 0.45 : 0.55;
+    if (dist < arriveTol) return true;
+
+    let steerX = dx / dist;
+    let steerZ = dz / dist;
+
+    // Social-force personal-space repulsion + right-hand passing rule
+    if (!isBoarding && this.allVillagers) {
+      for (const other of this.allVillagers) {
+        if (other === this || !other.group.visible || other.state === "RIDING") continue;
+        const vx = this.x - other.x;
+        const vz = this.z - other.z;
+        const d = Math.hypot(vx, vz);
+        if (d < 3.2 && d > 0.0001) {
+          const ux = vx / d;
+          const uz = vz / d;
+          const prox = (3.2 - d) / 3.2;
+          // Push away + curve to right shoulder so oncoming villagers glide past each other
+          const repel = prox * prox * 1.65;
+          const rightPass = prox * 0.95;
+          steerX += ux * repel - uz * rightPass;
+          steerZ += uz * repel + ux * rightPass;
+        }
+      }
+    }
+
+    // Smoothly skirt around stationary buildings & town signboard
+    if (!isBoarding && this.obstacles) {
+      for (const obs of this.obstacles) {
+        const vx = this.x - obs.x;
+        const vz = this.z - obs.z;
+        const d = Math.hypot(vx, vz);
+        const avoidR = obs.r + 1.2;
+        if (d < avoidR && d > 0.001) {
+          const ux = vx / d;
+          const uz = vz / d;
+          const prox = (avoidR - d) / avoidR;
+          // Pick tangent direction aligned with goal
+          const t1x = -uz, t1z = ux;
+          const dot = t1x * (dx / dist) + t1z * (dz / dist);
+          const sign = dot >= 0 ? 1 : -1;
+          steerX += ux * prox * 1.5 + t1x * sign * prox * 1.1;
+          steerZ += uz * prox * 1.5 + t1z * sign * prox * 1.1;
+        }
+      }
+    }
+
+    const sLen = Math.hypot(steerX, steerZ) || 1;
+    steerX /= sLen;
+    steerZ /= sLen;
+
     const stepLen = Math.min(dist, speed * dt);
-    this.x += (dx / dist) * stepLen;
-    this.z += (dz / dist) * stepLen;
+    this.x += steerX * stepLen;
+    this.z += steerZ * stepLen;
+
+    this.resolveCollisions(dt, isBoarding);
+
+    const targetYaw = Math.atan2(steerX, steerZ);
+    let diff = targetYaw - this.yaw;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    this.yaw += diff * Math.min(1, dt * 8.5);
+    return Math.hypot(tx - this.x, tz - this.z) <= arriveTol;
+  }
+
+  resolveCollisions(dt, isBoarding = false) {
+    // Keep dry outside ponds
     for (const pond of this.ponds || []) {
-      const pr = (pond.radius || 6.4) + 0.85;
+      const pr = (pond.radius || 6.4) + 0.9;
       const pdx = this.x - pond.x;
       const pdz = this.z - pond.z;
       const pd = Math.hypot(pdx, pdz);
-      if (pd < pr && pd > 0.01) {
+      if (pd < pr && pd > 0.001) {
         this.x = pond.x + (pdx / pd) * pr;
         this.z = pond.z + (pdz / pd) * pr;
       }
     }
-    const targetYaw = Math.atan2(dx, dz);
-    let diff = targetYaw - this.yaw;
-    while (diff > Math.PI) diff -= Math.PI * 2;
-    while (diff < -Math.PI) diff += Math.PI * 2;
-    this.yaw += diff * Math.min(1, dt * 10);
-    return dist - stepLen <= 0.35;
+
+    // Keep outside stationary building footprints & city sign
+    if (!isBoarding && this.obstacles) {
+      for (const obs of this.obstacles) {
+        const odx = this.x - obs.x;
+        const odz = this.z - obs.z;
+        const od = Math.hypot(odx, odz);
+        if (od < obs.r && od > 0.001) {
+          this.x = obs.x + (odx / od) * obs.r;
+          this.z = obs.z + (odz / od) * obs.r;
+        }
+      }
+    }
+
+    // Non-overlapping personal space between villagers
+    if (!isBoarding && this.allVillagers) {
+      const minSep = 1.5;
+      for (const other of this.allVillagers) {
+        if (other === this || !other.group.visible || other.state === "RIDING") continue;
+        let dx = this.x - other.x;
+        let dz = this.z - other.z;
+        let d = Math.hypot(dx, dz);
+        if (d < minSep) {
+          if (d < 0.001) {
+            const ang = (this.index * 2.399) % (Math.PI * 2);
+            dx = Math.cos(ang);
+            dz = Math.sin(ang);
+            d = 1;
+          }
+          const push = Math.min((minSep - d) * 0.55, dt * 4.5 + 0.08);
+          this.x += (dx / d) * push;
+          this.z += (dz / d) * push;
+        }
+      }
+    }
   }
 
   dispose() {
@@ -345,16 +440,12 @@ export function buildWorldPropMesh(prop) {
     group.add(padMesh);
   } else if (prop.kind === "bus_stop") {
     const v = new Vox(51);
-    // Stone curb pad
     v.box(-5, 0, -3, 5, 1, 3, "concrete");
-    // Timber shelter posts + glass back + terracotta canopy
     v.box(-4, 1, -2, -3, 10, -1, "woodDark");
     v.box(3, 1, -2, 4, 10, -1, "woodDark");
     v.box(-3, 2, -2, 3, 9, -1, "glass");
     v.box(-5, 10, -3, 5, 11, 2, "terracotta");
-    // Waiting bench inside shelter
     v.box(-3, 2, -1, 3, 3, 1, "wood");
-    // Iconic yellow bus-stop sign pole on right
     v.box(5, 0, 1, 6, 11, 2, "steelDark");
     v.box(4, 10, 1, 7, 13, 2, "busYellow", 0.55);
     v.put(5, 11, 2, "charcoal");
@@ -380,19 +471,15 @@ export function buildWorldPropMesh(prop) {
     v.box(-1, 5, 0, 5, 6, 1, "wood");
     group.add(buildVoxelMesh(v, { scale: s }));
   } else {
-    // Plump, cohesive low voxel shrub & flower cushion (zero wispy isolated specks)
     const seed = Math.abs(Math.round((prop.x || 1) * 13 + (prop.z || 1) * 29)) + 91;
     const v = new Vox(seed);
     const blossoms = ["#f6d55c", "#ec8db0", "#fcfaf5", "#ffb642"];
     const b1 = blossoms[seed % blossoms.length];
     const b2 = blossoms[(seed + 1) % blossoms.length];
-    // Main low leafy mound
     v.sphere(0, 1.1, 0, 2.6, 1.4, 2.3, "leaf");
     v.sphere(2.1, 0.9, 1.1, 1.9, 1.2, 1.8, "leafLight");
     v.sphere(-1.8, 0.8, 0.9, 1.6, 1.1, 1.6, "leafDark");
-    // Trim underside below Y=0 so it sits flush on the grass
     v.clear(-6, -4, -6, 6, 0, 6);
-    // Chunky blossom clusters nestled on top
     v.put(-1, 2, 0, b1);
     v.put(0, 2, 1, b1);
     v.put(2, 2, 1, b2);

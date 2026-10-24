@@ -470,6 +470,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
       z: -3,
       yaw: Math.PI / 2,
       blueprint: bakeryBlueprint,
+      liveFeed: { kind: "wind", place: "Meadow", lat: -33.87, lon: 151.21 },
       behavior: {
         type: "landmark",
         facingYaw: Math.PI / 2,
@@ -490,6 +491,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
       z: -32,
       yaw: 0,
       blueprint: clocktowerBlueprint,
+      liveFeed: { kind: "time", place: "Meadow", timezone: "Australia/Sydney" },
       behavior: {
         type: "landmark",
         facingYaw: 0,
@@ -794,6 +796,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
     paths,
     props,
     villagers,
+    contributorCount: 0,
     lastWeaveNote: "Sunnyvale School Bus is running the Meadow Loop between Clocktower Station, Bookshop Corner, and Windmill Bakery.",
   };
 }

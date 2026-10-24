@@ -182,7 +182,18 @@ const SCULPTOR_SYSTEM_PROMPT = `You are Master Voxel Sculptor Argon, creating br
    - \`{"op":"line","x0":0,"y0":12,"z0":0,"x1":0,"y1":18,"z1":0,"radius":0.6,"color":"brass","mirrorX":false}\`
    - \`{"op":"voxels","list":[[2,7,9,"black"],[2,8,9,"white"]],"mirrorX":true}\`
 
-7. OUTPUT STRICT JSON ONLY:
+7. OPTIONAL SIMPLE LIVE API FEED (\`liveFeed\`) — DECIDE ONLY WHEN APPROPRIATE:
+   - Most ordinary creations (animals, cars, buses, furniture, food carts, regular houses, trees) DO NOT need live data — set \`"liveFeed": null\`.
+   - ONLY attach a simple \`liveFeed\` object when it genuinely fits what the creation is:
+     * Weather station, thermometer, barometer, rain cloud, sun dial, weather kiosk -> \`{"kind":"weather","place":"Sydney","lat":-33.87,"lon":151.21}\`
+     * Surfboard, surf shack, lifeguard tower, wave, beach van, lighthouse, sailboat -> \`{"kind":"surf","place":"Bondi","lat":-33.89,"lon":151.28}\`
+     * Windmill, wind turbine, anemometer, windsock, kite -> \`{"kind":"wind","place":"Meadow","lat":-33.87,"lon":151.21}\`
+     * Clocktower, station clock, sundial, watch -> \`{"kind":"time","place":"Sydney","timezone":"Australia/Sydney"}\`
+     * Observatory, telescope, moon shrine, wizard tower -> \`{"kind":"moon","place":"Meadow"}\`
+     * Satellite dish, space station, radar, rocket launchpad -> \`{"kind":"iss","place":"Orbit"}\`
+   - If the user mentions a real city or beach (e.g. "Tokyo clock", "Malibu surf shack", "London weather box"), fill \`place\`, \`lat\`, \`lon\`, and \`timezone\` for that real location! Keep it simple.
+
+8. OUTPUT STRICT JSON ONLY:
 {
   "safe": true,
   "extractedSubject": "concise phrase of what was extracted/sculpted",
@@ -190,6 +201,7 @@ const SCULPTOR_SYSTEM_PROMPT = `You are Master Voxel Sculptor Argon, creating br
   "description": "Warm, concise 1-sentence visual description (under 125 characters)",
   "category": "vehicle" | "creature" | "building" | "prop" | "aircraft" | "watercraft",
   "scaleClass": "small" | "medium" | "large",
+  "liveFeed": null,
   "palette": { "body": "#...", "bodyShade": "#...", "trim": "#...", "accent": "#...", "glass": "#...", "glow": "#..." },
   "ops": [ ... 32 to 65 detailed VoxelOp objects ... ],
   "parts": [

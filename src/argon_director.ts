@@ -1,6 +1,8 @@
 import { callGeminiArgon } from "./argon_sculptor";
+import { sanitizeLiveFeed } from "./live_feeds";
 import type {
   CreationBehavior,
+  LiveFeedSpec,
   RouteStop,
   WorldCreation,
   WorldPath,
@@ -9,8 +11,16 @@ import type {
   WorldVillager,
 } from "./types";
 
+export const CITY_SIGN_POS: [number, number] = [3.8, -10.8];
+
 export interface WorldPatch {
-  updatedBehaviors: { creationId: string; behavior: CreationBehavior; yaw?: number; integratedLevel?: number }[];
+  updatedBehaviors: {
+    creationId: string;
+    behavior: CreationBehavior;
+    yaw?: number;
+    integratedLevel?: number;
+    liveFeed?: LiveFeedSpec | null;
+  }[];
   newPaths: WorldPath[];
   newProps: WorldProp[];
   newVillagers: WorldVillager[];
@@ -56,6 +66,15 @@ export function nudgeClearOfBuildings(
         px = c.x + ux * minDist;
         pz = c.z + uz * minDist;
       }
+    }
+    const sdx = px - CITY_SIGN_POS[0];
+    const sdz = pz - CITY_SIGN_POS[1];
+    const sd = Math.hypot(sdx, sdz);
+    if (sd < 3.6) {
+      const ux = sd > 0.01 ? sdx / sd : 1;
+      const uz = sd > 0.01 ? sdz / sd : 0;
+      px = CITY_SIGN_POS[0] + ux * 3.6;
+      pz = CITY_SIGN_POS[1] + uz * 3.6;
     }
   }
   return [Number(px.toFixed(1)), Number(pz.toFixed(1))];
@@ -270,6 +289,7 @@ function summarizeWorldForArgon(world: Omit<WorldStateSnapshot, "myCreationId">)
       z: c.z,
       yaw: Number(c.yaw.toFixed(2)),
       integratedLevel: c.integratedLevel,
+      liveFeed: c.liveFeed ?? null,
       behavior: c.behavior,
     })),
     paths: world.paths.slice(0, 32),
@@ -302,6 +322,9 @@ CORE WORLD RULES & COORDINATES:
   * Ensure a \`pond\` prop (\`radius: 6..8\`) exists at \`(pondX, pondZ)\` and give it \`water_float\`.
 - When \`aircraft\` is integrated:
   * Give it \`fly_circle\` (\`altitude: 11..16\`, \`speed: 4..6.5\`, \`radius: 15..28\`) sweeping above scenic landmarks.
+- VILLAGER SPACING: Keep \`newVillagers\` modest (0 to 1 per integration, 0 on cron runs if \`villagerCount >= 10\`) and spread their \`stops\` across distinct landmarks so villagers don't crowd the same spot.
+- OPTIONAL SIMPLE LIVE API (\`liveFeed\` on \`updatedBehaviors\`):
+  * Only set \`liveFeed\` if the creation currently has \`liveFeed: null\` AND clearly benefits from a simple live world feed (\`"weather"\`, \`"surf"\`, \`"wind"\`, \`"time"\`, \`"moon"\`, or \`"iss"\`, e.g. \`{"kind":"surf","place":"Bondi","lat":-33.89,"lon":151.28}\` for a surf shack/board/lighthouse, \`{"kind":"weather","place":"Sydney","lat":-33.87,"lon":151.21}\` for a weather station). Leave \`liveFeed\` omitted for ordinary creations!
 
 OUTPUT STRICT JSON ONLY matching this exact schema:
 {
@@ -428,10 +451,12 @@ export function sanitizeWorldPatch(
     }
 
     if (behavior) {
+      const parsedFeed = rec.liveFeed !== undefined ? sanitizeLiveFeed(rec.liveFeed) : undefined;
       updatedBehaviors.push({
         creationId,
         behavior,
         ...(rec.yaw !== undefined ? { yaw: clamp(num(rec.yaw, target.yaw), -Math.PI * 2, Math.PI * 2) } : {}),
+        ...(parsedFeed ? { liveFeed: parsedFeed } : {}),
         integratedLevel: Math.max(target.integratedLevel, clamp(Math.round(num(rec.integratedLevel, 2)), 1, 3)),
       });
     }

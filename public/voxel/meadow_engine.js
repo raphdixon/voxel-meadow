@@ -1,11 +1,12 @@
-// Endless Sunlit Voxel Turf World Engine + Pure-White (#FFFFFF) Modal Turntable Preview.
+// Endless Sunlit Voxel Turf World Engine.
 // Features:
 //  - Crisp voxel-tiled sunlit meadow ground shader with beveled grass blocks, subtle park-lawn weave & cumulus sun dapple
-//  - Chunky 3D voxel perimeter groves (trees & flowering shrubs — zero wispy grass sticks)
+//  - Physical 3D City Contributor Signboard in the central village green (live contributor count)
+//  - Simple in-world live API micro-badges (weather, surf, wind, time, moon, ISS)
+//  - Interactive 3D voxel plot stake marker + live voxel construction scaffolding while building
 //  - Camera-tracking texel-snapped 4096^2 PCF golden-hour shadows (zero pan shimmer!)
 //  - GTAO real-time contact occlusion + subtle UnrealBloom + ACESFilmic + SMAA
-//  - Smooth CatmullRom vehicle routes with bus-stop deceleration, dwell & physical wheel roll
-//  - Articulated voxel villagers boarding & alighting buses at different stops
+//  - Smooth CatmullRom vehicle routes + polite non-overlapping voxel villagers
 
 import * as THREE from "../vendor/three-bundle.js";
 import {
@@ -18,6 +19,20 @@ import {
 } from "../vendor/three-bundle.js";
 import { VillagerAgent, buildWorldPropMesh } from "./villagers.js";
 import { Vox, buildCreationGroup, buildVoxelMesh } from "./vox.js";
+
+const CITY_SIGN_POS = [3.8, -10.8];
+const CITY_SIGN_YAW = 0.62;
+
+function distToSeg2D(px, pz, ax, az, bx, bz) {
+  const vx = bx - ax;
+  const vz = bz - az;
+  const wx = px - ax;
+  const wz = pz - az;
+  const len2 = vx * vx + vz * vz;
+  if (len2 < 0.001) return Math.hypot(px - ax, pz - az);
+  const t = Math.max(0, Math.min(1, (wx * vx + wz * vz) / len2));
+  return Math.hypot(px - (ax + t * vx), pz - (az + t * vz));
+}
 
 function makeMeadowSkyTexture() {
   const c = document.createElement("canvas");
@@ -34,6 +49,230 @@ function makeMeadowSkyTexture() {
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   return tex;
+}
+
+function roundRectPath(ctx, x, y, w, h, r) {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
+}
+
+function createContributorSignboard(maxAniso = 4) {
+  const group = new THREE.Group();
+  const s = 0.21;
+  const v = new Vox(905);
+
+  // Stepped limestone & stone-shade base plinth + brass corner studs
+  v.box(-14, 0, -4, 14, 1, 4, "concrete2");
+  v.box(-13, 1, -3, 13, 2, 3, "limestone");
+  for (const [cx, cz] of [[-13, -3], [12, -3], [-13, 2], [12, 2]]) {
+    v.put(cx, 2, cz, "brass");
+  }
+
+  // Twin dark-oak timber posts
+  v.box(-12, 2, -1, -10, 20, 1, "woodDark");
+  v.box(10, 2, -1, 12, 20, 1, "woodDark");
+  v.box(-12, 20, -1, -10, 21, 1, "brass");
+  v.box(10, 20, -1, 12, 21, 1, "brass");
+
+  // Solid oak signboard frame & backing
+  v.box(-10, 5, -1, 10, 18, 1, "oak");
+  v.box(-11, 4, -1, 11, 5, 1, "woodDark");
+  v.box(-11, 18, -1, 11, 19, 1, "woodDark");
+
+  // Pitched terracotta shingle eave canopy + warm glowing crown lantern
+  v.box(-14, 19, -3, 14, 20, 3, "terracotta");
+  v.box(-13, 20, -2, 13, 21, 2, "brickDark");
+  v.box(-1, 21, -1, 1, 23, 1, "iron");
+  v.box(-1, 22, 1, 1, 24, 3, "warmGlow", 1.45);
+
+  // Cozy flower cushions tucked beside stone base
+  v.sphere(-14, 1.5, 2, 1.8, 1.2, 1.6, "leaf");
+  v.sphere(14, 1.5, 2, 1.8, 1.2, 1.6, "leafLight");
+  v.clear(-18, -3, -8, 18, 0, 8);
+  v.put(-14, 2, 2, "#f6d55c");
+  v.put(14, 2, 2, "#ec8db0");
+
+  group.add(buildVoxelMesh(v, { scale: s }));
+
+  // Crisp high-DPI CanvasTexture plaque on front & back faces
+  const canvas = document.createElement("canvas");
+  canvas.width = 512;
+  canvas.height = 280;
+  const ctx = canvas.getContext("2d");
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = Math.min(8, maxAniso);
+
+  const plaqueGeo = new THREE.PlaneGeometry(4.15, 2.52);
+  const plaqueMat = new THREE.MeshStandardMaterial({
+    map: tex,
+    roughness: 0.56,
+    metalness: 0.04,
+  });
+
+  const frontPlaque = new THREE.Mesh(plaqueGeo, plaqueMat);
+  frontPlaque.position.set(0, 11.5 * s, 1.08 * s);
+  group.add(frontPlaque);
+
+  const backPlaque = new THREE.Mesh(plaqueGeo, plaqueMat);
+  backPlaque.position.set(0, 11.5 * s, -1.08 * s);
+  backPlaque.rotation.y = Math.PI;
+  group.add(backPlaque);
+
+  let renderedCount = -1;
+  function updateCount(count) {
+    const n = Math.max(0, Number(count) || 0);
+    if (n === renderedCount) return;
+    renderedCount = n;
+
+    ctx.clearRect(0, 0, 512, 280);
+
+    // Timber outer border
+    roundRectPath(ctx, 4, 4, 504, 272, 22);
+    ctx.fillStyle = "#5c3b20";
+    ctx.fill();
+
+    // Warm cream enamel sign face
+    roundRectPath(ctx, 18, 18, 476, 244, 14);
+    ctx.fillStyle = "#fcf7ea";
+    ctx.fill();
+
+    // Subtle brass pin-stripe + 4 corner rivets
+    roundRectPath(ctx, 28, 28, 456, 224, 10);
+    ctx.strokeStyle = "#d3a14a";
+    ctx.lineWidth = 3.5;
+    ctx.stroke();
+
+    ctx.fillStyle = "#c9953c";
+    for (const [rx, ry] of [[42, 42], [470, 42], [42, 238], [470, 238]]) {
+      ctx.beginPath();
+      ctx.arc(rx, ry, 6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Header
+    ctx.fillStyle = "#6b4f35";
+    ctx.font = "800 28px -apple-system, BlinkMacSystemFont, 'Inter', sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("VOXEL MEADOW", 256, 66);
+
+    // Big contributor count numeral
+    ctx.fillStyle = "#18211b";
+    ctx.font = "800 104px -apple-system, BlinkMacSystemFont, 'Inter', sans-serif";
+    ctx.fillText(String(n), 256, 148);
+
+    // Concise bottom line
+    ctx.fillStyle = "#267043";
+    ctx.font = "800 32px -apple-system, BlinkMacSystemFont, 'Inter', sans-serif";
+    ctx.fillText(n === 1 ? "CONTRIBUTOR" : "CONTRIBUTORS", 256, 220);
+
+    tex.needsUpdate = true;
+  }
+
+  updateCount(0);
+  group.position.set(CITY_SIGN_POS[0], 0, CITY_SIGN_POS[1]);
+  group.rotation.y = CITY_SIGN_YAW;
+
+  return { group, updateCount };
+}
+
+function buildPlotMarkerGroup() {
+  const group = new THREE.Group();
+
+  // Crisp glowing ground plot ring
+  const ringGeo = new THREE.RingGeometry(2.35, 2.78, 48);
+  ringGeo.rotateX(-Math.PI / 2);
+  const ringMat = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.92,
+    side: THREE.DoubleSide,
+  });
+  const ring = new THREE.Mesh(ringGeo, ringMat);
+  ring.position.y = 0.11;
+  group.add(ring);
+
+  // 4 chunky voxel corner stakes (oak + brass cap)
+  const stakeVox = new Vox(931);
+  for (const [sx, sz] of [[-8, -8], [7, -8], [-8, 7], [7, 7]]) {
+    stakeVox.box(sx, 0, sz, sx + 2, 5, sz + 2, "woodDark");
+    stakeVox.box(sx, 5, sz, sx + 2, 6, sz + 2, "gold", 0.45);
+  }
+  const stakesMesh = buildVoxelMesh(stakeVox, { scale: 0.22 });
+  group.add(stakesMesh);
+
+  // Construction scaffolding sub-group (shown while Argon builds in the background)
+  const scaffoldGroup = new THREE.Group();
+  const scafVox = new Vox(947);
+  for (const [sx, sz] of [[-9, -9], [8, -9], [-9, 8], [8, 8]]) {
+    scafVox.box(sx, 0, sz, sx + 2, 16, sz + 2, "wood");
+  }
+  // Crossbars
+  scafVox.box(-9, 8, -9, 10, 9, -8, "hazard");
+  scafVox.box(-9, 8, 9, 10, 9, 10, "hazard");
+  scafVox.box(-9, 8, -9, -8, 9, 10, "hazard");
+  scafVox.box(9, 8, -9, 10, 9, 10, "hazard");
+  scafVox.box(-9, 15, -9, 10, 16, -8, "woodLight");
+  scafVox.box(-9, 15, 9, 10, 16, 10, "woodLight");
+  scaffoldGroup.add(buildVoxelMesh(scafVox, { scale: 0.22 }));
+
+  // Animated floating voxel blocks inside the worksite
+  const floatingCubes = [];
+  const cubeCols = ["busYellow", "teal", "terracotta"];
+  for (let i = 0; i < 3; i++) {
+    const cv = new Vox(960 + i);
+    cv.box(-2, -2, -2, 2, 2, 2, cubeCols[i], 0.35);
+    const cm = buildVoxelMesh(cv, { scale: 0.2 });
+    scaffoldGroup.add(cm);
+    floatingCubes.push(cm);
+  }
+  scaffoldGroup.visible = false;
+  group.add(scaffoldGroup);
+  group.visible = false;
+
+  return { group, ring, ringMat, scaffoldGroup, floatingCubes };
+}
+
+const FEED_DOT_COLORS = {
+  weather: "#f5b82e",
+  surf: "#3ca7de",
+  wind: "#4eb86e",
+  time: "#d99b38",
+  moon: "#9370cf",
+  iss: "#3ec9bd",
+};
+
+function drawFeedBadgeCanvas(canvas, reading) {
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  roundRectPath(ctx, 6, 6, w - 12, h - 12, 54);
+  ctx.fillStyle = "rgba(22, 28, 24, 0.88)";
+  ctx.fill();
+  ctx.lineWidth = 3.5;
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.72)";
+  ctx.stroke();
+
+  const dotCol = FEED_DOT_COLORS[reading.kind] || "#3fb963";
+  ctx.fillStyle = dotCol;
+  ctx.beginPath();
+  ctx.arc(46, h / 2, 12, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "700 40px -apple-system, BlinkMacSystemFont, 'Inter', sans-serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText(String(reading.badge || "").slice(0, 20), 74, h / 2 + 2);
 }
 
 function buildEndlessGrassMaterial(uniforms) {
@@ -93,17 +332,14 @@ function buildEndlessGrassMaterial(uniforms) {
         vec2 cell = floor(tileCoord);
         vec2 cellUv = fract(tileCoord);
 
-        // Anti-aliased level-of-detail factor so voxel turf blocks stay crisp up close and silky-smooth far out
         float tilePx = max(fwidth(tileCoord.x), fwidth(tileCoord.y));
         float tileDetail = 1.0 - smoothstep(0.06, 0.20, tilePx);
 
-        // Curated linear-space sunlit diorama turf palette (matches Project Factory's lush voxel greens)
         vec3 turfDeep = srgb2lin(103.0, 174.0, 74.0);
         vec3 turfBase = srgb2lin(116.0, 187.0, 84.0);
         vec3 turfMid  = srgb2lin(128.0, 198.0, 94.0);
         vec3 turfSun  = srgb2lin(142.0, 209.0, 105.0);
 
-        // Broad meadow sunlight zones + subtle 4x4 courtyard lawn weave + deterministic per-block voxel tone
         float meadowZone = mNoise(wp * 0.028);
         float subZone = mNoise(wp * 0.085 + vec2(19.4, -11.2));
         float cellH = mHash(cell);
@@ -114,11 +350,9 @@ function buildEndlessGrassMaterial(uniforms) {
         grassCol = mix(grassCol, turfMid, smoothstep(0.42, 0.85, subZone) * 0.72);
         grassCol = mix(grassCol, turfSun, smoothstep(0.68, 0.96, meadowZone * 0.6 + subZone * 0.4) * 0.45);
 
-        // Stepped per-voxel block variation (faded cleanly at Grazing/far zoom)
         float blockTone = (floor(cellH * 4.0) / 3.0 - 0.5) * 0.075 + (lawnCheck - 0.5) * 0.028;
         grassCol *= 1.0 + blockTone * tileDetail;
 
-        // Tactile voxel block seam & sunlit top-left bevel catchlight
         vec2 edgeDist = min(cellUv, 1.0 - cellUv);
         float minEdge = min(edgeDist.x, edgeDist.y);
         float seamW = max(0.042, tilePx * 1.35);
@@ -128,12 +362,10 @@ function buildEndlessGrassMaterial(uniforms) {
         float topLip = (1.0 - smoothstep(0.0, 0.14, cellUv.y)) * seam;
         grassCol += grassCol * topLip * 0.045 * tileDetail;
 
-        // Gentle drifting cumulus sunlight warmth across the endless meadow
         vec2 cloudUv = wp * 0.011 + vec2(uTime * 0.008, uTime * 0.0045);
         float cloud = mNoise(cloudUv) * 0.65 + mNoise(cloudUv * 2.0 + 3.7) * 0.35;
         grassCol *= mix(0.92, 1.05, smoothstep(0.32, 0.70, cloud));
 
-        // Seamless distant horizon mist
         float distFocus = length(wp - uFocusXZ);
         vec3 horizonMist = srgb2lin(154.0, 206.0, 134.0);
         grassCol = mix(grassCol, horizonMist, smoothstep(185.0, 480.0, distFocus) * 0.58);
@@ -154,7 +386,6 @@ function buildRibbonMesh(curve, sampleCount, halfWidth, yOffset, colorHex, recei
   const uvs = [];
   const indices = [];
 
-  // Top surface strip
   for (let i = 0; i < pts.length; i++) {
     const p = isClosed && i === pts.length - 1 ? pts[0] : pts[i];
     const prev = isClosed
@@ -183,7 +414,6 @@ function buildRibbonMesh(curve, sampleCount, halfWidth, yOffset, colorHex, recei
     }
   }
 
-  // Solid 3D side curb skirts down to Y=0 so road/curb slabs sit crisply on the voxel turf
   for (const side of [-1, 1]) {
     const sideBase = positions.length / 3;
     for (let i = 0; i < pts.length; i++) {
@@ -242,20 +472,16 @@ function buildRibbonMesh(curve, sampleCount, halfWidth, yOffset, colorHex, recei
 
 function buildMeadowTreeMesh(variant = 0) {
   const v = new Vox(700 + variant * 19);
-  // Trunk + roots
   v.box(-1, 0, -1, 2, 1, 2, "woodDark");
   v.box(0, 0, 0, 1, 8, 1, variant % 3 === 1 ? "cream" : "woodDark");
   if (variant % 3 === 0) {
-    // Lush Oak
     v.sphere(0.5, 11, 0.5, 4.8, 4.2, 4.8, "leaf");
     v.sphere(2.2, 10, 1.5, 3.0, 2.8, 3.0, "leafLight");
     v.sphere(-1.8, 9.5, -1.2, 3.2, 2.6, 3.2, "leafDark");
   } else if (variant % 3 === 1) {
-    // Spring Blossom Birch
     v.sphere(0.5, 11.5, 0.5, 4.2, 4.6, 4.2, "#f29cb8");
     v.sphere(1.8, 10.2, 1.4, 2.8, 2.6, 2.8, "#fbd0df");
   } else {
-    // Cypress / Meadow Pine
     v.cone(0.5, 5, 14, 0.5, 4.2, 0.9, "leafDark");
     v.cone(0.5, 9, 17, 0.5, 3.1, 0.6, "leaf");
   }
@@ -291,6 +517,15 @@ class CreationSimEntity {
     this.moveFactor = 0;
     this.spawnScale = creation.isSeed ? 1.0 : 0.05;
 
+    // Height estimate for optional live-feed badge
+    const worldUnit = creation.scaleClass === "large" ? 0.34 : creation.scaleClass === "medium" ? 0.24 : 0.18;
+    this.topY = Math.max(2.2, (creation.blueprint?.stats?.maxY || 14) * worldUnit);
+    this.feedReading = null;
+    this.feedBadgeText = "";
+    this.feedCanvas = null;
+    this.feedTex = null;
+    this.feedMesh = null;
+
     // Transit / Vehicle curve state
     this.routeCurve = null;
     this.routeLength = 1;
@@ -316,6 +551,39 @@ class CreationSimEntity {
     this.group.scale.setScalar(this.spawnScale);
   }
 
+  setLiveFeedReading(reading, maxAniso = 4) {
+    this.feedReading = reading || null;
+    if (!reading || !reading.badge) {
+      if (this.feedMesh) this.feedMesh.visible = false;
+      return;
+    }
+    if (!this.feedMesh) {
+      this.feedCanvas = document.createElement("canvas");
+      this.feedCanvas.width = 512;
+      this.feedCanvas.height = 116;
+      this.feedTex = new THREE.CanvasTexture(this.feedCanvas);
+      this.feedTex.colorSpace = THREE.SRGBColorSpace;
+      this.feedTex.anisotropy = Math.min(8, maxAniso);
+      const geo = new THREE.PlaneGeometry(4.2, 0.95);
+      const mat = new THREE.MeshBasicMaterial({
+        map: this.feedTex,
+        transparent: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      });
+      this.feedMesh = new THREE.Mesh(geo, mat);
+      this.feedMesh.position.set(0, this.topY + 1.15, 0);
+      this.group.add(this.feedMesh);
+    }
+    this.feedMesh.visible = true;
+    const key = `${reading.kind}:${reading.badge}`;
+    if (key !== this.feedBadgeText) {
+      this.feedBadgeText = key;
+      drawFeedBadgeCanvas(this.feedCanvas, reading);
+      this.feedTex.needsUpdate = true;
+    }
+  }
+
   rebuildBehavior(creation) {
     this.data = creation;
     const b = creation.behavior;
@@ -325,7 +593,6 @@ class CreationSimEntity {
       this.routeLength = Math.max(8, this.routeCurve.getLength());
       this.routeDist = this.routeDist % this.routeLength;
 
-      // Map each stop to its closest arc-length position along the closed curve
       const samples = 160;
       this.stopArcPositions = (b.stops || []).map((stop) => {
         let bestU = 0;
@@ -347,8 +614,7 @@ class CreationSimEntity {
     }
   }
 
-  step(dt, t, allEntities = [], ponds = []) {
-    // Springy arrival pop when freshly placed!
+  step(dt, t, allEntities = [], ponds = [], camAz = 0.62) {
     if (this.spawnScale < 1.0) {
       this.spawnScale = Math.min(1.0, this.spawnScale + dt * 3.2);
     }
@@ -367,7 +633,6 @@ class CreationSimEntity {
           this.dwellingStop = null;
         }
       } else {
-        // Smooth deceleration as we approach the next stop
         let speedScale = 1.0;
         for (const sp of this.stopArcPositions) {
           let ahead = sp.distOnCurve - this.routeDist;
@@ -389,7 +654,6 @@ class CreationSimEntity {
           }
         }
 
-        // Polite vehicle-to-vehicle spacing & intersection yielding
         if (speedScale > 0) {
           const fwdX = Math.sin(this.yaw);
           const fwdZ = Math.cos(this.yaw);
@@ -409,26 +673,23 @@ class CreationSimEntity {
 
         const stepDist = (b.speed || 6.0) * speedScale * dt;
         this.routeDist = (this.routeDist + stepDist) % this.routeLength;
-        // Exact wheel angular roll from linear ground distance!
         this.wheelAngle += stepDist / 0.62;
         this.moveFactor = speedScale;
       }
 
-      const u = ((this.routeDist % this.routeLength) + this.routeLength) % this.routeLength / this.routeLength;
+      const u = (((this.routeDist % this.routeLength) + this.routeLength) % this.routeLength) / this.routeLength;
       const pos = this.routeCurve.getPointAt(u);
       const tan = this.routeCurve.getTangentAt(u);
       this.x = pos.x;
       this.z = pos.z;
-      this.y = 0.092; // Sit cleanly on raised asphalt surface
+      this.y = 0.092;
       this.yaw = Math.atan2(tan.x, tan.z);
 
-      // Starboard curb-side door world coordinates for boarding villagers
       const rightX = -Math.cos(this.yaw);
       const rightZ = Math.sin(this.yaw);
       this.doorX = this.x + rightX * 1.9 + Math.sin(this.yaw) * 0.9;
       this.doorZ = this.z + rightZ * 1.9 + Math.cos(this.yaw) * 0.9;
 
-      // Subtle engine purr when stopped or driving
       pitchX = this.dwellingStop ? 0 : Math.sin(t * 14) * 0.008 * this.moveFactor;
     } else if (b?.type === "wander") {
       const targets =
@@ -478,7 +739,7 @@ class CreationSimEntity {
           if (b.style === "hop") {
             this.hopPhase = (this.hopPhase + dt * 3.4) % 1;
             const u = this.hopPhase;
-            this.y = 4 * 0.58 * u * (1 - u); // C1 parabolic hop arc
+            this.y = 4 * 0.58 * u * (1 - u);
             pitchX = (0.5 - u) * 0.22;
           } else if (b.style === "trot") {
             this.y = Math.abs(Math.sin(t * 9.0)) * 0.12;
@@ -501,8 +762,12 @@ class CreationSimEntity {
       if (Math.hypot(dx, dz) > 0.0005) {
         this.yaw = Math.atan2(dx, dz);
       }
-      rollZ = Math.sin(t * 2.1) * 0.05;
-      pitchX = Math.cos(t * 1.8) * 0.035;
+      const surfBoost =
+        this.feedReading?.kind === "surf" && typeof this.feedReading.value === "number"
+          ? Math.max(0.7, Math.min(2.2, this.feedReading.value))
+          : 1.0;
+      rollZ = Math.sin(t * 2.1) * 0.05 * surfBoost;
+      pitchX = Math.cos(t * 1.8) * 0.035 * surfBoost;
       this.moveFactor = 0.7;
     } else if (b?.type === "fly_circle") {
       this.orbitAngle += ((b.speed || 4.8) / Math.max(8, b.radius || 16)) * dt;
@@ -517,21 +782,29 @@ class CreationSimEntity {
       if (Math.hypot(dx, dz) > 0.001) {
         this.yaw = Math.atan2(dx, dz);
       }
-      rollZ = -0.22; // Graceful inward bank turn
+      rollZ = -0.22;
       this.moveFactor = 1.0;
     } else {
-      // Stationary landmark / cottage / monument
       this.y = 0;
       if (typeof b?.facingYaw === "number") {
         this.yaw = b.facingYaw;
       }
-      this.moveFactor = 1.0;
+      if (this.feedReading?.kind === "wind" && typeof this.feedReading.value === "number") {
+        this.moveFactor = Math.max(0.45, Math.min(2.1, this.feedReading.value / 15));
+      } else {
+        this.moveFactor = 1.0;
+      }
     }
 
     this.group.position.set(this.x, this.y, this.z);
     this.group.rotation.set(pitchX, this.yaw, rollZ);
     const popEase = this.spawnScale < 1 ? 1 - (1 - this.spawnScale) ** 3 : 1;
     this.group.scale.setScalar(popEase);
+
+    if (this.feedMesh && this.feedMesh.visible) {
+      this.feedMesh.position.y = this.topY + 1.15 + Math.sin(t * 2.1) * 0.05;
+      this.feedMesh.rotation.y = camAz - this.yaw;
+    }
 
     this.group.userData.animate?.(t, {
       wheelAngle: this.wheelAngle,
@@ -540,6 +813,11 @@ class CreationSimEntity {
   }
 
   dispose() {
+    if (this.feedMesh) {
+      this.feedMesh.geometry.dispose();
+      this.feedMesh.material.dispose();
+      this.feedTex?.dispose();
+    }
     this.group.userData.dispose?.();
   }
 }
@@ -560,6 +838,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
   const dbg = gl.getExtension("WEBGL_debug_renderer_info");
   const gpuName = dbg ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || "") : "";
   const isSoftwareGpu = /swiftshader|llvmpipe|software|basic render/i.test(gpuName);
+  const maxAniso = renderer.capabilities.getMaxAnisotropy?.() || 4;
 
   renderer.setPixelRatio(isSoftwareGpu ? 1 : Math.min(window.devicePixelRatio || 1, 2));
   renderer.setSize(w0, h0, false);
@@ -579,7 +858,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     900,
   );
 
-  // Studio Post-Processing (GTAO contact shadows + gentle warm bloom + SMAA)
   const composer = isSoftwareGpu ? null : new EffectComposer(renderer);
   let gtaoPass = null;
   let smaaPass = null;
@@ -632,7 +910,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
   rim.position.set(-85, 70, -90);
   scene.add(rim);
 
-  // Endless Voxel Turf Ground Plane (zero wispy sticks or floating particles)
+  // Endless Voxel Turf Ground Plane
   const grassUniforms = {
     uTime: { value: 0 },
     uFocusXZ: { value: new THREE.Vector2(0, 0) },
@@ -643,7 +921,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
   groundMesh.receiveShadow = true;
   scene.add(groundMesh);
 
-  // Scattered scenic perimeter Meadow Groves (trees + chunky flowering voxel shrubs)
+  // Physical 3D City Contributor Signboard on the central village green
+  const citySignboard = createContributorSignboard(maxAniso);
+  scene.add(citySignboard.group);
+
+  // Scattered scenic perimeter Meadow Groves
   const perimeterTreesGroup = new THREE.Group();
   scene.add(perimeterTreesGroup);
   const treeProtos = [buildMeadowTreeMesh(0), buildMeadowTreeMesh(1), buildMeadowTreeMesh(2)];
@@ -669,7 +951,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     }
   }
 
-  // Reusable beveled micro-voxel limestone flagstone prototypes for footpaths
   const flagstoneProtos = [0, 1, 2].map((variant) => {
     const fv = new Vox(410 + variant * 17);
     const cMain = variant === 0 ? "limestone" : variant === 1 ? "path" : "cream";
@@ -680,14 +961,13 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     return buildVoxelMesh(fv, { scale: 0.24, castShadow: false });
   });
 
-  // Dynamic World Scene Groups
   const pathsGroup = new THREE.Group();
   const propsGroup = new THREE.Group();
   const creationsGroup = new THREE.Group();
   const villagersGroup = new THREE.Group();
   scene.add(pathsGroup, propsGroup, creationsGroup, villagersGroup);
 
-  // Highlight Halo for "My Creation" or Hovered Creation + Placement Ghost
+  // Highlight Halo for "My Creation" or Selected Creation
   const haloGeo = new THREE.RingGeometry(2.7, 3.15, 48);
   haloGeo.rotateX(-Math.PI / 2);
   const haloMat = new THREE.MeshBasicMaterial({
@@ -701,19 +981,18 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
   selectionHalo.visible = false;
   scene.add(selectionHalo);
 
-  let placementGhost = null;
-  let placementRing = null;
-  let placementBlueprint = null;
-  let placementPos = [16, 10];
-  let placementYaw = 0;
+  // 3D Plot Marker + Live Construction Worksite
+  const plotMarker = buildPlotMarkerGroup();
+  scene.add(plotMarker.group);
 
-  // Entity Maps
+  let spotState = { mode: "hidden", x: 16, z: 10 };
+  let liveFeedsById = {};
+
   const creationEntities = new Map();
   const villagerAgents = new Map();
   let currentWorld = null;
   let highlightedId = null;
 
-  // Camera State (Isometric Diorama Angle with 360 Orbit, Smooth Scroll Pan & Cursor Zoom)
   const cam = {
     tx: 0,
     tz: -2,
@@ -733,6 +1012,50 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     cam.goalTz = Math.max(-CLAMP_BOUND, Math.min(CLAMP_BOUND, cam.goalTz));
   }
 
+  function isClientSpotClear(x, z) {
+    if (Math.abs(x) > 130 || Math.abs(z) > 130) return false;
+    if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < 5.0) return false;
+    if (!currentWorld) return true;
+    for (const c of currentWorld.creations || []) {
+      const sep = c.category === "building" ? 9.5 : 6.2;
+      if (Math.hypot(x - c.x, z - c.z) < sep) return false;
+    }
+    for (const pr of currentWorld.props || []) {
+      if (pr.kind === "pond" && Math.hypot(x - pr.x, z - pr.z) < (pr.radius || 6.5) + 3.8) {
+        return false;
+      }
+    }
+    for (const p of currentWorld.paths || []) {
+      if (p.kind !== "road" || !p.points) continue;
+      for (let i = 0; i < p.points.length; i++) {
+        const a = p.points[i];
+        const b = p.points[(i + 1) % p.points.length];
+        if (!p.closed && i === p.points.length - 1) break;
+        if (distToSeg2D(x, z, a[0], a[1], b[0], b[1]) < 5.2) return false;
+      }
+    }
+    return true;
+  }
+
+  function snapToClearMeadowSpot(rawX, rawZ) {
+    const cx = Math.max(-128, Math.min(128, rawX));
+    const cz = Math.max(-128, Math.min(128, rawZ));
+    if (isClientSpotClear(cx, cz)) {
+      return [Number(cx.toFixed(1)), Number(cz.toFixed(1))];
+    }
+    for (let r = 2.5; r <= 38; r += 2.2) {
+      for (let k = 0; k < 16; k++) {
+        const ang = (k / 16) * Math.PI * 2;
+        const tx = cx + Math.cos(ang) * r;
+        const tz = cz + Math.sin(ang) * r;
+        if (isClientSpotClear(tx, tz)) {
+          return [Number(tx.toFixed(1)), Number(tz.toFixed(1))];
+        }
+      }
+    }
+    return [Number(cx.toFixed(1)), Number(cz.toFixed(1))];
+  }
+
   const raycaster = new THREE.Raycaster();
   const groundPlaneMath = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
   const tmpHit = new THREE.Vector3();
@@ -748,9 +1071,32 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     return null;
   }
 
+  function getCitySignHoverItem() {
+    const n = currentWorld?.contributorCount ?? 0;
+    const total = currentWorld?.creations?.length ?? 0;
+    return {
+      id: "__city_sign__",
+      x: CITY_SIGN_POS[0],
+      z: CITY_SIGN_POS[1],
+      data: {
+        id: "__city_sign__",
+        name: "Meadow Town Sign",
+        description: `${n} ${n === 1 ? "person has" : "people have"} contributed (${total} creations in the world)`,
+        behavior: {
+          statusLine: `${n} ${n === 1 ? "person has" : "people have"} contributed to Voxel Meadow`,
+        },
+      },
+    };
+  }
+
   function pickCreationAt(clientX, clientY) {
     const g = screenToGround(clientX, clientY);
     if (!g) return null;
+
+    if (Math.hypot(g[0] - CITY_SIGN_POS[0], g[1] - CITY_SIGN_POS[1]) < 3.4) {
+      return getCitySignHoverItem();
+    }
+
     let best = null;
     let bestD = 4.6;
     for (const ent of creationEntities.values()) {
@@ -790,7 +1136,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
         pathsGroup.add(buildRibbonMesh(curve, samples, 2.52, 0.055, "#dfd7c5"));
         pathsGroup.add(buildRibbonMesh(curve, samples, 2.1, 0.088, "#4b505c"));
 
-        // Cream dashed road centerline
         const dashCount = Math.floor(len / 3.4);
         const dashGeo = new THREE.BoxGeometry(0.2, 0.03, 1.3);
         const dashMat = new THREE.MeshBasicMaterial({
@@ -808,7 +1153,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
           pathsGroup.add(dash);
         }
       } else {
-        // Beveled micro-voxel limestone & sandstone flagstones aligned cleanly along footpath
         const stoneCount = Math.max(3, Math.floor(len / 1.42));
         for (let i = 0; i <= stoneCount; i++) {
           const u = i / stoneCount;
@@ -829,8 +1173,20 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     }
   }
 
+  function applyLiveFeeds(feedsMap) {
+    liveFeedsById = feedsMap || {};
+    for (const [id, ent] of creationEntities.entries()) {
+      ent.setLiveFeedReading(liveFeedsById[id] || null, maxAniso);
+    }
+  }
+
   function applyWorldSnapshot(world) {
     currentWorld = world;
+    const contribCount =
+      typeof world.contributorCount === "number"
+        ? world.contributorCount
+        : (world.creations || []).filter((c) => !c.isSeed).length;
+    citySignboard.updateCount(contribCount);
     rebuildPathsAndProps(world);
 
     const seenIds = new Set();
@@ -839,8 +1195,10 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
       const existing = creationEntities.get(c.id);
       if (existing) {
         existing.rebuildBehavior(c);
+        existing.setLiveFeedReading(liveFeedsById[c.id] || null, maxAniso);
       } else {
         const ent = new CreationSimEntity(c, idx);
+        ent.setLiveFeedReading(liveFeedsById[c.id] || null, maxAniso);
         creationEntities.set(c.id, ent);
         creationsGroup.add(ent.group);
       }
@@ -873,12 +1231,47 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
       }
     }
 
-    if (world.myCreationId) {
+    if (world.myCreationId && !highlightedId) {
       highlightedId = world.myCreationId;
     }
   }
 
-  // Camera Navigation Gestures (Trackpad 2-finger scroll pan, Pinch/Cmd+Wheel zoom, Drag pan, Right/Alt-drag orbit)
+  function setSpotPickerState(next) {
+    const mode = next?.mode || "hidden";
+    let nx = typeof next?.x === "number" ? next.x : spotState.x;
+    let nz = typeof next?.z === "number" ? next.z : spotState.z;
+    if (mode === "picking" && typeof next?.x !== "number") {
+      const def = snapToClearMeadowSpot(cam.goalTx + 14, cam.goalTz + 8);
+      nx = def[0];
+      nz = def[1];
+    }
+    spotState = { mode, x: nx, z: nz };
+
+    if (mode === "hidden") {
+      plotMarker.group.visible = false;
+      plotMarker.scaffoldGroup.visible = false;
+      canvas.style.cursor = "grab";
+    } else if (mode === "picking") {
+      plotMarker.group.visible = true;
+      plotMarker.scaffoldGroup.visible = false;
+      plotMarker.ringMat.color.setHex(0xffffff);
+      plotMarker.group.position.set(nx, 0, nz);
+      canvas.style.cursor = "crosshair";
+    } else if (mode === "staked") {
+      plotMarker.group.visible = true;
+      plotMarker.scaffoldGroup.visible = false;
+      plotMarker.ringMat.color.setHex(0xffe57f);
+      plotMarker.group.position.set(nx, 0, nz);
+      canvas.style.cursor = "grab";
+    } else if (mode === "building") {
+      plotMarker.group.visible = true;
+      plotMarker.scaffoldGroup.visible = true;
+      plotMarker.ringMat.color.setHex(0xffe57f);
+      plotMarker.group.position.set(nx, 0, nz);
+      canvas.style.cursor = "grab";
+    }
+  }
+
   function panByPixels(dxPx, dyPx) {
     const vh = canvas.clientHeight || window.innerHeight;
     const worldPerPx = (2 * BASE_FRUSTUM) / (cam.zoom * vh);
@@ -908,10 +1301,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     "wheel",
     (e) => {
       e.preventDefault();
-      if (placementBlueprint && e.shiftKey) {
-        placementYaw += Math.sign(e.deltaY) * 0.25;
-        return;
-      }
       if (e.ctrlKey || e.metaKey) {
         zoomAt(Math.exp(-e.deltaY * 0.0085), e.clientX, e.clientY);
         return;
@@ -948,17 +1337,26 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
   });
 
   canvas.addEventListener("pointermove", (e) => {
-    if (placementBlueprint) {
+    if (spotState.mode === "picking" && !pointerGesture) {
       const g = screenToGround(e.clientX, e.clientY);
       if (g) {
-        placementPos = [g[0], g[1]];
+        const snapped = snapToClearMeadowSpot(g[0], g[1]);
+        spotState.x = snapped[0];
+        spotState.z = snapped[1];
+        plotMarker.group.position.set(snapped[0], 0, snapped[1]);
       }
     }
 
     if (!pointerGesture) {
+      if (spotState.mode === "picking") {
+        callbacks.onHoverCreation?.(null, e.clientX, e.clientY, null);
+        canvas.style.cursor = "crosshair";
+        return;
+      }
       const hovered = pickCreationAt(e.clientX, e.clientY);
-      callbacks.onHoverCreation?.(hovered ? hovered.data : null, e.clientX, e.clientY);
-      canvas.style.cursor = placementBlueprint ? "crosshair" : hovered ? "pointer" : "grab";
+      const reading = hovered && hovered.id !== "__city_sign__" ? liveFeedsById[hovered.id] || null : null;
+      callbacks.onHoverCreation?.(hovered ? hovered.data : null, e.clientX, e.clientY, reading);
+      canvas.style.cursor = hovered ? "pointer" : spotState.mode === "staked" ? "crosshair" : "grab";
       return;
     }
 
@@ -986,21 +1384,31 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     if (!pointerGesture || pointerGesture.id !== e.pointerId) return;
     const wasClick = !pointerGesture.moved && pointerGesture.kind === "pan";
     pointerGesture = null;
-    canvas.style.cursor = placementBlueprint ? "crosshair" : "grab";
+    canvas.style.cursor = spotState.mode === "picking" ? "crosshair" : "grab";
 
     if (wasClick) {
-      if (placementBlueprint) {
-        const g = screenToGround(e.clientX, e.clientY);
-        if (g) {
-          callbacks.onConfirmGroundSpot?.(g[0], g[1], placementYaw);
+      if (spotState.mode === "picking" || spotState.mode === "staked") {
+        const pickedExisting = spotState.mode === "staked" ? pickCreationAt(e.clientX, e.clientY) : null;
+        if (!pickedExisting) {
+          const g = screenToGround(e.clientX, e.clientY);
+          if (g) {
+            const [sx, sz] = snapToClearMeadowSpot(g[0], g[1]);
+            spotState.x = sx;
+            spotState.z = sz;
+            plotMarker.group.position.set(sx, 0, sz);
+            callbacks.onPickGroundSpot?.(sx, sz);
+          }
+          return;
         }
-        return;
       }
+
       const picked = pickCreationAt(e.clientX, e.clientY);
       if (picked) {
-        highlightedId = picked.id;
+        if (picked.id !== "__city_sign__") {
+          highlightedId = picked.id;
+        }
         focusOn(picked.x, picked.z, 1.55);
-        callbacks.onSelectCreation?.(picked.data);
+        callbacks.onSelectCreation?.(picked.data, liveFeedsById[picked.id] || null);
       }
     }
   };
@@ -1008,51 +1416,14 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
   canvas.addEventListener("pointercancel", endGesture);
 
   window.addEventListener("keydown", (e) => {
-    if (e.target?.matches?.("input, textarea") || document.querySelector("dialog[open]")) return;
+    if (e.target?.matches?.("input, textarea")) return;
     const step = 7 / Math.max(0.5, cam.zoom);
     if (e.key === "ArrowLeft" || e.key === "a") cam.goalTx -= step;
     else if (e.key === "ArrowRight" || e.key === "d") cam.goalTx += step;
     else if (e.key === "ArrowUp" || e.key === "w") cam.goalTz -= step;
     else if (e.key === "ArrowDown" || e.key === "s") cam.goalTz += step;
-    else if (e.key === "r" && placementBlueprint) placementYaw += Math.PI / 4;
     clampTarget();
   });
-
-  function setPlacementBlueprint(blueprint) {
-    if (placementGhost) {
-      scene.remove(placementGhost);
-      placementGhost.userData.dispose?.();
-      placementGhost = null;
-    }
-    if (placementRing) {
-      scene.remove(placementRing);
-      placementRing.geometry.dispose();
-      placementRing.material.dispose();
-      placementRing = null;
-    }
-    placementBlueprint = blueprint;
-    if (!blueprint) {
-      canvas.style.cursor = "grab";
-      return;
-    }
-    placementYaw = 0;
-    placementPos = [cam.goalTx + 6, cam.goalTz + 6];
-    placementGhost = buildCreationGroup(blueprint, { ghost: true, useWorldScale: true });
-    scene.add(placementGhost);
-
-    const rGeo = new THREE.RingGeometry(2.5, 3.0, 48);
-    rGeo.rotateX(-Math.PI / 2);
-    const rMat = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
-      transparent: true,
-      opacity: 0.9,
-      side: THREE.DoubleSide,
-    });
-    placementRing = new THREE.Mesh(rGeo, rMat);
-    placementRing.position.y = 0.1;
-    scene.add(placementRing);
-    canvas.style.cursor = "crosshair";
-  }
 
   function focusOn(x, z, zoom = 1.45) {
     cam.goalTx = x;
@@ -1086,7 +1457,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
   }
   window.addEventListener("resize", handleResize);
 
-  // Update sun shadow camera snapped to world shadow texels to eliminate shimmer when scrolling!
   const lightUp = new THREE.Vector3(0, 1, 0);
   const lightDir = SUN_OFFSET.clone().normalize();
   const lightRight = new THREE.Vector3().crossVectors(lightUp, lightDir).normalize();
@@ -1109,7 +1479,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     sun.target.updateMatrixWorld();
   }
 
-  // Main 60fps Animation Loop
   let lastNow = performance.now();
   function animate(now) {
     requestAnimationFrame(animate);
@@ -1119,7 +1488,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
 
     grassUniforms.uTime.value = t;
 
-    // Smoothly damp camera pan/zoom/orbit
     const damp = 1 - Math.exp(-dt * 11);
     cam.tx += (cam.goalTx - cam.tx) * damp;
     cam.tz += (cam.goalTz - cam.tz) * damp;
@@ -1142,23 +1510,31 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     grassUniforms.uFocusXZ.value.set(cam.tx, cam.tz);
     updateTexelSnappedSun(cam.tx, cam.tz);
 
-    // Step all creations & collect active transit vehicles for villager boarding
+    // Step all creations & collect active transit vehicles + stationary obstacles for villager avoidance
     const allEnts = Array.from(creationEntities.values());
     const ponds = (currentWorld?.props || []).filter((p) => p.kind === "pond");
     const activeVehicles = [];
+    const obstacles = [{ x: CITY_SIGN_POS[0], z: CITY_SIGN_POS[1], r: 2.9 }];
+
     for (const ent of allEnts) {
-      ent.step(dt, t, allEnts, ponds);
+      ent.step(dt, t, allEnts, ponds, cam.az);
       if (ent.data.behavior?.type === "vehicle_route") {
         activeVehicles.push(ent);
+      } else if (ent.data.category === "building" || ent.data.behavior?.type === "landmark") {
+        obstacles.push({
+          x: ent.x,
+          z: ent.z,
+          r: ent.data.scaleClass === "large" ? 5.2 : 3.8,
+        });
       }
     }
 
-    // Step all villagers
-    for (const ag of villagerAgents.values()) {
-      ag.step(dt, t, activeVehicles, ponds);
+    // Step all villagers with full personal-space & building avoidance
+    const allVillagers = Array.from(villagerAgents.values());
+    for (const ag of allVillagers) {
+      ag.step(dt, t, activeVehicles, ponds, allVillagers, obstacles);
     }
 
-    // Update subtle halo under visitor's own creation
     if (highlightedId && creationEntities.has(highlightedId)) {
       const myEnt = creationEntities.get(highlightedId);
       selectionHalo.visible = true;
@@ -1168,12 +1544,21 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
       selectionHalo.visible = false;
     }
 
-    // Update ghost preview during interactive spot picking
-    if (placementGhost && placementRing) {
-      placementGhost.position.set(placementPos[0], 0.15 + Math.sin(t * 3.2) * 0.12, placementPos[1]);
-      placementGhost.rotation.y = placementYaw;
-      placementGhost.userData.animate?.(t);
-      placementRing.position.set(placementPos[0], 0.1, placementPos[1]);
+    // Animate 3D plot ring + live construction scaffolding
+    if (plotMarker.group.visible) {
+      plotMarker.ring.scale.setScalar(1 + Math.sin(t * 3.2) * 0.045);
+      if (plotMarker.scaffoldGroup.visible) {
+        plotMarker.floatingCubes.forEach((cube, idx) => {
+          const ang = t * 2.2 + (idx * Math.PI * 2) / 3;
+          cube.position.set(
+            Math.cos(ang) * 0.95,
+            1.15 + Math.sin(t * 3.8 + idx * 1.4) * 0.38,
+            Math.sin(ang) * 0.95,
+          );
+          cube.rotation.y = t * 1.8 + idx;
+          cube.rotation.x = Math.sin(t * 2.1 + idx) * 0.35;
+        });
+      }
     }
 
     if (composer) composer.render();
@@ -1183,136 +1568,12 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
 
   return {
     applyWorldSnapshot,
-    setPlacementBlueprint,
+    applyLiveFeeds,
+    setSpotPickerState,
     focusCreationById,
     focusOn,
+    getCameraTarget: () => ({ x: cam.tx, z: cam.tz, zoom: cam.zoom }),
     isPointerActive: () => Boolean(pointerGesture),
     getCreationEntity: (id) => creationEntities.get(id) || null,
   };
-}
-
-/**
- * Pure White (#FFFFFF) Studio 3D Turntable Renderer inside the Creation Modal.
- */
-export function createWhitePreviewStage(canvas) {
-  const scene = new THREE.Scene();
-  scene.background = new THREE.Color("#ffffff");
-
-  const renderer = new THREE.WebGLRenderer({
-    canvas,
-    antialias: true,
-    alpha: false,
-  });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-  renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFShadowMap;
-  renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.06;
-
-  const camera = new THREE.OrthographicCamera(-6, 6, 6, -6, 0.5, 120);
-
-  const keyLight = new THREE.DirectionalLight(0xfff8eb, 2.15);
-  keyLight.position.set(16, 26, 20);
-  keyLight.castShadow = true;
-  keyLight.shadow.mapSize.set(1024, 1024);
-  keyLight.shadow.camera.left = -10;
-  keyLight.shadow.camera.right = 10;
-  keyLight.shadow.camera.top = 10;
-  keyLight.shadow.camera.bottom = -10;
-  keyLight.shadow.bias = -0.0005;
-  scene.add(keyLight);
-
-  scene.add(new THREE.HemisphereLight(0xffffff, 0xeaeef5, 1.35));
-
-  // Shadow-only floor so background remains pure #FFFFFF while grounded shadow anchors the sculpture!
-  const floorGeo = new THREE.PlaneGeometry(40, 40);
-  floorGeo.rotateX(-Math.PI / 2);
-  const floorMat = new THREE.ShadowMaterial({ opacity: 0.13 });
-  const floor = new THREE.Mesh(floorGeo, floorMat);
-  floor.receiveShadow = true;
-  scene.add(floor);
-
-  const turntable = new THREE.Group();
-  scene.add(turntable);
-
-  let modelGroup = null;
-  let active = false;
-  let userYaw = 0.55;
-  let dragging = false;
-  let lastX = 0;
-  let frustumHalf = 5.2;
-
-  canvas.addEventListener("pointerdown", (e) => {
-    dragging = true;
-    lastX = e.clientX;
-    canvas.setPointerCapture(e.pointerId);
-  });
-  canvas.addEventListener("pointermove", (e) => {
-    if (!dragging) return;
-    userYaw += (e.clientX - lastX) * 0.012;
-    lastX = e.clientX;
-  });
-  canvas.addEventListener("pointerup", () => {
-    dragging = false;
-  });
-
-  function syncSize() {
-    const w = Math.max(220, canvas.clientWidth || 380);
-    const h = Math.max(180, canvas.clientHeight || 250);
-    renderer.setSize(w, h, false);
-    const aspect = w / h;
-    camera.left = -frustumHalf * aspect;
-    camera.right = frustumHalf * aspect;
-    camera.top = frustumHalf;
-    camera.bottom = -frustumHalf;
-    camera.updateProjectionMatrix();
-  }
-
-  function showBlueprint(blueprint) {
-    if (modelGroup) {
-      turntable.remove(modelGroup);
-      modelGroup.userData.dispose?.();
-      modelGroup = null;
-    }
-    if (!blueprint) {
-      active = false;
-      return;
-    }
-    modelGroup = buildCreationGroup(blueprint, { seed: 29, useWorldScale: false });
-    turntable.add(modelGroup);
-
-    const box = new THREE.Box3().setFromObject(modelGroup);
-    const size = new THREE.Vector3();
-    const center = new THREE.Vector3();
-    box.getSize(size);
-    box.getCenter(center);
-
-    modelGroup.position.x = -center.x;
-    modelGroup.position.z = -center.z;
-
-    const maxDim = Math.max(size.x, size.y, size.z, 2.5);
-    frustumHalf = maxDim * 0.68;
-    camera.position.set(18, 14, 18);
-    camera.lookAt(0, size.y * 0.44, 0);
-    syncSize();
-    active = true;
-  }
-
-  function loop(now) {
-    requestAnimationFrame(loop);
-    if (!active || !modelGroup) return;
-    const t = now * 0.001;
-    if (!dragging) {
-      userYaw += 0.0065;
-    }
-    turntable.rotation.y = userYaw;
-    modelGroup.userData.animate?.(t, { wheelAngle: t * 2.6, moveFactor: 1.0 });
-    renderer.render(scene, camera);
-  }
-  requestAnimationFrame(loop);
-  window.addEventListener("resize", () => {
-    if (active) syncSize();
-  });
-
-  return { showBlueprint, syncSize };
 }

@@ -1,6 +1,24 @@
 export type CreationCategory = "vehicle" | "creature" | "building" | "prop" | "aircraft" | "watercraft";
 export type ScaleClass = "small" | "medium" | "large";
 
+export type LiveFeedKind = "weather" | "surf" | "wind" | "time" | "moon" | "iss";
+
+export interface LiveFeedSpec {
+  kind: LiveFeedKind;
+  place?: string;
+  lat?: number;
+  lon?: number;
+  timezone?: string;
+}
+
+export interface LiveFeedReading {
+  kind: LiveFeedKind;
+  badge: string;
+  summary: string;
+  value?: number;
+  updatedAt: number;
+}
+
 export type VoxelPartKind =
   | "wheel"
   | "spinY"
@@ -82,6 +100,7 @@ export interface VoxelBlueprint {
   palette: Record<string, string>;
   ops: VoxelOp[];
   parts: VoxelPart[];
+  liveFeed?: LiveFeedSpec | null;
   stats: {
     voxels: number;
     footprintX: number;
@@ -152,6 +171,7 @@ export interface WorldCreation {
   yaw: number;
   blueprint: VoxelBlueprint;
   behavior: CreationBehavior;
+  liveFeed?: LiveFeedSpec | null;
   integratedLevel: number;
   createdAt: number;
   isSeed?: boolean;
@@ -192,6 +212,7 @@ export interface WorldStateSnapshot {
   paths: WorldPath[];
   props: WorldProp[];
   villagers: WorldVillager[];
+  contributorCount: number;
   myCreationId: string | null;
   lastWeaveNote: string;
 }

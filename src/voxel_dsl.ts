@@ -1,3 +1,4 @@
+import { sanitizeLiveFeed } from "./live_feeds";
 import type {
   CreationCategory,
   ScaleClass,
@@ -1077,6 +1078,8 @@ export function normalizeAndGroundBlueprint(
     description = `${(lastSpace > 120 ? cut.slice(0, lastSpace) : cut).replace(/[,;:\s]+$/, "")}…`;
   }
 
+  const liveFeed = sanitizeLiveFeed(raw.liveFeed);
+
   return {
     version: 1,
     name,
@@ -1086,6 +1089,7 @@ export function normalizeAndGroundBlueprint(
     palette,
     ops,
     parts,
+    ...(liveFeed ? { liveFeed } : {}),
     stats: {
       voxels: b.count,
       footprintX: Math.max(2, b.maxX - b.minX),

@@ -2,6 +2,7 @@ import { sanitizeLiveFeed } from "./live_feeds";
 import { sanitizePlainText } from "./security";
 import { autoRepairBlueprintOverlaps } from "./voxel_audit";
 import type {
+  BlueprintAmendment,
   CreationCategory,
   ScaleClass,
   VoxelBlueprint,
@@ -1034,6 +1035,34 @@ export function normalizeAndGroundBlueprint(
     });
   }
 
+  // Synchronize paired symmetrical wings (`swingZ`) and alternating gait legs (`swingX`):
+  // For `swingZ` wings on opposite X shoulders (+X vs -X), +rotation.z lifts +X and drops -X,
+  // so offsetting the -X wing by PI makes both wings flap UP and DOWN together symmetrically!
+  for (let i = 0; i < parts.length; i++) {
+    const a = parts[i];
+    for (let j = i + 1; j < parts.length; j++) {
+      const bPart = parts[j];
+      if (a.kind !== bPart.kind) continue;
+      const oppositeX =
+        (a.pivot[0] > 0.5 && bPart.pivot[0] < -0.5) ||
+        (a.pivot[0] < -0.5 && bPart.pivot[0] > 0.5);
+      if (!oppositeX) continue;
+      if (Math.abs(a.pivot[1] - bPart.pivot[1]) > 3.0 || Math.abs(a.pivot[2] - bPart.pivot[2]) > 3.0) {
+        continue;
+      }
+      const phA = a.phase ?? 0;
+      const phB = bPart.phase ?? 0;
+      const diff = Math.abs((((phA - phB) % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2));
+      if (diff < 0.35 || diff > Math.PI * 2 - 0.35) {
+        if (a.kind === "swingZ" || a.kind === "swingX") {
+          const negPart = a.pivot[0] < 0 ? a : bPart;
+          const posPart = a.pivot[0] < 0 ? bPart : a;
+          negPart.phase = Number((((posPart.phase ?? 0) + Math.PI) % (Math.PI * 2)).toFixed(2));
+        }
+      }
+    }
+  }
+
   // Simulate full combined voxel volume (base + parts at pivots) to compute exact ground contact!
   const calcCombined = (curOps: VoxelOp[], curParts: VoxelPart[]) => {
     const worldVox = new SimVox();
@@ -1116,4 +1145,127 @@ export function normalizeAndGroundBlueprint(
     return normalized;
   }
   return autoRepairBlueprintOverlaps(normalized).blueprint;
+}
+
+export function sanitizeBlueprintAmendment(
+  raw: unknown,
+  existingPalette: Record<string, string>,
+): BlueprintAmendment | null {
+  if (!raw || typeof raw !== "object") return null;
+  const rec = raw as Record<string, unknown>;
+  const out: BlueprintAmendment = {};
+  let hasChange = false;
+
+  if (typeof rec.category === "string") {
+    const c = rec.category.trim().toLowerCase() as CreationCategory;
+    if (CATEGORIES[c]) {
+      out.category = c;
+      hasChange = true;
+    }
+  }
+  if (typeof rec.scaleClass === "string") {
+    const sc = rec.scaleClass.trim().toLowerCase() as ScaleClass;
+    if (SCALES[sc]) {
+      out.scaleClass = sc;
+      hasChange = true;
+    }
+  }
+  if (rec.stripPlinth === true) {
+    out.stripPlinth = true;
+    hasChange = true;
+  }
+
+  if (Array.isArray(rec.clearOps) && rec.clearOps.length > 0) {
+    const clears: VoxelOp[] = [];
+    for (const item of rec.clearOps.slice(0, 12)) {
+      if (item && typeof item === "object" && (item as Record<string, unknown>).op === "clear") {
+        const cleaned = sanitizeOp(item as Record<string, unknown>, existingPalette, false);
+        if (cleaned && cleaned.op === "clear") clears.push(cleaned);
+      }
+    }
+    if (clears.length > 0) {
+      out.clearOps = clears;
+      hasChange = true;
+    }
+  }
+
+  if (Array.isArray(rec.upsertParts) && rec.upsertParts.length > 0) {
+    const upserts: VoxelPart[] = [];
+    for (const pRaw of rec.upsertParts.slice(0, 8)) {
+      if (!pRaw || typeof pRaw !== "object") continue;
+      const pr = pRaw as Record<string, unknown>;
+      const piv = Array.isArray(pr.pivot) ? pr.pivot : [0, 4, 0];
+      const px = clamp(num(piv[0], 0), -18, 18);
+      const py = clamp(num(piv[1], 4), 0, 40);
+      const pz = clamp(num(piv[2], 0), -18, 18);
+      const pOps: VoxelOp[] = [];
+      for (const opRaw of Array.isArray(pr.ops) ? pr.ops.slice(0, 24) : []) {
+        if (opRaw && typeof opRaw === "object") {
+          const cleaned = sanitizeOp(opRaw as Record<string, unknown>, existingPalette, true);
+          if (cleaned) pOps.push(cleaned);
+        }
+      }
+      if (!pOps.length) continue;
+      const kindStr = typeof pr.kind === "string" ? pr.kind : "bob";
+      const kind: VoxelPartKind = PART_KINDS[kindStr as VoxelPartKind] ? (kindStr as VoxelPartKind) : "bob";
+      upserts.push({
+        name: sanitizePlainText(pr.name, 36, true) || `part-${upserts.length + 1}`,
+        kind,
+        speed: clamp(Number(num(pr.speed, 1.5).toFixed(2)), 0.25, 4.0),
+        ...(pr.amp !== undefined ? { amp: clamp(Number(num(pr.amp, 0.4).toFixed(2)), 0.05, 1.4) } : {}),
+        ...(pr.phase !== undefined ? { phase: clamp(Number(num(pr.phase, 0).toFixed(2)), 0, 6.28) } : {}),
+        pivot: [Number(px.toFixed(2)), Number(py.toFixed(2)), Number(pz.toFixed(2))],
+        ops: pOps,
+      });
+    }
+    if (upserts.length > 0) {
+      out.upsertParts = upserts;
+      hasChange = true;
+    }
+  }
+
+  return hasChange ? out : null;
+}
+
+export function applyBlueprintAmendment(
+  existing: VoxelBlueprint,
+  amendment: BlueprintAmendment,
+): VoxelBlueprint {
+  let nextOps = amendment.stripPlinth
+    ? existing.ops.filter((o) => o.op !== "plinth")
+    : [...existing.ops];
+
+  if (amendment.clearOps && amendment.clearOps.length > 0) {
+    nextOps = [...nextOps, ...amendment.clearOps];
+  }
+
+  let nextParts = [...existing.parts];
+  if (amendment.upsertParts && amendment.upsertParts.length > 0) {
+    for (const up of amendment.upsertParts) {
+      const idx = nextParts.findIndex((p) => p.name.toLowerCase() === up.name.toLowerCase());
+      if (idx >= 0) nextParts[idx] = up;
+      else if (nextParts.length < 16) nextParts.push(up);
+    }
+  }
+
+  const candidate = normalizeAndGroundBlueprint(
+    {
+      name: existing.name,
+      description: existing.description,
+      category: amendment.category ?? existing.category,
+      scaleClass: amendment.scaleClass ?? existing.scaleClass,
+      palette: existing.palette,
+      ops: nextOps,
+      parts: nextParts,
+      liveFeed: existing.liveFeed ?? null,
+    },
+    existing.name,
+  );
+
+  // Guard: never let an overly broad clearOp wipe out most of the sculpture's voxels
+  const minSafeVoxels = Math.max(25, Math.floor(existing.stats.voxels * 0.4));
+  if (candidate.stats.voxels < minSafeVoxels && amendment.clearOps?.length) {
+    return applyBlueprintAmendment(existing, { ...amendment, clearOps: undefined });
+  }
+  return candidate.stats.voxels >= 25 ? candidate : existing;
 }

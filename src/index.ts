@@ -183,6 +183,7 @@ export default {
             ipHash: id.ipHash,
             cookieId: id.cookieId,
             dayKey: id.dayKey,
+            creatorPrompt: prompt,
             blueprintRaw: sculpted.blueprint as unknown as Record<string, unknown>,
             x: typeof body.x === "number" && Number.isFinite(body.x) ? body.x : null,
             z: typeof body.z === "number" && Number.isFinite(body.z) ? body.z : null,
@@ -241,6 +242,24 @@ export default {
           const stub = getWorldStub(env);
           const worldRepair = await stub.runWorldAuditAndRepair();
           return jsonResponse(request, { ok: true, ...worldRepair });
+        }
+        if (url.pathname === "/api/dev/place-raw" && request.method === "POST") {
+          const parsed = await readBoundedJsonBody(request, 512_000);
+          if (!parsed.ok) return jsonResponse(request, { ok: false, error: parsed.error }, 400);
+          const body = parsed.data;
+          const id = await resolveVisitorIdentity(request, env);
+          const stub = getWorldStub(env);
+          const placed = await stub.placeCreation({
+            ipHash: id.ipHash,
+            cookieId: typeof body.cookieId === "string" ? body.cookieId : id.cookieId,
+            dayKey: id.dayKey,
+            creatorPrompt: typeof body.creatorPrompt === "string" ? body.creatorPrompt : "",
+            blueprintRaw: (body.blueprint as Record<string, unknown>) || {},
+            x: typeof body.x === "number" ? body.x : null,
+            z: typeof body.z === "number" ? body.z : null,
+            yaw: typeof body.yaw === "number" ? body.yaw : null,
+          });
+          return jsonResponse(request, placed, placed.ok ? 200 : 400);
         }
       }
 

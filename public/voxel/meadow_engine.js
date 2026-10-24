@@ -520,11 +520,11 @@ function buildMeadowBushMesh(variant = 0) {
 
 function computeBlueprintSignature(bp) {
   if (!bp) return "";
-  const opsSig = (bp.ops || []).length;
+  const opsSig = (bp.ops || []).map((o) => o.op).join(",");
   const partsSig = (bp.parts || [])
-    .map((p) => `${p.name}:${(p.pivot || []).join(",")}:${(p.ops || []).length}`)
+    .map((p) => `${p.name}:${p.kind}:${p.phase || 0}:${(p.pivot || []).join(",")}:${(p.ops || []).length}`)
     .join("|");
-  return `${opsSig}#${partsSig}`;
+  return `${bp.category || ""}:${bp.scaleClass || ""}:${bp.stats?.voxels || 0}:${opsSig}#${partsSig}`;
 }
 
 class CreationSimEntity {
@@ -537,6 +537,7 @@ class CreationSimEntity {
       seed: 17 + index * 13,
       useWorldScale: true,
     });
+    this.group.rotation.order = "YXZ";
 
     this.x = creation.x;
     this.y = 0.004;
@@ -566,6 +567,12 @@ class CreationSimEntity {
     this.doorX = this.x;
     this.doorZ = this.z;
 
+    // 3D Flight spline state
+    this.flightCurve = null;
+    this.flightLength = 1;
+    this.flightDist = (index * 19.3) % 60;
+    this.bankRoll = 0;
+
     // Wander state
     this.wanderIdx = 0;
     this.wanderPause = (index * 1.3) % 2.5;
@@ -575,7 +582,7 @@ class CreationSimEntity {
     this.orbitAngle = (index * 1.9) % (Math.PI * 2);
 
     this.rebuildBehavior(creation);
-    this.group.position.set(this.x, 0, this.z);
+    this.group.position.set(this.x, this.y, this.z);
     this.group.rotation.y = this.yaw;
     this.group.scale.setScalar(this.spawnScale);
   }
@@ -628,6 +635,7 @@ class CreationSimEntity {
         seed: 17 + this.index * 13,
         useWorldScale: true,
       });
+      this.group.rotation.order = "YXZ";
       const worldUnit = creation.scaleClass === "large" ? 0.34 : creation.scaleClass === "medium" ? 0.24 : 0.18;
       this.topY = Math.max(2.2, (creation.blueprint?.stats?.maxY || 14) * worldUnit);
       if (this.feedMesh) {
@@ -663,6 +671,20 @@ class CreationSimEntity {
     } else {
       this.routeCurve = null;
       this.dwellingStop = null;
+    }
+
+    if (b?.type === "fly_circle" && Array.isArray(b.waypoints) && b.waypoints.length >= 3) {
+      const defaultAlt = b.altitude || 14.0;
+      const vecs = b.waypoints.map((wp) =>
+        wp.length >= 3
+          ? new THREE.Vector3(wp[0], wp[1], wp[2])
+          : new THREE.Vector3(wp[0], defaultAlt, wp[1]),
+      );
+      this.flightCurve = new THREE.CatmullRomCurve3(vecs, true, "centripetal", 0.5);
+      this.flightLength = Math.max(12, this.flightCurve.getLength());
+      this.flightDist = this.flightDist % this.flightLength;
+    } else {
+      this.flightCurve = null;
     }
   }
 
@@ -744,41 +766,60 @@ class CreationSimEntity {
 
       pitchX = this.dwellingStop ? 0 : Math.sin(t * 14) * 0.008 * this.moveFactor;
     } else if (b?.type === "wander") {
+      const isGlide = b.style === "glide";
+      const glideBaseY = b.hoverHeight || 1.9;
       const targets =
         b.targets && b.targets.length
           ? b.targets
           : [
-              [b.homeX + 5, b.homeZ + 3],
-              [b.homeX - 4, b.homeZ + 4],
-              [b.homeX + 1, b.homeZ - 5],
+              [b.homeX + 12, b.homeZ + 8],
+              [b.homeX - 11, b.homeZ + 9],
+              [b.homeX + 4, b.homeZ - 14],
             ];
       if (this.wanderPause > 0) {
         this.wanderPause -= dt;
-        this.y = 0;
-        this.moveFactor = 0;
+        this.y = isGlide ? glideBaseY + Math.sin(t * 2.2 + this.index) * 0.22 : 0;
+        this.moveFactor = isGlide ? 0.5 : 0;
       } else {
         const tgt = targets[this.wanderIdx % targets.length];
         const dx = tgt[0] - this.x;
         const dz = tgt[1] - this.z;
         const dist = Math.hypot(dx, dz);
-        if (dist < 0.45) {
+        if (dist < 0.55) {
           this.wanderIdx = (this.wanderIdx + 1) % targets.length;
-          this.wanderPause = 1.6 + (this.wanderIdx % 2) * 0.9;
-          this.y = 0;
+          this.wanderPause = isGlide ? 0.6 : 1.5 + (this.wanderIdx % 2) * 0.8;
+          this.y = isGlide ? glideBaseY + Math.sin(t * 2.2 + this.index) * 0.22 : 0;
         } else {
-          const stepLen = Math.min(dist, (b.speed || 2.5) * dt);
+          const stepLen = Math.min(dist, (b.speed || 2.8) * dt);
           this.x += (dx / dist) * stepLen;
           this.z += (dz / dist) * stepLen;
-          for (const pond of ponds) {
-            const pr = (pond.radius || 6.4) + 0.9;
-            const pdx = this.x - pond.x;
-            const pdz = this.z - pond.z;
-            const pd = Math.hypot(pdx, pdz);
-            if (pd < pr && pd > 0.01) {
-              this.x = pond.x + (pdx / pd) * pr;
-              this.z = pond.z + (pdz / pd) * pr;
+
+          if (!isGlide) {
+            for (const pond of ponds) {
+              const pr = (pond.radius || 6.4) + 0.9;
+              const pdx = this.x - pond.x;
+              const pdz = this.z - pond.z;
+              const pd = Math.hypot(pdx, pdz);
+              if (pd < pr && pd > 0.01) {
+                this.x = pond.x + (pdx / pd) * pr;
+                this.z = pond.z + (pdz / pd) * pr;
+              }
             }
           }
+          // Steer cleanly around stationary landmark buildings so roaming creatures never walk through walls
+          for (const other of allEntities) {
+            if (other === this) continue;
+            if (other.data.category !== "building" && other.data.behavior?.type !== "landmark") continue;
+            const br = other.data.scaleClass === "large" ? 5.6 : 4.2;
+            const bdx = this.x - other.x;
+            const bdz = this.z - other.z;
+            const bd = Math.hypot(bdx, bdz);
+            if (bd < br && bd > 0.01) {
+              this.x = other.x + (bdx / bd) * br;
+              this.z = other.z + (bdz / bd) * br;
+            }
+          }
+
           this.wheelAngle += stepLen / 0.45;
           this.moveFactor = 1.0;
 
@@ -788,7 +829,11 @@ class CreationSimEntity {
           while (dyaw < -Math.PI) dyaw += Math.PI * 2;
           this.yaw += dyaw * Math.min(1, dt * 7.5);
 
-          if (b.style === "hop") {
+          if (isGlide) {
+            this.y = glideBaseY + Math.sin(t * 2.5 + this.index) * 0.26;
+            pitchX = 0.06;
+            rollZ = Math.max(-0.22, Math.min(0.22, -dyaw * 0.35));
+          } else if (b.style === "hop") {
             this.hopPhase = (this.hopPhase + dt * 3.4) % 1;
             const u = this.hopPhase;
             this.y = 4 * 0.58 * u * (1 - u);
@@ -822,20 +867,48 @@ class CreationSimEntity {
       pitchX = Math.cos(t * 1.8) * 0.035 * surfBoost;
       this.moveFactor = 0.7;
     } else if (b?.type === "fly_circle") {
-      this.orbitAngle += ((b.speed || 4.8) / Math.max(8, b.radius || 16)) * dt;
-      const r = b.radius || 16;
-      const nx = b.centerX + Math.cos(this.orbitAngle) * r;
-      const nz = b.centerZ + Math.sin(this.orbitAngle) * r;
-      const dx = nx - this.x;
-      const dz = nz - this.z;
-      this.x = nx;
-      this.z = nz;
-      this.y = (b.altitude || 12.5) + Math.sin(t * 1.7) * 0.55;
-      if (Math.hypot(dx, dz) > 0.001) {
-        this.yaw = Math.atan2(dx, dz);
+      if (this.flightCurve) {
+        this.flightDist = (this.flightDist + (b.speed || 6.4) * dt) % this.flightLength;
+        const u = (((this.flightDist % this.flightLength) + this.flightLength) % this.flightLength) / this.flightLength;
+        const pos = this.flightCurve.getPointAt(u);
+        const tan = this.flightCurve.getTangentAt(u);
+        const tanAhead = this.flightCurve.getTangentAt((u + 0.022) % 1);
+
+        this.x = pos.x;
+        this.z = pos.z;
+        this.y = pos.y + Math.sin(t * 2.6 + this.index) * 0.36;
+        this.yaw = Math.atan2(tan.x, tan.z);
+
+        const yawAhead = Math.atan2(tanAhead.x, tanAhead.z);
+        let dTurn = yawAhead - this.yaw;
+        while (dTurn > Math.PI) dTurn -= Math.PI * 2;
+        while (dTurn < -Math.PI) dTurn += Math.PI * 2;
+
+        const targetBank = Math.max(-0.46, Math.min(0.46, -dTurn * 1.55));
+        this.bankRoll += (targetBank - this.bankRoll) * Math.min(1, dt * 5.2);
+        rollZ = this.bankRoll;
+        pitchX = Math.max(-0.36, Math.min(0.36, -tan.y * 0.78));
+        this.moveFactor = 1.0;
+      } else {
+        this.orbitAngle += ((b.speed || 5.6) / Math.max(10, b.radius || 24)) * dt;
+        const r = b.radius || 24;
+        const nx = b.centerX + Math.cos(this.orbitAngle) * r;
+        const nz = b.centerZ + Math.sin(this.orbitAngle) * r * 0.86;
+        const ny = (b.altitude || 14.0) + Math.sin(this.orbitAngle * 2.0 + t * 0.6) * 2.1;
+        const dx = nx - this.x;
+        const dy = ny - this.y;
+        const dz = nz - this.z;
+        const hDist = Math.hypot(dx, dz);
+        this.x = nx;
+        this.z = nz;
+        this.y = ny;
+        if (hDist > 0.001) {
+          this.yaw = Math.atan2(dx, dz);
+          pitchX = Math.max(-0.32, Math.min(0.32, -Math.atan2(dy, hDist) * 0.75));
+        }
+        rollZ = -0.24;
+        this.moveFactor = 1.0;
       }
-      rollZ = -0.22;
-      this.moveFactor = 1.0;
     } else {
       this.y = 0.004;
       if (typeof b?.facingYaw === "number") {
@@ -1492,7 +1565,10 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     const ent = creationEntities.get(id);
     if (!ent) return;
     highlightedId = id;
-    focusOn(ent.x, ent.z, 1.65);
+    const altOffset = ent.y > 1 ? ent.y / Math.max(0.35, Math.tan(cam.el)) : 0;
+    const projX = ent.x - Math.sin(cam.az) * altOffset;
+    const projZ = ent.z - Math.cos(cam.az) * altOffset;
+    focusOn(projX, projZ, ent.y > 4 ? 1.25 : 1.65);
   }
 
   function handleResize() {
@@ -1593,9 +1669,13 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
 
     if (highlightedId && creationEntities.has(highlightedId)) {
       const myEnt = creationEntities.get(highlightedId);
-      selectionHalo.visible = true;
-      selectionHalo.position.set(myEnt.x, 0.122, myEnt.z);
-      selectionHalo.scale.setScalar(1 + Math.sin(t * 2.5) * 0.05);
+      if (myEnt.y <= 2.5) {
+        selectionHalo.visible = true;
+        selectionHalo.position.set(myEnt.x, 0.122, myEnt.z);
+        selectionHalo.scale.setScalar(1 + Math.sin(t * 2.5) * 0.05);
+      } else {
+        selectionHalo.visible = false;
+      }
     } else {
       selectionHalo.visible = false;
     }

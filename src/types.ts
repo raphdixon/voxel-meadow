@@ -128,11 +128,12 @@ export type CreationBehavior =
     }
   | {
       type: "wander";
-      style: "walk" | "hop" | "trot";
+      style: "walk" | "hop" | "trot" | "glide";
       speed: number;
       homeX: number;
       homeZ: number;
       radius: number;
+      hoverHeight?: number;
       targets?: [number, number][];
       statusLine: string;
     }
@@ -143,6 +144,7 @@ export type CreationBehavior =
       centerX: number;
       centerZ: number;
       radius: number;
+      waypoints?: [number, number, number][];
       statusLine: string;
     }
   | {
@@ -160,10 +162,19 @@ export type CreationBehavior =
       statusLine: string;
     };
 
+export interface BlueprintAmendment {
+  category?: CreationCategory;
+  scaleClass?: ScaleClass;
+  stripPlinth?: boolean;
+  clearOps?: VoxelOp[];
+  upsertParts?: VoxelPart[];
+}
+
 export interface WorldCreation {
   id: string;
   name: string;
   description: string;
+  creatorPrompt?: string;
   category: CreationCategory;
   scaleClass: ScaleClass;
   x: number;

@@ -3,11 +3,12 @@ import {
   buildInitialIntegration,
   CITY_SIGN_POS,
   integrateCreationWithArgon,
+  needsMobilityAmendment,
   weaveWorldCronWithArgon,
   type WorldPatch,
 } from "./argon_director";
 import { buildSeedWorld } from "./seed_world";
-import { formatDayKeyInTz, safeLogError, verifyWebSocketOrigin } from "./security";
+import { formatDayKeyInTz, safeLogError, sanitizePlainText, verifyWebSocketOrigin } from "./security";
 import type {
   WorldCreation,
   WorldPath,
@@ -20,7 +21,7 @@ import {
   auditBlueprintOverlaps,
   autoRepairBlueprintOverlaps,
 } from "./voxel_audit";
-import { normalizeAndGroundBlueprint } from "./voxel_dsl";
+import { applyBlueprintAmendment, normalizeAndGroundBlueprint } from "./voxel_dsl";
 
 export interface WorldCreationAuditEntry {
   id: string;
@@ -48,6 +49,7 @@ export interface PlaceCreationInput {
   ipHash: string;
   cookieId: string;
   dayKey: string;
+  creatorPrompt?: string;
   blueprintRaw: Record<string, unknown>;
   x?: number | null;
   z?: number | null;
@@ -807,6 +809,18 @@ export class WorldDO extends DurableObject<Env> {
       const rows = sql.exec(`SELECT json FROM creations WHERE id = ?`, upd.creationId).toArray();
       if (!rows.length) continue;
       const existing = JSON.parse(String(rows[0].json)) as WorldCreation;
+      const wasLandmark = existing.behavior?.type === "landmark";
+
+      if (upd.blueprintAmendment) {
+        existing.blueprint = applyBlueprintAmendment(existing.blueprint, upd.blueprintAmendment);
+        existing.category = existing.blueprint.category;
+        existing.scaleClass = existing.blueprint.scaleClass;
+      }
+      if (upd.category) {
+        existing.category = upd.category;
+        existing.blueprint.category = upd.category;
+      }
+
       existing.behavior = upd.behavior;
       if (typeof upd.yaw === "number" && Number.isFinite(upd.yaw)) {
         existing.yaw = upd.yaw;
@@ -816,6 +830,24 @@ export class WorldDO extends DurableObject<Env> {
       }
       if (upd.liveFeed && !existing.liveFeed) {
         existing.liveFeed = upd.liveFeed;
+      }
+      if (upd.removeStationaryFootpath || upd.behavior.type !== "landmark") {
+        sql.exec(`DELETE FROM paths WHERE id = ?`, `initpath-${upd.creationId}`);
+        if (wasLandmark && upd.behavior.type !== "landmark") {
+          const fpRows = sql.exec(`SELECT id, json FROM paths WHERE id NOT LIKE 'path-%'`).toArray();
+          for (const fpr of fpRows) {
+            const p = JSON.parse(String(fpr.json)) as WorldPath;
+            if (p.kind !== "footpath" || p.points.length === 0) continue;
+            const firstPt = p.points[0];
+            const lastPt = p.points[p.points.length - 1];
+            if (
+              Math.hypot(firstPt[0] - existing.x, firstPt[1] - existing.z) < 5.8 ||
+              Math.hypot(lastPt[0] - existing.x, lastPt[1] - existing.z) < 5.8
+            ) {
+              sql.exec(`DELETE FROM paths WHERE id = ?`, String(fpr.id));
+            }
+          }
+        }
       }
       if ((upd.integratedLevel ?? 0) >= 2 && (hasCustomRoad || upd.behavior.type === "vehicle_route")) {
         sql.exec(`DELETE FROM paths WHERE id = ?`, `initroad-${upd.creationId}`);
@@ -904,10 +936,12 @@ export class WorldDO extends DurableObject<Env> {
     const now = Date.now();
     const id = `c-${now.toString(36)}-${crypto.randomUUID().replace(/-/g, "").slice(0, 6)}`;
 
+    const cleanPrompt = sanitizePlainText(input.creatorPrompt, 240, true);
     const creation: WorldCreation = {
       id,
       name: bp.name,
       description: bp.description,
+      ...(cleanPrompt ? { creatorPrompt: cleanPrompt } : {}),
       category: bp.category,
       scaleClass: bp.scaleClass,
       x,
@@ -1046,11 +1080,12 @@ export class WorldDO extends DurableObject<Env> {
     }
     const world = this.readBaseWorld();
     const hasUnintegrated = world.creations.some((c) => c.integratedLevel < 2);
+    const hasStuckMobile = world.creations.some((c) => !c.isSeed && needsMobilityAmendment(c));
     const lastWeaveCount = Number(this.getMeta("lastWeaveCount", "0")) || 0;
     const hasNewCreations = world.creations.length > lastWeaveCount;
 
-    // Only run background Cron World-Weaver LLM call when unintegrated or newly added creations exist!
-    if (!hasUnintegrated && !hasNewCreations) {
+    // Only run background Cron World-Weaver LLM call when unintegrated, newly added, or stuck mobile creations exist!
+    if (!hasUnintegrated && !hasStuckMobile && !hasNewCreations) {
       return {
         ok: true,
         note:

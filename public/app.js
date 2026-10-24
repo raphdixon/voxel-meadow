@@ -415,6 +415,30 @@ async function refreshLiveFeeds() {
   }
 }
 
+async function refreshDailyEligibility() {
+  if (!myCreationId || uiState === "building" || uiState === "ready") return;
+  try {
+    const res = await fetch("/api/world");
+    if (!res.ok) return;
+    const latest = await res.json();
+    worldData = latest;
+    myCreationId = latest.myCreationId || null;
+    engine.applyWorldSnapshot(worldData);
+    if (!myCreationId && uiState === "placed") {
+      uiState = "idle";
+      syncDockUI();
+    }
+  } catch {
+    // ignore transient network errors
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    refreshDailyEligibility();
+  }
+});
+
 async function initWorld() {
   try {
     const res = await fetch("/api/world");
@@ -431,6 +455,7 @@ async function initWorld() {
 
   refreshLiveFeeds();
   setInterval(refreshLiveFeeds, 90_000);
+  setInterval(refreshDailyEligibility, 10 * 60_000);
   connectLiveWebSocket();
 }
 

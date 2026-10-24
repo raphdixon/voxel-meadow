@@ -7,7 +7,7 @@ import {
   type WorldPatch,
 } from "./argon_director";
 import { buildSeedWorld } from "./seed_world";
-import { safeLogError, verifyWebSocketOrigin } from "./security";
+import { formatDayKeyInTz, safeLogError, verifyWebSocketOrigin } from "./security";
 import type {
   WorldCreation,
   WorldPath,
@@ -47,6 +47,7 @@ export interface WorldAuditSummary {
 export interface PlaceCreationInput {
   ipHash: string;
   cookieId: string;
+  dayKey: string;
   blueprintRaw: Record<string, unknown>;
   x?: number | null;
   z?: number | null;
@@ -120,6 +121,14 @@ export class WorldDO extends DurableObject<Env> {
         creation_id TEXT NOT NULL,
         created_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS creator_builds (
+        creation_id TEXT PRIMARY KEY,
+        cookie_id TEXT NOT NULL,
+        day_key TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_creator_builds_cookie_day
+        ON creator_builds (cookie_id, day_key);
       CREATE TABLE IF NOT EXISTS integration_queue (
         creation_id TEXT PRIMARY KEY,
         queued_at INTEGER NOT NULL
@@ -301,6 +310,32 @@ export class WorldDO extends DurableObject<Env> {
       // Lightweight startup self-check (< 3ms, zero LLM calls) so the world stays overlap-free across restarts
       this.auditAndRepairWorld();
     }
+
+    // Non-destructive v6 upgrade: switch from permanent shared-IP lock to 1 creation per individual (cookie) per day
+    const upgradedV6 = sql.exec(`SELECT value FROM meta WHERE key = 'upgrade_v6_daily_individual'`).toArray();
+    if (upgradedV6.length === 0) {
+      const legacyCookieRows = sql
+        .exec(`SELECT token, creation_id, created_at FROM creators WHERE token LIKE 'cid:%'`)
+        .toArray();
+      for (const row of legacyCookieRows) {
+        const cookieId = String(row.token).slice(4);
+        const creationId = String(row.creation_id);
+        const createdAt = Number(row.created_at) || Date.now();
+        if (cookieId && creationId) {
+          const dayKey = formatDayKeyInTz(createdAt, "Australia/Sydney");
+          sql.exec(
+            `INSERT OR IGNORE INTO creator_builds (creation_id, cookie_id, day_key, created_at) VALUES (?, ?, ?, ?)`,
+            creationId,
+            cookieId,
+            dayKey,
+            createdAt,
+          );
+        }
+      }
+      // Remove legacy shared-IP locks so multiple individuals/devices on the same Wi-Fi/office IP can build independently
+      sql.exec(`DELETE FROM creators WHERE token LIKE 'ip:%'`);
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v6_daily_individual', '1')`);
+    }
   }
 
   private auditAndRepairWorld(): { repairedCount: number; repairs: string[] } {
@@ -444,7 +479,19 @@ export class WorldDO extends DurableObject<Env> {
       .exec(`SELECT json FROM villagers`)
       .toArray()
       .map((r) => JSON.parse(String(r.json)) as WorldVillager);
-    const contributorCount = creations.filter((c) => !c.isSeed).length;
+    const distinctContributors =
+      Number(sql.exec(`SELECT COUNT(DISTINCT cookie_id) AS c FROM creator_builds`).toArray()[0]?.c) || 0;
+    const unattributedNonSeed =
+      Number(
+        sql
+          .exec(
+            `SELECT COUNT(*) AS c FROM creations c
+             WHERE c.id NOT LIKE 'seed-%'
+               AND NOT EXISTS (SELECT 1 FROM creator_builds cb WHERE cb.creation_id = c.id)`,
+          )
+          .toArray()[0]?.c,
+      ) || 0;
+    const contributorCount = distinctContributors + unattributedNonSeed;
 
     return {
       version: parseInt(this.getMeta("version", "1"), 10) || 1,
@@ -457,17 +504,18 @@ export class WorldDO extends DurableObject<Env> {
     };
   }
 
-  public lookupCreatorCreation(ipHash: string, cookieId: string): string | null {
-    const sql = this.ctx.storage.sql;
-    if (cookieId) {
-      const byCookie = sql.exec(`SELECT creation_id FROM creators WHERE token = ?`, `cid:${cookieId}`).toArray();
-      if (byCookie.length > 0) return String(byCookie[0].creation_id);
-    }
-    if (ipHash) {
-      const byIp = sql.exec(`SELECT creation_id FROM creators WHERE token = ?`, `ip:${ipHash}`).toArray();
-      if (byIp.length > 0) return String(byIp[0].creation_id);
-    }
-    return null;
+  public lookupTodayCreation(cookieId: string, dayKey: string): string | null {
+    if (!cookieId || !dayKey) return null;
+    const rows = this.ctx.storage.sql
+      .exec(
+        `SELECT creation_id FROM creator_builds
+         WHERE cookie_id = ? AND day_key = ?
+         ORDER BY created_at DESC LIMIT 1`,
+        cookieId,
+        dayKey,
+      )
+      .toArray();
+    return rows.length > 0 ? String(rows[0].creation_id) : null;
   }
 
   private checkWindowBucket(
@@ -512,10 +560,10 @@ export class WorldDO extends DurableObject<Env> {
   }
 
   /**
-   * Atomically verifies visitor eligibility, enforces 1-in-flight build lock per visitor,
-   * max 4 concurrent global builds, per-visitor rate limits, and global hourly/daily Gemini API spend caps.
+   * Atomically verifies daily per-individual eligibility (1 creation per browser cookie per day),
+   * household-safe concurrency & anti-abuse IP caps, and global Gemini API spend circuit breakers.
    */
-  public acquireBuildSlot(ipHash: string, cookieId: string): AcquireBuildSlotResult {
+  public acquireBuildSlot(ipHash: string, cookieId: string, dayKey: string): AcquireBuildSlotResult {
     const sql = this.ctx.storage.sql;
     const now = Date.now();
 
@@ -525,35 +573,47 @@ export class WorldDO extends DurableObject<Env> {
       sql.exec(`DELETE FROM rate_limits WHERE window_start < ?`, now - 25 * 60 * 60 * 1000);
     }
 
-    // 2. Reject if this visitor has already contributed their 1 creation
-    const existingId = this.lookupCreatorCreation(ipHash, cookieId);
-    if (existingId) {
+    // 2. Reject if THIS individual browser has already placed their 1 creation today
+    const existingTodayId = this.lookupTodayCreation(cookieId, dayKey);
+    if (existingTodayId) {
       return {
         ok: false,
         status: 403,
         alreadyPlaced: true,
-        myCreationId: existingId,
-        error: "You have already placed your one creation in the shared meadow!",
+        myCreationId: existingTodayId,
+        error: "You've already added your creation for today — come back tomorrow to add another!",
       };
     }
 
-    // 3. Reject parallel concurrent requests from the same IP or cookie
-    const ipLockKey = `ip:${ipHash}`;
+    // 3. Concurrency lock: 1 in-flight build per browser cookie, up to 3 simultaneous on the same Wi-Fi/office IP
     const cidLockKey = `cid:${cookieId}`;
-    const activeVisitorLock = sql
-      .exec(
-        `SELECT lock_key FROM inflight_locks WHERE lock_key = ? OR lock_key = ? LIMIT 1`,
-        ipLockKey,
-        cidLockKey,
-      )
+    const activeCookieLock = sql
+      .exec(`SELECT lock_key FROM inflight_locks WHERE lock_key = ? LIMIT 1`, cidLockKey)
       .toArray();
-    if (activeVisitorLock.length > 0) {
+    if (activeCookieLock.length > 0) {
       return {
         ok: false,
         status: 429,
         retryAfterSec: 15,
         error: "Your creation is already being sculpted — hang tight!",
       };
+    }
+
+    if (ipHash) {
+      const activeIpCount =
+        Number(
+          sql
+            .exec(`SELECT COUNT(*) AS c FROM inflight_locks WHERE lock_key LIKE ?`, `ip:${ipHash}:%`)
+            .toArray()[0]?.c,
+        ) || 0;
+      if (activeIpCount >= 3) {
+        return {
+          ok: false,
+          status: 429,
+          retryAfterSec: 12,
+          error: "A few builds are running on your network right now — try again in a few seconds.",
+        };
+      }
     }
 
     // 4. Global concurrent Argon build cap (max 4 simultaneous builds across all visitors)
@@ -568,17 +628,10 @@ export class WorldDO extends DurableObject<Env> {
       };
     }
 
-    // 5. Per-visitor attempt rate limit (max 4 attempts per 15 min per IP/cookie)
+    // 5. Per-browser & household-friendly per-IP anti-abuse limits
     const visitorWindowMs = 15 * 60 * 1000;
-    const ipCheck = this.checkWindowBucket(`gen_ip:${ipHash}`, 4, visitorWindowMs, now);
-    if (!ipCheck.allowed) {
-      return {
-        ok: false,
-        status: 429,
-        retryAfterSec: ipCheck.retryAfterSec,
-        error: `Please wait ${ipCheck.retryAfterSec ?? 60}s before building again.`,
-      };
-    }
+    const dayWindowMs = 24 * 60 * 60 * 1000;
+
     const cidCheck = this.checkWindowBucket(`gen_cid:${cookieId}`, 4, visitorWindowMs, now);
     if (!cidCheck.allowed) {
       return {
@@ -589,9 +642,29 @@ export class WorldDO extends DurableObject<Env> {
       };
     }
 
+    if (ipHash) {
+      const ipBurstCheck = this.checkWindowBucket(`gen_ip:${ipHash}`, 12, visitorWindowMs, now);
+      if (!ipBurstCheck.allowed) {
+        return {
+          ok: false,
+          status: 429,
+          retryAfterSec: ipBurstCheck.retryAfterSec,
+          error: `Please wait ${ipBurstCheck.retryAfterSec ?? 60}s before building again.`,
+        };
+      }
+      const ipDailyPlaced = this.checkWindowBucket(`placed_ip:${ipHash}`, 15, dayWindowMs, now);
+      if (!ipDailyPlaced.allowed) {
+        return {
+          ok: false,
+          status: 429,
+          retryAfterSec: ipDailyPlaced.retryAfterSec,
+          error: "Daily network build limit reached — check back tomorrow!",
+        };
+      }
+    }
+
     // 6. Global Gemini API spend circuit-breaker (max 45 builds/hour & max 240 builds/24h globally)
     const hourWindowMs = 60 * 60 * 1000;
-    const dayWindowMs = 24 * 60 * 60 * 1000;
     const globalHour = this.checkWindowBucket("global:hour", 45, hourWindowMs, now);
     if (!globalHour.allowed) {
       return {
@@ -611,20 +684,24 @@ export class WorldDO extends DurableObject<Env> {
       };
     }
 
-    // Commit rate-limit increments & acquire 90s in-flight lock
-    this.incrementWindowBucket(`gen_ip:${ipHash}`, visitorWindowMs, now);
+    // Commit attempt counters & acquire 90s in-flight lock
+    if (ipHash) {
+      this.incrementWindowBucket(`gen_ip:${ipHash}`, visitorWindowMs, now);
+    }
     this.incrementWindowBucket(`gen_cid:${cookieId}`, visitorWindowMs, now);
     this.incrementWindowBucket("global:hour", hourWindowMs, now);
     this.incrementWindowBucket("global:day", dayWindowMs, now);
 
     const lockToken = crypto.randomUUID();
     const expiresAt = now + 90_000;
-    sql.exec(
-      `INSERT OR REPLACE INTO inflight_locks (lock_key, lock_token, expires_at) VALUES (?, ?, ?)`,
-      ipLockKey,
-      lockToken,
-      expiresAt,
-    );
+    if (ipHash) {
+      sql.exec(
+        `INSERT OR REPLACE INTO inflight_locks (lock_key, lock_token, expires_at) VALUES (?, ?, ?)`,
+        `ip:${ipHash}:${lockToken}`,
+        lockToken,
+        expiresAt,
+      );
+    }
     sql.exec(
       `INSERT OR REPLACE INTO inflight_locks (lock_key, lock_token, expires_at) VALUES (?, ?, ?)`,
       cidLockKey,
@@ -640,9 +717,9 @@ export class WorldDO extends DurableObject<Env> {
     this.ctx.storage.sql.exec(`DELETE FROM inflight_locks WHERE lock_token = ?`, lockToken);
   }
 
-  public getWorldSnapshot(ipHash: string, cookieId: string): WorldStateSnapshot {
+  public getWorldSnapshot(cookieId: string, dayKey: string): WorldStateSnapshot {
     const base = this.readBaseWorld();
-    const myCreationId = this.lookupCreatorCreation(ipHash, cookieId);
+    const myCreationId = this.lookupTodayCreation(cookieId, dayKey);
     return {
       ...base,
       myCreationId,
@@ -802,13 +879,13 @@ export class WorldDO extends DurableObject<Env> {
   }
 
   public async placeCreation(input: PlaceCreationInput): Promise<PlaceCreationResult> {
-    const existingId = this.lookupCreatorCreation(input.ipHash, input.cookieId);
+    const existingId = this.lookupTodayCreation(input.cookieId, input.dayKey);
     if (existingId) {
       return {
         ok: false,
         alreadyPlaced: true,
         myCreationId: existingId,
-        error: "You've already added your one creation to the shared meadow — watch it live in the world!",
+        error: "You've already added your creation for today — come back tomorrow to add another!",
       };
     }
 
@@ -855,21 +932,24 @@ export class WorldDO extends DurableObject<Env> {
       creation.createdAt,
       JSON.stringify(creation),
     );
-    if (input.ipHash) {
+    if (input.cookieId) {
+      const dayKey = input.dayKey || formatDayKeyInTz(now, "Australia/Sydney");
       sql.exec(
-        `INSERT OR REPLACE INTO creators (token, creation_id, created_at) VALUES (?, ?, ?)`,
-        `ip:${input.ipHash}`,
+        `INSERT OR REPLACE INTO creator_builds (creation_id, cookie_id, day_key, created_at) VALUES (?, ?, ?, ?)`,
         creation.id,
+        input.cookieId,
+        dayKey,
         now,
       );
-    }
-    if (input.cookieId) {
       sql.exec(
         `INSERT OR REPLACE INTO creators (token, creation_id, created_at) VALUES (?, ?, ?)`,
         `cid:${input.cookieId}`,
         creation.id,
         now,
       );
+    }
+    if (input.ipHash) {
+      this.incrementWindowBucket(`placed_ip:${input.ipHash}`, 24 * 60 * 60 * 1000, now);
     }
 
     // Apply instant 0ms deterministic behavior so it immediately animates upon placement!

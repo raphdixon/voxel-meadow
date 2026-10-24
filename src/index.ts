@@ -60,14 +60,14 @@ export default {
         return stub.fetch(request);
       }
 
-      // Read full shared world state + whether this visitor has already placed their 1 creation
+      // Read full shared world state + whether this individual browser has placed today's creation
       if (url.pathname === "/api/world") {
         if (request.method !== "GET") {
           return jsonResponse(request, { ok: false, error: "Method not allowed." }, 405);
         }
         const id = await resolveVisitorIdentity(request, env);
         const stub = getWorldStub(env);
-        const snapshot = await stub.getWorldSnapshot(id.ipHash, id.cookieId);
+        const snapshot = await stub.getWorldSnapshot(id.cookieId, id.dayKey);
         return jsonResponse(
           request,
           snapshot,
@@ -144,7 +144,7 @@ export default {
         const stub = getWorldStub(env);
         const cookieHeaders = id.setCookieHeader ? { "Set-Cookie": id.setCookieHeader } : undefined;
 
-        const slot = await stub.acquireBuildSlot(id.ipHash, id.cookieId);
+        const slot = await stub.acquireBuildSlot(id.ipHash, id.cookieId, id.dayKey);
         if (!slot.ok) {
           const extra = {
             ...(cookieHeaders ?? {}),
@@ -182,6 +182,7 @@ export default {
           const placed = await stub.placeCreation({
             ipHash: id.ipHash,
             cookieId: id.cookieId,
+            dayKey: id.dayKey,
             blueprintRaw: sculpted.blueprint as unknown as Record<string, unknown>,
             x: typeof body.x === "number" && Number.isFinite(body.x) ? body.x : null,
             z: typeof body.z === "number" && Number.isFinite(body.z) ? body.z : null,

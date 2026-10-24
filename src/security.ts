@@ -227,10 +227,40 @@ const LEGACY_COOKIE_NAME = "meadow_cid";
 const CID_RE = /^[0-9a-f]{24,40}$/;
 const SIG_RE = /^[0-9a-f]{28,64}$/;
 
+export function formatDayKeyInTz(nowMs: number, timeZone: string): string {
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date(nowMs));
+  } catch {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: "UTC",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date(nowMs));
+  }
+}
+
+function resolveVisitorDayKey(request: Request, allowTestHeaders: boolean): string {
+  if (allowTestHeaders) {
+    const testDay = request.headers.get("X-Test-Day")?.trim();
+    if (testDay && /^\d{4}-\d{2}-\d{2}$/.test(testDay)) {
+      return testDay;
+    }
+  }
+  const cfTz = (request as Request & { cf?: { timezone?: string } }).cf?.timezone;
+  const tz = typeof cfTz === "string" && cfTz.includes("/") ? cfTz : "Australia/Sydney";
+  return formatDayKeyInTz(Date.now(), tz);
+}
+
 export async function resolveVisitorIdentity(
   request: Request,
   env: Env & { ENABLE_DEV_ENDPOINTS?: string },
-): Promise<{ ipHash: string; cookieId: string; setCookieHeader?: string }> {
+): Promise<{ ipHash: string; cookieId: string; dayKey: string; setCookieHeader?: string }> {
   const isLocal = isLocalDevRequest(request);
   const secret = env.CREATOR_HMAC_SECRET?.trim() || (isLocal ? getDevHmacSecret() : "");
   if (!secret) {
@@ -238,6 +268,7 @@ export async function resolveVisitorIdentity(
   }
 
   const allowTestHeader = isLocal && env.ENABLE_DEV_ENDPOINTS === "1";
+  const dayKey = resolveVisitorDayKey(request, allowTestHeader);
   const rawIp =
     (!isLocal ? request.headers.get("CF-Connecting-IP") : null) ||
     (allowTestHeader ? request.headers.get("X-Test-Visitor") : null) ||
@@ -267,10 +298,11 @@ export async function resolveVisitorIdentity(
         return {
           ipHash,
           cookieId: cid,
+          dayKey,
           setCookieHeader: `${HOST_COOKIE_NAME}=${cid}.${upgradedSig}; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Strict`,
         };
       }
-      return { ipHash, cookieId: cid };
+      return { ipHash, cookieId: cid, dayKey };
     }
   }
 
@@ -281,7 +313,7 @@ export async function resolveVisitorIdentity(
     ? `${cookieNameToSet}=${signedVal}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`
     : `${HOST_COOKIE_NAME}=${signedVal}; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Strict`;
 
-  return { ipHash, cookieId: freshCid, setCookieHeader };
+  return { ipHash, cookieId: freshCid, dayKey, setCookieHeader };
 }
 
 /**

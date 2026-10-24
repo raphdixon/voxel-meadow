@@ -4,7 +4,7 @@
 //   node scripts/audit_world.mjs                        (checks live production)
 //   node scripts/audit_world.mjs http://127.0.0.1:8788  (checks local dev server)
 
-const target = (process.argv[2] || "https://voxel-meadow.quiet-king-8097.workers.dev").replace(/\/$/, "");
+const target = (process.argv[2] || "https://geminisland.raph.plus").replace(/\/$/, "");
 
 const res = await fetch(`${target}/api/audit`, {
   headers: { accept: "application/json" },

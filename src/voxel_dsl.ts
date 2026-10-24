@@ -1,4 +1,5 @@
 import { sanitizeLiveFeed } from "./live_feeds";
+import { sanitizePlainText } from "./security";
 import { autoRepairBlueprintOverlaps } from "./voxel_audit";
 import type {
   CreationCategory,
@@ -140,16 +141,22 @@ function hashToken(s: string): number {
   return h >>> 0;
 }
 
+const SAFE_TOKEN_RE = /^[a-zA-Z0-9_-]{1,28}$/;
+
 export function normalizeColorToken(raw: unknown, palette: Record<string, string>, fallback = "cream"): string {
   const name = typeof raw === "string" ? raw.trim() : "";
   if (!name) return fallback;
   if (HEX_RE.test(name)) return name.toLowerCase();
-  if (palette[name] && HEX_RE.test(palette[name])) return name;
-  if (VOX_PALETTE[name]) return name;
+  if (!SAFE_TOKEN_RE.test(name) || name === "__proto__" || name === "constructor" || name === "prototype") {
+    return fallback;
+  }
+  if (Object.hasOwn(palette, name) && HEX_RE.test(palette[name])) return name;
+  if (Object.hasOwn(VOX_PALETTE, name)) return name;
   const lower = name.toLowerCase();
   for (const k of Object.keys(VOX_PALETTE)) {
     if (k.toLowerCase() === lower) return k;
   }
+  if (Object.keys(palette).length >= 32) return fallback;
   if (lower.includes("yellow") || lower.includes("amber")) palette[name] = "#f5b82e";
   else if (lower.includes("red") || lower.includes("crimson")) palette[name] = "#df5246";
   else if (lower.includes("glass") || lower.includes("window")) palette[name] = "#b8e4f2";
@@ -493,7 +500,10 @@ export function mirrorOpX(op: VoxelOp): VoxelOp | null {
 }
 
 export function applySimOps(vox: SimVox, ops: VoxelOp[], palette: Record<string, string>): SimVox {
-  const col = (c: string) => palette[c] || VOX_PALETTE[c] || c;
+  const col = (c: string) =>
+    (Object.hasOwn(palette, c) ? palette[c] : undefined) ||
+    (Object.hasOwn(VOX_PALETTE, c) ? VOX_PALETTE[c] : undefined) ||
+    c;
   const runSingle = (op: VoxelOp) => {
     switch (op.op) {
       case "plinth":
@@ -956,18 +966,22 @@ export function normalizeAndGroundBlueprint(
   options?: { skipAutoRepair?: boolean },
 ): VoxelBlueprint {
   const palette: Record<string, string> = {};
-  if (raw.palette && typeof raw.palette === "object") {
-    for (const [k, v] of Object.entries(raw.palette as Record<string, unknown>)) {
+  if (raw.palette && typeof raw.palette === "object" && !Array.isArray(raw.palette)) {
+    for (const [k, v] of Object.entries(raw.palette as Record<string, unknown>).slice(0, 32)) {
+      const key = k.trim();
+      if (!SAFE_TOKEN_RE.test(key) || key === "__proto__" || key === "constructor" || key === "prototype") {
+        continue;
+      }
       if (typeof v === "string" && HEX_RE.test(v.trim())) {
-        palette[k.trim()] = v.trim().toLowerCase();
-      } else if (typeof v === "string" && VOX_PALETTE[v.trim()]) {
-        palette[k.trim()] = VOX_PALETTE[v.trim()];
+        palette[key] = v.trim().toLowerCase();
+      } else if (typeof v === "string" && Object.hasOwn(VOX_PALETTE, v.trim())) {
+        palette[key] = VOX_PALETTE[v.trim()];
       }
     }
   }
 
   let ops: VoxelOp[] = [];
-  for (const item of Array.isArray(raw.ops) ? raw.ops : []) {
+  for (const item of Array.isArray(raw.ops) ? raw.ops.slice(0, 96) : []) {
     if (item && typeof item === "object") {
       const cleaned = sanitizeOp(item as Record<string, unknown>, palette, false);
       if (cleaned) ops.push(cleaned);
@@ -975,7 +989,7 @@ export function normalizeAndGroundBlueprint(
   }
 
   let parts: VoxelPart[] = [];
-  for (const pRaw of Array.isArray(raw.parts) ? raw.parts : []) {
+  for (const pRaw of Array.isArray(raw.parts) ? raw.parts.slice(0, 16) : []) {
     if (!pRaw || typeof pRaw !== "object") continue;
     const rec = pRaw as Record<string, unknown>;
     const piv = Array.isArray(rec.pivot) ? rec.pivot : [0, 4, 0];
@@ -984,7 +998,7 @@ export function normalizeAndGroundBlueprint(
     const pz = clamp(num(piv[2], 0), -18, 18);
 
     let pOps: VoxelOp[] = [];
-    for (const item of Array.isArray(rec.ops) ? rec.ops : []) {
+    for (const item of Array.isArray(rec.ops) ? rec.ops.slice(0, 48) : []) {
       if (item && typeof item === "object") {
         const cleaned = sanitizeOp(item as Record<string, unknown>, palette, true);
         if (cleaned) pOps.push(cleaned);
@@ -1010,7 +1024,7 @@ export function normalizeAndGroundBlueprint(
     const kindStr = typeof rec.kind === "string" ? rec.kind : "bob";
     const kind: VoxelPartKind = PART_KINDS[kindStr as VoxelPartKind] ? (kindStr as VoxelPartKind) : "bob";
     parts.push({
-      name: typeof rec.name === "string" && rec.name.trim() ? rec.name.trim().slice(0, 36) : "part",
+      name: sanitizePlainText(rec.name, 36, true) || "part",
       kind,
       speed: clamp(Number(num(rec.speed, 1.2).toFixed(2)), 0.25, 4.0),
       ...(rec.amp !== undefined ? { amp: clamp(Number(num(rec.amp, 0.35).toFixed(2)), 0.05, 1.4) } : {}),
@@ -1069,11 +1083,9 @@ export function normalizeAndGroundBlueprint(
     category === "building" ? "large" : category === "vehicle" || category === "aircraft" || category === "watercraft" ? "medium" : "small";
   const scaleClass: ScaleClass = SCALES[scaleRaw as ScaleClass] ? (scaleRaw as ScaleClass) : defaultScale;
 
-  const name = typeof raw.name === "string" && raw.name.trim() ? raw.name.trim().slice(0, 48) : fallbackName;
+  const name = sanitizePlainText(raw.name, 48, true) || sanitizePlainText(fallbackName, 48, true) || "Meadow Creation";
   let description =
-    typeof raw.description === "string" && raw.description.trim()
-      ? raw.description.trim()
-      : `A handcrafted micro-voxel ${name.toLowerCase()}.`;
+    sanitizePlainText(raw.description, 224, true) || `A handcrafted micro-voxel ${name.toLowerCase()}.`;
   if (description.length > 220) {
     const cut = description.slice(0, 217);
     const lastSpace = cut.lastIndexOf(" ");

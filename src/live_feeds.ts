@@ -1,3 +1,4 @@
+import { sanitizePlainText } from "./security";
 import type { LiveFeedKind, LiveFeedReading, LiveFeedSpec } from "./types";
 
 const FEED_KINDS: Record<LiveFeedKind, true> = {
@@ -31,11 +32,8 @@ export function sanitizeLiveFeed(raw: unknown): LiveFeedSpec | null {
   const kind = kindStr as LiveFeedKind;
 
   const place =
-    typeof rec.place === "string" && rec.place.trim()
-      ? rec.place.trim().slice(0, 24)
-      : kind === "surf"
-        ? DEFAULT_SURF_PLACE
-        : DEFAULT_PLACE;
+    sanitizePlainText(rec.place, 24, true) ||
+    (kind === "surf" ? DEFAULT_SURF_PLACE : DEFAULT_PLACE);
 
   const defLat = kind === "surf" ? DEFAULT_SURF_LAT : DEFAULT_LAT;
   const defLon = kind === "surf" ? DEFAULT_SURF_LON : DEFAULT_LON;
@@ -214,6 +212,10 @@ async function fetchSingleFeed(spec: LiveFeedSpec): Promise<LiveFeedReading> {
         value: temp,
         updatedAt: now,
       };
+    }
+    if (feedCache.size >= 128) {
+      const oldestKey = feedCache.keys().next().value;
+      if (oldestKey) feedCache.delete(oldestKey);
     }
     feedCache.set(cacheKey, { exp: now + CACHE_TTL_MS, data: reading });
     return reading;

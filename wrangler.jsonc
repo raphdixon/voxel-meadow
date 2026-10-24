@@ -4,7 +4,14 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-09-11",
   "compatibility_flags": ["nodejs_compat"],
-  "workers_dev": true,
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    {
+      "pattern": "geminisland.raph.plus",
+      "custom_domain": true
+    }
+  ],
   "assets": {
     "directory": "./public/",
     "binding": "ASSETS",

@@ -160,7 +160,8 @@ const QUAD_UVS = [
 
 const rgbCache = new Map();
 export function parseColorLinear(hexOrName) {
-  const key = PALETTE[hexOrName] || hexOrName || "#eae4d7";
+  const safeName = typeof hexOrName === "string" ? hexOrName : "";
+  const key = (Object.hasOwn(PALETTE, safeName) ? PALETTE[safeName] : safeName) || "#eae4d7";
   let cached = rgbCache.get(key);
   if (!cached) {
     const c = new THREE.Color();
@@ -496,7 +497,10 @@ export function mirrorOpX(op) {
 }
 
 export function applyOps(vox, ops = [], customPalette = {}) {
-  const col = (c) => customPalette[c] || PALETTE[c] || c;
+  const col = (c) =>
+    (typeof c === "string" && customPalette && Object.hasOwn(customPalette, c) ? customPalette[c] : undefined) ||
+    (typeof c === "string" && Object.hasOwn(PALETTE, c) ? PALETTE[c] : undefined) ||
+    c;
   const runOne = (op) => {
     if (!op || typeof op !== "object") return;
     const emit = Number(op.emit) || 0;

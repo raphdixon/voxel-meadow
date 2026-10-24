@@ -346,7 +346,10 @@ sculptBtn.addEventListener("click", async () => {
   try {
     const res = await fetch("/api/build", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        "x-meadow-client": "1",
+      },
       body: JSON.stringify({
         prompt,
         imageDataUrl: selectedImageDataUrl || undefined,

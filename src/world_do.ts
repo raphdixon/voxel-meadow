@@ -7,6 +7,7 @@ import {
   type WorldPatch,
 } from "./argon_director";
 import { buildSeedWorld } from "./seed_world";
+import { safeLogError, verifyWebSocketOrigin } from "./security";
 import type {
   WorldCreation,
   WorldPath,
@@ -56,6 +57,17 @@ export type PlaceCreationResult =
   | { ok: true; creation: WorldCreation; world: WorldStateSnapshot }
   | { ok: false; alreadyPlaced?: boolean; myCreationId?: string; error: string };
 
+export type AcquireBuildSlotResult =
+  | { ok: true; lockToken: string }
+  | {
+      ok: false;
+      status: 403 | 429;
+      alreadyPlaced?: boolean;
+      myCreationId?: string;
+      retryAfterSec?: number;
+      error: string;
+    };
+
 function distToSegment(px: number, pz: number, ax: number, az: number, bx: number, bz: number): number {
   const vx = bx - ax;
   const vz = bz - az;
@@ -70,6 +82,9 @@ function distToSegment(px: number, pz: number, ax: number, az: number, bx: numbe
 export class WorldDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.ctx.setWebSocketAutoResponse(
+      new WebSocketRequestResponsePair("ping", JSON.stringify({ type: "pong" })),
+    );
     this.ctx.blockConcurrencyWhile(async () => {
       this.initSchemaAndSeed();
     });
@@ -113,6 +128,11 @@ export class WorldDO extends DurableObject<Env> {
         bucket TEXT PRIMARY KEY,
         count INTEGER NOT NULL,
         window_start INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS inflight_locks (
+        lock_key TEXT PRIMARY KEY,
+        lock_token TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
       );
     `);
 
@@ -450,28 +470,174 @@ export class WorldDO extends DurableObject<Env> {
     return null;
   }
 
-  public checkGenerateQuota(ipHash: string): { allowed: boolean; retryAfterSec?: number } {
+  private checkWindowBucket(
+    bucket: string,
+    maxCount: number,
+    windowMs: number,
+    now: number,
+  ): { allowed: boolean; retryAfterSec?: number } {
     const sql = this.ctx.storage.sql;
-    const now = Date.now();
-    const windowMs = 10 * 60 * 1000; // 10 minutes
-    const maxAttempts = 12;
-    const bucket = `gen:${ipHash}`;
-    const rows = sql.exec(`SELECT count, window_start FROM rate_limits WHERE bucket = ?`, bucket).toArray();
+    const rows = sql
+      .exec(`SELECT count, window_start FROM rate_limits WHERE bucket = ?`, bucket)
+      .toArray();
     if (rows.length === 0) {
-      sql.exec(`INSERT INTO rate_limits (bucket, count, window_start) VALUES (?, 1, ?)`, bucket, now);
       return { allowed: true };
     }
     const count = Number(rows[0].count) || 0;
     const start = Number(rows[0].window_start) || now;
     if (now - start > windowMs) {
-      sql.exec(`UPDATE rate_limits SET count = 1, window_start = ? WHERE bucket = ?`, now, bucket);
       return { allowed: true };
     }
-    if (count >= maxAttempts) {
-      return { allowed: false, retryAfterSec: Math.ceil((windowMs - (now - start)) / 1000) };
+    if (count >= maxCount) {
+      return { allowed: false, retryAfterSec: Math.max(5, Math.ceil((windowMs - (now - start)) / 1000)) };
     }
-    sql.exec(`UPDATE rate_limits SET count = ? WHERE bucket = ?`, count + 1, bucket);
     return { allowed: true };
+  }
+
+  private incrementWindowBucket(bucket: string, windowMs: number, now: number): void {
+    const sql = this.ctx.storage.sql;
+    const rows = sql
+      .exec(`SELECT count, window_start FROM rate_limits WHERE bucket = ?`, bucket)
+      .toArray();
+    if (rows.length === 0 || now - (Number(rows[0].window_start) || 0) > windowMs) {
+      sql.exec(
+        `INSERT OR REPLACE INTO rate_limits (bucket, count, window_start) VALUES (?, 1, ?)`,
+        bucket,
+        now,
+      );
+      return;
+    }
+    const count = Number(rows[0].count) || 0;
+    sql.exec(`UPDATE rate_limits SET count = ? WHERE bucket = ?`, count + 1, bucket);
+  }
+
+  /**
+   * Atomically verifies visitor eligibility, enforces 1-in-flight build lock per visitor,
+   * max 4 concurrent global builds, per-visitor rate limits, and global hourly/daily Gemini API spend caps.
+   */
+  public acquireBuildSlot(ipHash: string, cookieId: string): AcquireBuildSlotResult {
+    const sql = this.ctx.storage.sql;
+    const now = Date.now();
+
+    // 1. Clean expired in-flight locks and stale rate-limit buckets
+    sql.exec(`DELETE FROM inflight_locks WHERE expires_at <= ?`, now);
+    if (now % 17 === 0) {
+      sql.exec(`DELETE FROM rate_limits WHERE window_start < ?`, now - 25 * 60 * 60 * 1000);
+    }
+
+    // 2. Reject if this visitor has already contributed their 1 creation
+    const existingId = this.lookupCreatorCreation(ipHash, cookieId);
+    if (existingId) {
+      return {
+        ok: false,
+        status: 403,
+        alreadyPlaced: true,
+        myCreationId: existingId,
+        error: "You have already placed your one creation in the shared meadow!",
+      };
+    }
+
+    // 3. Reject parallel concurrent requests from the same IP or cookie
+    const ipLockKey = `ip:${ipHash}`;
+    const cidLockKey = `cid:${cookieId}`;
+    const activeVisitorLock = sql
+      .exec(
+        `SELECT lock_key FROM inflight_locks WHERE lock_key = ? OR lock_key = ? LIMIT 1`,
+        ipLockKey,
+        cidLockKey,
+      )
+      .toArray();
+    if (activeVisitorLock.length > 0) {
+      return {
+        ok: false,
+        status: 429,
+        retryAfterSec: 15,
+        error: "Your creation is already being sculpted — hang tight!",
+      };
+    }
+
+    // 4. Global concurrent Argon build cap (max 4 simultaneous builds across all visitors)
+    const activeGlobalCount =
+      Number(sql.exec(`SELECT COUNT(DISTINCT lock_token) AS c FROM inflight_locks`).toArray()[0]?.c) || 0;
+    if (activeGlobalCount >= 4) {
+      return {
+        ok: false,
+        status: 429,
+        retryAfterSec: 12,
+        error: "A few visitors are sculpting at the exact same moment — please try again in 10 seconds.",
+      };
+    }
+
+    // 5. Per-visitor attempt rate limit (max 4 attempts per 15 min per IP/cookie)
+    const visitorWindowMs = 15 * 60 * 1000;
+    const ipCheck = this.checkWindowBucket(`gen_ip:${ipHash}`, 4, visitorWindowMs, now);
+    if (!ipCheck.allowed) {
+      return {
+        ok: false,
+        status: 429,
+        retryAfterSec: ipCheck.retryAfterSec,
+        error: `Please wait ${ipCheck.retryAfterSec ?? 60}s before building again.`,
+      };
+    }
+    const cidCheck = this.checkWindowBucket(`gen_cid:${cookieId}`, 4, visitorWindowMs, now);
+    if (!cidCheck.allowed) {
+      return {
+        ok: false,
+        status: 429,
+        retryAfterSec: cidCheck.retryAfterSec,
+        error: `Please wait ${cidCheck.retryAfterSec ?? 60}s before building again.`,
+      };
+    }
+
+    // 6. Global Gemini API spend circuit-breaker (max 45 builds/hour & max 240 builds/24h globally)
+    const hourWindowMs = 60 * 60 * 1000;
+    const dayWindowMs = 24 * 60 * 60 * 1000;
+    const globalHour = this.checkWindowBucket("global:hour", 45, hourWindowMs, now);
+    if (!globalHour.allowed) {
+      return {
+        ok: false,
+        status: 429,
+        retryAfterSec: globalHour.retryAfterSec,
+        error: "The meadow workshop is resting briefly — please try again shortly.",
+      };
+    }
+    const globalDay = this.checkWindowBucket("global:day", 240, dayWindowMs, now);
+    if (!globalDay.allowed) {
+      return {
+        ok: false,
+        status: 429,
+        retryAfterSec: globalDay.retryAfterSec,
+        error: "Today's meadow build capacity has been reached — check back soon!",
+      };
+    }
+
+    // Commit rate-limit increments & acquire 90s in-flight lock
+    this.incrementWindowBucket(`gen_ip:${ipHash}`, visitorWindowMs, now);
+    this.incrementWindowBucket(`gen_cid:${cookieId}`, visitorWindowMs, now);
+    this.incrementWindowBucket("global:hour", hourWindowMs, now);
+    this.incrementWindowBucket("global:day", dayWindowMs, now);
+
+    const lockToken = crypto.randomUUID();
+    const expiresAt = now + 90_000;
+    sql.exec(
+      `INSERT OR REPLACE INTO inflight_locks (lock_key, lock_token, expires_at) VALUES (?, ?, ?)`,
+      ipLockKey,
+      lockToken,
+      expiresAt,
+    );
+    sql.exec(
+      `INSERT OR REPLACE INTO inflight_locks (lock_key, lock_token, expires_at) VALUES (?, ?, ?)`,
+      cidLockKey,
+      lockToken,
+      expiresAt,
+    );
+
+    return { ok: true, lockToken };
+  }
+
+  public releaseBuildSlot(lockToken: string): void {
+    if (!lockToken) return;
+    this.ctx.storage.sql.exec(`DELETE FROM inflight_locks WHERE lock_token = ?`, lockToken);
   }
 
   public getWorldSnapshot(ipHash: string, cookieId: string): WorldStateSnapshot {
@@ -659,7 +825,7 @@ export class WorldDO extends DurableObject<Env> {
         : Number(Math.atan2(-x, -z).toFixed(2));
 
     const now = Date.now();
-    const id = `c-${now.toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    const id = `c-${now.toString(36)}-${crypto.randomUUID().replace(/-/g, "").slice(0, 6)}`;
 
     const creation: WorldCreation = {
       id,
@@ -773,7 +939,7 @@ export class WorldDO extends DurableObject<Env> {
           });
         }
       } catch (err) {
-        console.error("Argon alarm integration failed:", err);
+        safeLogError("alarm_integration", err, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET]);
       }
     }
 
@@ -796,7 +962,7 @@ export class WorldDO extends DurableObject<Env> {
     }
 
     if (!this.env.GEMINI_API_KEY) {
-      return { ok: false, note: "Missing GEMINI_API_KEY" };
+      return { ok: false, note: "Director unavailable" };
     }
     const world = this.readBaseWorld();
     const hasUnintegrated = world.creations.some((c) => c.integratedLevel < 2);
@@ -834,8 +1000,8 @@ export class WorldDO extends DurableObject<Env> {
         return { ok: true, note: patch.weaveNote };
       }
     } catch (err) {
-      console.error("Cron weaver error:", err);
-      return { ok: false, note: String(err) };
+      safeLogError("cron_weaver", err, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET]);
+      return { ok: false, note: "Cron weave skipped due to transient upstream error" };
     }
     return { ok: true, note: "No changes needed" };
   }
@@ -857,6 +1023,18 @@ export class WorldDO extends DurableObject<Env> {
       if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
         return new Response("Expected WebSocket Upgrade", { status: 426 });
       }
+      const originErr = verifyWebSocketOrigin(request);
+      if (originErr) {
+        return new Response("Forbidden", { status: 403 });
+      }
+      const existingSockets = this.ctx.getWebSockets();
+      if (existingSockets.length >= 200) {
+        try {
+          existingSockets[0].close(1000, "Connection limit rotation");
+        } catch {
+          // ignore
+        }
+      }
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       this.ctx.acceptWebSocket(server);
@@ -866,9 +1044,10 @@ export class WorldDO extends DurableObject<Env> {
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    if (typeof message === "string" && message === "ping") {
+    const byteLen = typeof message === "string" ? message.length : message.byteLength;
+    if (byteLen > 128) {
       try {
-        ws.send(JSON.stringify({ type: "pong", t: Date.now() }));
+        ws.close(1009, "Message too large");
       } catch {
         // ignore
       }

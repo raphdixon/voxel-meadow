@@ -443,10 +443,10 @@ export function sanitizePlainText(raw: unknown, maxLen: number, stripUrls = fals
 
 export const CSP_HEADER = [
   "default-src 'self'",
-  "script-src 'self'",
+  "script-src 'self' https://static.cloudflareinsights.com",
   "style-src 'self'",
   "img-src 'self' data: blob:",
-  "connect-src 'self' wss://geminisland.raph.plus ws://localhost:* ws://127.0.0.1:*",
+  "connect-src 'self' wss://geminisland.raph.plus https://cloudflareinsights.com ws://localhost:* ws://127.0.0.1:*",
   "font-src 'self'",
   "manifest-src 'self'",
   "object-src 'none'",

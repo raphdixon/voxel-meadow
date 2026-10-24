@@ -107,6 +107,28 @@ body:has(#create-modal[open]) .dock-pill {
   box-shadow: 0 0 0 3px rgba(63, 185, 99, 0.2);
 }
 
+.dock-pill-building {
+  cursor: default;
+  pointer-events: none;
+  color: var(--ink);
+}
+
+.pill-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid rgba(22, 27, 24, 0.16);
+  border-top-color: var(--meadow-accent);
+  animation: pill-spin 0.78s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes pill-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 /* ---------------- Whisper-Quiet Hover Card & Weave Toast ---------------- */
 .hover-card {
   position: fixed;
@@ -267,18 +289,11 @@ body:has(#create-modal[open]) .dock-pill {
 }
 
 .modal-title {
-  margin: 0 28px 6px 0;
+  margin: 0 28px 16px 0;
   font-size: 1.24rem;
   font-weight: 640;
   letter-spacing: -0.022em;
   line-height: 1.25;
-}
-
-.modal-subtitle {
-  margin: 0 0 18px;
-  font-size: 0.88rem;
-  line-height: 1.48;
-  color: var(--ink-muted);
 }
 
 /* Image Drop Tile */

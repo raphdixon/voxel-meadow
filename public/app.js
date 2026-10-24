@@ -4,6 +4,10 @@ const worldCanvas = document.getElementById("world-canvas");
 const previewCanvas = document.getElementById("preview-canvas");
 const modal = document.getElementById("create-modal");
 const openCreateBtn = document.getElementById("open-create-btn");
+const buildingPill = document.getElementById("building-pill");
+const buildingPillLabel = document.getElementById("building-pill-label");
+const readyPreviewBtn = document.getElementById("ready-preview-btn");
+const readyPreviewLabel = document.getElementById("ready-preview-label");
 const closeModalBtn = document.getElementById("close-modal-btn");
 const locateMineBtn = document.getElementById("locate-mine-btn");
 const locateMineLabel = document.getElementById("locate-mine-label");
@@ -42,6 +46,8 @@ let myCreationId = null;
 let worldData = null;
 let selectedImageDataUrl = null;
 let draftBlueprint = null;
+let isSculpting = false;
+let isPlacing = false;
 let isPickingSpot = false;
 let toastTimer = null;
 
@@ -82,7 +88,7 @@ const engine = createMeadowWorldEngine(worldCanvas, {
 
 // Dialog open/close & universal light-dismiss fallback
 function openModal() {
-  if (myCreationId) return;
+  if (myCreationId || isSculpting || isPlacing) return;
   hoverCard.hidden = true;
   if (!modal.open) {
     modal.showModal();
@@ -91,7 +97,9 @@ function openModal() {
     }
   }
   if (!stepPreview.hidden && draftBlueprint) {
-    requestAnimationFrame(() => previewStage.syncSize());
+    requestAnimationFrame(() => {
+      previewStage.showBlueprint(draftBlueprint);
+    });
   }
 }
 
@@ -101,30 +109,77 @@ function closeModal() {
   }
 }
 
+async function waitUntilPointerIdle(maxWaitMs = 1200) {
+  const start = performance.now();
+  while (engine.isPointerActive?.() && performance.now() - start < maxWaitMs) {
+    await new Promise((r) => setTimeout(r, 60));
+  }
+}
+
 openCreateBtn.addEventListener("click", () => {
+  if (!modal.open) openModal();
+});
+readyPreviewBtn.addEventListener("click", () => {
   if (!modal.open) openModal();
 });
 closeModalBtn.addEventListener("click", () => {
   closeModal();
 });
-
-// Fallback light-dismiss when clicking on <dialog> backdrop outside .modal-card
-modal.addEventListener("click", (e) => {
-  if (e.target === modal) {
-    closeModal();
-  }
+modal.addEventListener("close", () => {
+  syncCreatorLockUI();
 });
+
+// Fallback light-dismiss for browsers without native <dialog closedby="any">
+if (!("closedBy" in HTMLDialogElement.prototype)) {
+  modal.addEventListener("click", (e) => {
+    if (e.target !== modal) return;
+    const rect = modal.getBoundingClientRect();
+    const isDialogContent =
+      rect.top <= e.clientY &&
+      e.clientY <= rect.top + rect.height &&
+      rect.left <= e.clientX &&
+      e.clientX <= rect.left + rect.width;
+    if (!isDialogContent) {
+      closeModal();
+    }
+  });
+}
 
 function syncCreatorLockUI() {
   if (myCreationId) {
     openCreateBtn.hidden = true;
+    buildingPill.hidden = true;
+    readyPreviewBtn.hidden = true;
     locateMineBtn.hidden = false;
     const mine = worldData?.creations?.find((c) => c.id === myCreationId);
     locateMineLabel.textContent = mine ? `Locate · ${mine.name}` : "Locate yours";
     closeModal();
+    return;
+  }
+
+  locateMineBtn.hidden = true;
+  if (isPickingSpot) {
+    openCreateBtn.hidden = true;
+    buildingPill.hidden = true;
+    readyPreviewBtn.hidden = true;
+    return;
+  }
+
+  if (isSculpting || isPlacing) {
+    openCreateBtn.hidden = true;
+    readyPreviewBtn.hidden = true;
+    buildingPill.hidden = false;
+    return;
+  }
+
+  buildingPill.hidden = true;
+  if (draftBlueprint) {
+    openCreateBtn.hidden = true;
+    readyPreviewBtn.hidden = false;
+    readyPreviewLabel.textContent = `Place · ${draftBlueprint.name}`;
   } else {
-    openCreateBtn.hidden = isPickingSpot;
-    locateMineBtn.hidden = true;
+    readyPreviewBtn.hidden = true;
+    openCreateBtn.hidden = false;
   }
 }
 
@@ -239,9 +294,10 @@ function hideErrors() {
   placeError.hidden = true;
 }
 
-// Sculpt with Argon
+// Sculpt with Argon — immediately close modal so the visitor can explore the meadow while building!
 let sculptProgressTimer = null;
 sculptBtn.addEventListener("click", async () => {
+  if (isSculpting || isPlacing) return;
   hideErrors();
   const prompt = promptInput.value.trim();
   if (!prompt && !selectedImageDataUrl) {
@@ -249,18 +305,23 @@ sculptBtn.addEventListener("click", async () => {
     return;
   }
 
+  isSculpting = true;
   sculptBtn.disabled = true;
   const phases = [
-    selectedImageDataUrl ? "Extracting subject with Argon..." : "Imagining structure with Argon...",
-    "Sculpting high-detail micro-voxels...",
-    "Articulating moving parts...",
+    selectedImageDataUrl ? "Extracting subject…" : "Building your creation…",
+    "Sculpting voxels…",
+    "Adding moving parts…",
   ];
   let pIdx = 0;
-  sculptBtnLabel.textContent = phases[0];
+  buildingPillLabel.textContent = phases[0];
   sculptProgressTimer = setInterval(() => {
     pIdx = Math.min(phases.length - 1, pIdx + 1);
-    sculptBtnLabel.textContent = phases[pIdx];
-  }, 2400);
+    buildingPillLabel.textContent = phases[pIdx];
+  }, 3200);
+
+  // Immediately close the dialog and let the visitor pan/zoom/explore the world!
+  closeModal();
+  syncCreatorLockUI();
 
   try {
     const res = await fetch("/api/generate", {
@@ -274,30 +335,43 @@ sculptBtn.addEventListener("click", async () => {
     const data = await res.json();
 
     if (!res.ok || !data.ok) {
+      isSculpting = false;
       if (data.alreadyPlaced && data.myCreationId) {
         myCreationId = data.myCreationId;
         syncCreatorLockUI();
         return;
       }
+      syncCreatorLockUI();
+      stepPreview.hidden = true;
+      stepCompose.hidden = false;
+      openModal();
       showFormError(data.error || "Could not sculpt that right now — please try again.");
       return;
     }
 
+    isSculpting = false;
     draftBlueprint = data.blueprint;
     previewTitle.textContent = draftBlueprint.name;
     previewDesc.textContent = draftBlueprint.description;
 
     stepCompose.hidden = true;
     stepPreview.hidden = false;
-    requestAnimationFrame(() => {
-      previewStage.showBlueprint(draftBlueprint);
-    });
+    syncCreatorLockUI();
+
+    await waitUntilPointerIdle();
+    openModal();
   } catch {
-    showFormError("Network hiccup while sculpting — please try once more.");
+    isSculpting = false;
+    syncCreatorLockUI();
+    stepPreview.hidden = true;
+    stepCompose.hidden = false;
+    openModal();
+    showFormError("Network hiccup while building — please try once more.");
   } finally {
     if (sculptProgressTimer) clearInterval(sculptProgressTimer);
+    sculptProgressTimer = null;
     sculptBtn.disabled = false;
-    sculptBtnLabel.textContent = "Create voxel version";
+    sculptBtnLabel.textContent = "Build";
   }
 });
 
@@ -310,9 +384,11 @@ promptInput.addEventListener("keydown", (e) => {
 
 backComposeBtn.addEventListener("click", () => {
   hideErrors();
+  draftBlueprint = null;
   stepPreview.hidden = true;
   stepCompose.hidden = false;
   previewStage.showBlueprint(null);
+  syncCreatorLockUI();
 });
 
 pickSpotBtn.addEventListener("click", () => {
@@ -348,19 +424,27 @@ placeNowBtn.addEventListener("click", async () => {
 });
 
 async function commitPlacement(x, z, yaw) {
-  if (!draftBlueprint) return;
+  if (!draftBlueprint || isPlacing) return;
+  const blueprintToPlace = draftBlueprint;
+  isPlacing = true;
+  isPickingSpot = false;
+  placementBanner.hidden = true;
+  engine.setPlacementBlueprint(null);
+
   placeNowBtn.disabled = true;
   pickSpotBtn.disabled = true;
   backComposeBtn.disabled = true;
-  placeNowBtn.textContent = "Placing...";
   placeError.hidden = true;
+  buildingPillLabel.textContent = "Placing in meadow…";
+  closeModal();
+  syncCreatorLockUI();
 
   try {
     const res = await fetch("/api/place", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        blueprint: draftBlueprint,
+        blueprint: blueprintToPlace,
         x,
         z,
         yaw,
@@ -369,25 +453,24 @@ async function commitPlacement(x, z, yaw) {
     const data = await res.json();
 
     if (!res.ok || !data.ok) {
+      isPlacing = false;
       if (data.alreadyPlaced && data.myCreationId) {
         myCreationId = data.myCreationId;
-        isPickingSpot = false;
-        placementBanner.hidden = true;
-        engine.setPlacementBlueprint(null);
+        draftBlueprint = null;
+        previewStage.showBlueprint(null);
         syncCreatorLockUI();
         engine.focusCreationById(myCreationId);
         return;
       }
-      if (isPickingSpot) cancelSpotPicking();
+      syncCreatorLockUI();
+      openModal();
       placeError.textContent = data.error || "Could not place creation.";
       placeError.hidden = false;
       return;
     }
 
-    // Permanently placed! Lock creation UI, close modal, and glide camera to watch it come alive!
-    isPickingSpot = false;
-    placementBanner.hidden = true;
-    engine.setPlacementBlueprint(null);
+    // Permanently placed! Lock creation UI and glide camera to watch it come alive!
+    isPlacing = false;
     previewStage.showBlueprint(null);
     draftBlueprint = null;
 
@@ -399,7 +482,9 @@ async function commitPlacement(x, z, yaw) {
     engine.focusOn(data.creation.x, data.creation.z, 1.58);
     showToast(`${data.creation.name} joined the meadow — Argon is weaving it into the world...`, 5200);
   } catch {
-    if (isPickingSpot) cancelSpotPicking();
+    isPlacing = false;
+    syncCreatorLockUI();
+    openModal();
     placeError.textContent = "Network error while placing — please try again.";
     placeError.hidden = false;
   } finally {

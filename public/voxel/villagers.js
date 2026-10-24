@@ -289,45 +289,59 @@ export function buildWorldPropMesh(prop) {
 
   if (prop.kind === "pond") {
     const r = prop.radius || 6.4;
-    // Soft stone & grass bank rim + translucent crystal water + voxel lilypads
-    const rimGeo = new THREE.CylinderGeometry(r + 0.55, r + 0.85, 0.26, 36);
-    const rimMat = new THREE.MeshStandardMaterial({ color: "#cfc6b4", roughness: 0.88 });
-    const rim = new THREE.Mesh(rimGeo, rimMat);
-    rim.position.y = 0.06;
-    rim.receiveShadow = true;
-    group.add(rim);
+    const ps = 0.32;
+    const gr = Math.round(r / ps);
+    const pondVox = new Vox(77);
+    const rimTones = ["limestone", "concrete", "concrete2", "grass2"];
+    // Stepped voxel stone & mossy bank rim sitting flush on the meadow
+    for (let x = -gr - 3; x <= gr + 3; x++) {
+      for (let z = -gr - 3; z <= gr + 3; z++) {
+        const d = Math.hypot(x, z);
+        if (d >= gr - 0.8 && d <= gr + 2.4) {
+          const h = Math.abs((x * 13 + z * 29) % 7);
+          const col = d > gr + 1.3 && h < 3 ? "grass2" : rimTones[h % 3];
+          pondVox.put(x, 0, z, col);
+          if (d >= gr - 0.2 && d <= gr + 1.1 && h % 3 !== 0) {
+            pondVox.put(x, 1, z, col);
+          }
+        }
+      }
+    }
+    const rimMesh = buildVoxelMesh(pondVox, { scale: ps });
+    group.add(rimMesh);
 
-    const waterGeo = new THREE.CylinderGeometry(r, r, 0.28, 36);
+    const waterGeo = new THREE.CylinderGeometry(r - 0.12, r - 0.12, 0.24, 32);
     const waterMat = new THREE.MeshStandardMaterial({
-      color: "#52b2e3",
-      roughness: 0.16,
-      metalness: 0.12,
-      emissive: new THREE.Color("#1c5f82"),
-      emissiveIntensity: 0.18,
+      color: "#4daee0",
+      roughness: 0.18,
+      metalness: 0.08,
+      emissive: new THREE.Color("#1a5b7d"),
+      emissiveIntensity: 0.16,
     });
     const water = new THREE.Mesh(waterGeo, waterMat);
-    water.position.y = 0.08;
+    water.position.y = 0.1;
     water.receiveShadow = true;
     group.add(water);
 
-    // Voxel lilypads & water lotus blossoms
-    const padVox = new Vox(77);
+    // Chunky voxel lilypads & lotus blossoms
+    const padVox = new Vox(79);
     const pads = [
-      [-r * 0.4, -r * 0.25, true],
-      [r * 0.35, r * 0.3, false],
-      [-r * 0.15, r * 0.45, true],
-      [r * 0.42, -r * 0.2, false],
+      [-r * 0.38, -r * 0.24, true],
+      [r * 0.34, r * 0.28, false],
+      [-r * 0.14, r * 0.44, true],
+      [r * 0.4, -r * 0.18, false],
     ];
     for (const [lx, lz, hasFlower] of pads) {
       const gx = Math.round(lx / s);
       const gz = Math.round(lz / s);
-      padVox.cylinderAxis("y", gx, gz, 1, 2, 2.2, "#5cb85c");
+      padVox.cylinderAxis("y", gx, gz, 1, 2, 2.4, "leaf");
       if (hasFlower) {
-        padVox.put(gx, 2, gz, "#f598b6", 0.35);
+        padVox.box(gx - 1, 2, gz, gx + 1, 3, gz + 1, "#f598b6");
+        padVox.put(gx, 3, gz, "yellow");
       }
     }
     const padMesh = buildVoxelMesh(padVox, { scale: s, castShadow: false });
-    padMesh.position.y = 0.04;
+    padMesh.position.y = 0.05;
     group.add(padMesh);
   } else if (prop.kind === "bus_stop") {
     const v = new Vox(51);
@@ -366,16 +380,24 @@ export function buildWorldPropMesh(prop) {
     v.box(-1, 5, 0, 5, 6, 1, "wood");
     group.add(buildVoxelMesh(v, { scale: s }));
   } else {
-    // flower_patch or tree_cluster
-    const v = new Vox(91);
-    const blossoms = ["#f6d55c", "#ec8db0", "#fcfaf5", "#9370cf", "#ff9b42"];
-    for (let i = 0; i < 11; i++) {
-      const fx = Math.round(Math.cos(i * 1.9) * (1 + (i % 4) * 1.4));
-      const fz = Math.round(Math.sin(i * 2.3) * (1 + (i % 3) * 1.5));
-      v.put(fx, 0, fz, "leaf");
-      v.put(fx, 1, fz, blossoms[i % blossoms.length]);
-    }
-    group.add(buildVoxelMesh(v, { scale: s, castShadow: false }));
+    // Plump, cohesive low voxel shrub & flower cushion (zero wispy isolated specks)
+    const seed = Math.abs(Math.round((prop.x || 1) * 13 + (prop.z || 1) * 29)) + 91;
+    const v = new Vox(seed);
+    const blossoms = ["#f6d55c", "#ec8db0", "#fcfaf5", "#ffb642"];
+    const b1 = blossoms[seed % blossoms.length];
+    const b2 = blossoms[(seed + 1) % blossoms.length];
+    // Main low leafy mound
+    v.sphere(0, 1.1, 0, 2.6, 1.4, 2.3, "leaf");
+    v.sphere(2.1, 0.9, 1.1, 1.9, 1.2, 1.8, "leafLight");
+    v.sphere(-1.8, 0.8, 0.9, 1.6, 1.1, 1.6, "leafDark");
+    // Trim underside below Y=0 so it sits flush on the grass
+    v.clear(-6, -4, -6, 6, 0, 6);
+    // Chunky blossom clusters nestled on top
+    v.put(-1, 2, 0, b1);
+    v.put(0, 2, 1, b1);
+    v.put(2, 2, 1, b2);
+    v.put(-2, 1, 1, b2);
+    group.add(buildVoxelMesh(v, { scale: 0.22 }));
   }
 
   group.position.set(prop.x, 0, prop.z);

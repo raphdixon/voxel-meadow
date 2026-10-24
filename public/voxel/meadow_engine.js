@@ -1,7 +1,7 @@
-// Endless Sunlit Grass Voxel World Engine + Pure-White (#FFFFFF) Modal Turntable Preview.
+// Endless Sunlit Voxel Turf World Engine + Pure-White (#FFFFFF) Modal Turntable Preview.
 // Features:
-//  - Custom sunlit meadow grass shader with drifting cumulus cloud dapple & seamless pastel horizon
-//  - Wind-rippling 3D voxel grass tufts, wildflowers & perimeter meadow trees
+//  - Crisp voxel-tiled sunlit meadow ground shader with beveled grass blocks, subtle park-lawn weave & cumulus sun dapple
+//  - Chunky 3D voxel perimeter groves (trees & flowering shrubs — zero wispy grass sticks)
 //  - Camera-tracking texel-snapped 4096^2 PCF golden-hour shadows (zero pan shimmer!)
 //  - GTAO real-time contact occlusion + subtle UnrealBloom + ACESFilmic + SMAA
 //  - Smooth CatmullRom vehicle routes with bus-stop deceleration, dwell & physical wheel roll
@@ -17,7 +17,7 @@ import {
   UnrealBloomPass,
 } from "../vendor/three-bundle.js";
 import { VillagerAgent, buildWorldPropMesh } from "./villagers.js";
-import { Vox, buildCreationGroup, buildVoxelMesh, hashCoords } from "./vox.js";
+import { Vox, buildCreationGroup, buildVoxelMesh } from "./vox.js";
 
 function makeMeadowSkyTexture() {
   const c = document.createElement("canvas");
@@ -25,10 +25,10 @@ function makeMeadowSkyTexture() {
   c.height = 256;
   const g = c.getContext("2d");
   const grad = g.createLinearGradient(0, 0, 0, 256);
-  grad.addColorStop(0.0, "#a8d2f0");
-  grad.addColorStop(0.52, "#cfe8f7");
-  grad.addColorStop(0.84, "#e6f4e4");
-  grad.addColorStop(1.0, "#dceecc");
+  grad.addColorStop(0.0, "#9ccaf0");
+  grad.addColorStop(0.54, "#c9e4f6");
+  grad.addColorStop(0.86, "#dfeed8");
+  grad.addColorStop(1.0, "#cbe4be");
   g.fillStyle = grad;
   g.fillRect(0, 0, 4, 256);
   const tex = new THREE.CanvasTexture(c);
@@ -38,8 +38,8 @@ function makeMeadowSkyTexture() {
 
 function buildEndlessGrassMaterial(uniforms) {
   const mat = new THREE.MeshStandardMaterial({
-    color: "#7ec858",
-    roughness: 0.92,
+    color: "#ffffff",
+    roughness: 0.88,
     metalness: 0.0,
     dithering: true,
   });
@@ -65,8 +65,13 @@ function buildEndlessGrassMaterial(uniforms) {
         uniform vec2 uFocusXZ;
         varying vec3 vWorldPos;
 
+        vec3 srgb2lin(float r, float g, float b) {
+          return pow(vec3(r, g, b) / 255.0, vec3(2.2));
+        }
         float mHash(vec2 p) {
-          return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+          vec2 q = fract(p * vec2(123.34, 456.21));
+          q += dot(q, q + 45.32);
+          return fract(q.x * q.y);
         }
         float mNoise(vec2 p) {
           vec2 i = floor(p);
@@ -83,36 +88,60 @@ function buildEndlessGrassMaterial(uniforms) {
         "#include <color_fragment>",
         `#include <color_fragment>
         vec2 wp = vWorldPos.xz;
-        // Rolling meadow color patches (sunlit golden-lime clover -> rich spring emerald)
-        float n1 = mNoise(wp * 0.045);
-        float n2 = mNoise(wp * 0.14 + vec2(17.3, -9.1));
-        float micro = mNoise(floor(wp * 2.0) * 0.73);
-        float pxScale = max(fwidth(wp.x), fwidth(wp.y));
-        float grainFade = 1.0 - smoothstep(0.18, 0.75, pxScale);
+        const float TILE = 0.85;
+        vec2 tileCoord = wp / TILE;
+        vec2 cell = floor(tileCoord);
+        vec2 cellUv = fract(tileCoord);
 
-        vec3 lushDeep = vec3(0.32, 0.62, 0.23);
-        vec3 springMid = vec3(0.45, 0.74, 0.29);
-        vec3 sunClover = vec3(0.61, 0.84, 0.36);
+        // Anti-aliased level-of-detail factor so voxel turf blocks stay crisp up close and silky-smooth far out
+        float tilePx = max(fwidth(tileCoord.x), fwidth(tileCoord.y));
+        float tileDetail = 1.0 - smoothstep(0.06, 0.20, tilePx);
 
-        vec3 grassCol = mix(lushDeep, springMid, smoothstep(0.22, 0.72, n1));
-        grassCol = mix(grassCol, sunClover, smoothstep(0.48, 0.88, n2) * 0.68);
-        grassCol *= 1.0 + (micro - 0.5) * 0.07 * grainFade;
+        // Curated linear-space sunlit diorama turf palette (matches Project Factory's lush voxel greens)
+        vec3 turfDeep = srgb2lin(103.0, 174.0, 74.0);
+        vec3 turfBase = srgb2lin(116.0, 187.0, 84.0);
+        vec3 turfMid  = srgb2lin(128.0, 198.0, 94.0);
+        vec3 turfSun  = srgb2lin(142.0, 209.0, 105.0);
 
-        // Soft drifting summer cloud shadows sweeping gently across the endless canvas
-        vec2 cloudUv = wp * 0.016 + vec2(uTime * 0.011, uTime * 0.006);
-        float cloud = mNoise(cloudUv) * 0.65 + mNoise(cloudUv * 2.1 + 4.2) * 0.35;
-        float cloudShadow = mix(0.86, 1.04, smoothstep(0.34, 0.68, cloud));
-        grassCol *= cloudShadow;
+        // Broad meadow sunlight zones + subtle 4x4 courtyard lawn weave + deterministic per-block voxel tone
+        float meadowZone = mNoise(wp * 0.028);
+        float subZone = mNoise(wp * 0.085 + vec2(19.4, -11.2));
+        float cellH = mHash(cell);
+        vec2 terraceBlock = floor(cell * 0.25);
+        float lawnCheck = mod(terraceBlock.x + terraceBlock.y, 2.0);
 
-        // Subtle horizon mist blend far from camera focus so the grass canvas feels truly boundless
+        vec3 grassCol = mix(turfDeep, turfBase, smoothstep(0.20, 0.68, meadowZone));
+        grassCol = mix(grassCol, turfMid, smoothstep(0.42, 0.85, subZone) * 0.72);
+        grassCol = mix(grassCol, turfSun, smoothstep(0.68, 0.96, meadowZone * 0.6 + subZone * 0.4) * 0.45);
+
+        // Stepped per-voxel block variation (faded cleanly at Grazing/far zoom)
+        float blockTone = (floor(cellH * 4.0) / 3.0 - 0.5) * 0.075 + (lawnCheck - 0.5) * 0.028;
+        grassCol *= 1.0 + blockTone * tileDetail;
+
+        // Tactile voxel block seam & sunlit top-left bevel catchlight
+        vec2 edgeDist = min(cellUv, 1.0 - cellUv);
+        float minEdge = min(edgeDist.x, edgeDist.y);
+        float seamW = max(0.042, tilePx * 1.35);
+        float seam = smoothstep(0.0, seamW, minEdge);
+        grassCol *= mix(1.0 - 0.08 * tileDetail, 1.0, seam);
+
+        float topLip = (1.0 - smoothstep(0.0, 0.14, cellUv.y)) * seam;
+        grassCol += grassCol * topLip * 0.045 * tileDetail;
+
+        // Gentle drifting cumulus sunlight warmth across the endless meadow
+        vec2 cloudUv = wp * 0.011 + vec2(uTime * 0.008, uTime * 0.0045);
+        float cloud = mNoise(cloudUv) * 0.65 + mNoise(cloudUv * 2.0 + 3.7) * 0.35;
+        grassCol *= mix(0.92, 1.05, smoothstep(0.32, 0.70, cloud));
+
+        // Seamless distant horizon mist
         float distFocus = length(wp - uFocusXZ);
-        vec3 horizonMist = vec3(0.76, 0.89, 0.73);
-        grassCol = mix(grassCol, horizonMist, smoothstep(165.0, 460.0, distFocus) * 0.62);
+        vec3 horizonMist = srgb2lin(154.0, 206.0, 134.0);
+        grassCol = mix(grassCol, horizonMist, smoothstep(185.0, 480.0, distFocus) * 0.58);
 
         diffuseColor.rgb = grassCol;`,
       );
   };
-  mat.customProgramCacheKey = () => "endless-meadow-grass-v1";
+  mat.customProgramCacheKey = () => "endless-meadow-voxel-turf-v2";
   return mat;
 }
 
@@ -125,6 +154,7 @@ function buildRibbonMesh(curve, sampleCount, halfWidth, yOffset, colorHex, recei
   const uvs = [];
   const indices = [];
 
+  // Top surface strip
   for (let i = 0; i < pts.length; i++) {
     const p = isClosed && i === pts.length - 1 ? pts[0] : pts[i];
     const prev = isClosed
@@ -150,6 +180,44 @@ function buildRibbonMesh(curve, sampleCount, halfWidth, yOffset, colorHex, recei
     if (i < pts.length - 1) {
       const base = i * 2;
       indices.push(base, base + 1, base + 3, base, base + 3, base + 2);
+    }
+  }
+
+  // Solid 3D side curb skirts down to Y=0 so road/curb slabs sit crisply on the voxel turf
+  for (const side of [-1, 1]) {
+    const sideBase = positions.length / 3;
+    for (let i = 0; i < pts.length; i++) {
+      const p = isClosed && i === pts.length - 1 ? pts[0] : pts[i];
+      const prev = isClosed
+        ? pts[(i - 1 + ringCount) % ringCount]
+        : pts[Math.max(0, i - 1)];
+      const next = isClosed
+        ? pts[(i + 1) % ringCount]
+        : pts[Math.min(pts.length - 1, i + 1)];
+      let tx = next.x - prev.x;
+      let tz = next.z - prev.z;
+      const len = Math.hypot(tx, tz) || 1;
+      tx /= len;
+      tz /= len;
+      const nx = -tz * side;
+      const nz = tx * side;
+      const ex = p.x + nx * halfWidth;
+      const ez = p.z + nz * halfWidth;
+
+      positions.push(ex, yOffset, ez);
+      positions.push(ex, 0, ez);
+      normals.push(nx, 0.25, nz, nx, 0.25, nz);
+      const v = i / Math.max(1, pts.length - 1);
+      uvs.push(v, 1, v, 0);
+
+      if (i < pts.length - 1) {
+        const b = sideBase + i * 2;
+        if (side === 1) {
+          indices.push(b, b + 1, b + 3, b, b + 3, b + 2);
+        } else {
+          indices.push(b, b + 3, b + 1, b, b + 2, b + 3);
+        }
+      }
     }
   }
 
@@ -192,6 +260,18 @@ function buildMeadowTreeMesh(variant = 0) {
     v.cone(0.5, 9, 17, 0.5, 3.1, 0.6, "leaf");
   }
   return buildVoxelMesh(v, { scale: 0.28 });
+}
+
+function buildMeadowBushMesh(variant = 0) {
+  const v = new Vox(820 + variant * 23);
+  v.sphere(0, 1.6, 0, 3.2, 2.1, 2.9, variant % 2 === 0 ? "leaf" : "leafDark");
+  v.sphere(2.2, 1.3, 1.2, 2.3, 1.7, 2.1, "leafLight");
+  v.clear(-6, -4, -6, 6, 0, 6);
+  const flowerCol = variant % 3 === 0 ? "#f6d55c" : variant % 3 === 1 ? "#ec8db0" : "#faf3e3";
+  v.put(-1, 3, 1, flowerCol);
+  v.put(2, 2, 2, flowerCol);
+  v.put(0, 3, -1, flowerCol);
+  return buildVoxelMesh(v, { scale: 0.24 });
 }
 
 class CreationSimEntity {
@@ -339,7 +419,7 @@ class CreationSimEntity {
       const tan = this.routeCurve.getTangentAt(u);
       this.x = pos.x;
       this.z = pos.z;
-      this.y = 0.07; // Sit cleanly on raised asphalt surface
+      this.y = 0.092; // Sit cleanly on raised asphalt surface
       this.yaw = Math.atan2(tan.x, tan.z);
 
       // Starboard curb-side door world coordinates for boarding villagers
@@ -552,7 +632,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
   rim.position.set(-85, 70, -90);
   scene.add(rim);
 
-  // Endless Meadow Ground Plane
+  // Endless Voxel Turf Ground Plane (zero wispy sticks or floating particles)
   const grassUniforms = {
     uTime: { value: 0 },
     uFocusXZ: { value: new THREE.Vector2(0, 0) },
@@ -563,31 +643,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
   groundMesh.receiveShadow = true;
   scene.add(groundMesh);
 
-  // Wind-rippling Instanced 3D Voxel Grass Tufts & Wildflowers around camera view
-  const tuftGeo = new THREE.BoxGeometry(0.11, 0.42, 0.11);
-  tuftGeo.translate(0, 0.21, 0);
-  const tuftMat = new THREE.MeshStandardMaterial({ roughness: 0.85, metalness: 0.0 });
-  tuftMat.onBeforeCompile = (shader) => {
-    shader.uniforms.uTime = grassUniforms.uTime;
-    shader.vertexShader = shader.vertexShader
-      .replace("#include <common>", `#include <common>\nuniform float uTime;`)
-      .replace(
-        "#include <begin_vertex>",
-        `#include <begin_vertex>
-        vec4 instW = instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
-        float breeze = sin(instW.x * 0.18 + uTime * 2.2 + instW.z * 0.13) * 0.16;
-        transformed.x += breeze * clamp(position.y * 2.2, 0.0, 1.0);`,
-      );
-  };
-  const TUFT_COUNT = isSoftwareGpu ? 350 : 1100;
-  const tuftInst = new THREE.InstancedMesh(tuftGeo, tuftMat, TUFT_COUNT);
-  tuftInst.receiveShadow = true;
-  scene.add(tuftInst);
-
-  // Scattered scenic perimeter Meadow Trees so scrolling far out discovers cozy groves
+  // Scattered scenic perimeter Meadow Groves (trees + chunky flowering voxel shrubs)
   const perimeterTreesGroup = new THREE.Group();
   scene.add(perimeterTreesGroup);
   const treeProtos = [buildMeadowTreeMesh(0), buildMeadowTreeMesh(1), buildMeadowTreeMesh(2)];
+  const bushProtos = [buildMeadowBushMesh(0), buildMeadowBushMesh(1), buildMeadowBushMesh(2)];
   for (let i = 0; i < 46; i++) {
     const r = 44 + ((i * 19) % 92);
     const ang = i * 2.399963 + 0.4;
@@ -599,31 +659,26 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     const sc = 0.85 + (i % 4) * 0.14;
     tree.scale.setScalar(sc);
     perimeterTreesGroup.add(tree);
+
+    if (i % 2 === 0) {
+      const bush = bushProtos[i % 3].clone();
+      const bAng = ang + 0.05;
+      bush.position.set(tx + Math.cos(bAng * 7) * 2.4, 0, tz + Math.sin(bAng * 5) * 2.4);
+      bush.rotation.y = (i * 2.3) % (Math.PI * 2);
+      perimeterTreesGroup.add(bush);
+    }
   }
 
-  // Floating Golden Sunlight Pollen Motes
-  const pollenCount = isSoftwareGpu ? 40 : 110;
-  const pollenGeo = new THREE.BufferGeometry();
-  const pollenPos = new Float32Array(pollenCount * 3);
-  for (let i = 0; i < pollenCount; i++) {
-    pollenPos[i * 3] = ((i * 73) % 100) - 50;
-    pollenPos[i * 3 + 1] = 1.2 + ((i * 29) % 14);
-    pollenPos[i * 3 + 2] = ((i * 97) % 100) - 50;
-  }
-  pollenGeo.setAttribute("position", new THREE.BufferAttribute(pollenPos, 3));
-  const pollenPoints = new THREE.Points(
-    pollenGeo,
-    new THREE.PointsMaterial({
-      color: 0xfff0b8,
-      size: 2.5,
-      sizeAttenuation: false,
-      transparent: true,
-      opacity: 0.5,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-    }),
-  );
-  scene.add(pollenPoints);
+  // Reusable beveled micro-voxel limestone flagstone prototypes for footpaths
+  const flagstoneProtos = [0, 1, 2].map((variant) => {
+    const fv = new Vox(410 + variant * 17);
+    const cMain = variant === 0 ? "limestone" : variant === 1 ? "path" : "cream";
+    const cEdge = variant === 1 ? "path2" : "concrete";
+    fv.box(-2, 0, -2, 2, 1, 2, cMain);
+    fv.put(-2, 0, -2, cEdge);
+    fv.put(1, 0, 1, cEdge);
+    return buildVoxelMesh(fv, { scale: 0.24, castShadow: false });
+  });
 
   // Dynamic World Scene Groups
   const pathsGroup = new THREE.Group();
@@ -708,86 +763,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     return best;
   }
 
-  // Repopulate grass tufts cleanly around the current camera focus, avoiding roads & ponds
-  let lastGrassCenter = [9999, 9999];
-  const dummyObj = new THREE.Object3D();
-  const tmpColor = new THREE.Color();
-  const grassSwatches = ["#74be50", "#85cf5d", "#66b045", "#94d968", "#f7dc6f", "#f59bb8", "#fcfaf2"];
-
-  function refreshGrassTufts(cx, cz) {
-    lastGrassCenter = [cx, cz];
-    const span = 56;
-    let idx = 0;
-    const step = 3.2;
-    const baseGX = Math.floor((cx - span) / step);
-    const baseGZ = Math.floor((cz - span) / step);
-    const countSide = Math.ceil((span * 2) / step);
-
-    for (let ix = 0; ix < countSide && idx < TUFT_COUNT; ix++) {
-      for (let iz = 0; iz < countSide && idx < TUFT_COUNT; iz++) {
-        const gx = baseGX + ix;
-        const gz = baseGZ + iz;
-        const h1 = hashCoords(gx, 0, gz, 31);
-        if (h1 < 0.28) continue;
-        const wx = (gx + (hashCoords(gx, 1, gz, 37) - 0.5) * 0.85) * step;
-        const wz = (gz + (hashCoords(gx, 2, gz, 41) - 0.5) * 0.85) * step;
-
-        // Keep tufts off ponds & building centers
-        let blocked = false;
-        if (currentWorld) {
-          for (const pr of currentWorld.props) {
-            if (pr.kind === "pond" && Math.hypot(wx - pr.x, wz - pr.z) < (pr.radius || 6.4) + 1.1) {
-              blocked = true;
-              break;
-            }
-          }
-          if (!blocked) {
-            for (const c of currentWorld.creations) {
-              if (c.category === "building" && Math.hypot(wx - c.x, wz - c.z) < 4.5) {
-                blocked = true;
-                break;
-              }
-            }
-          }
-        }
-        if (blocked) continue;
-
-        const isBlossom = h1 > 0.91;
-        dummyObj.position.set(wx, 0, wz);
-        dummyObj.rotation.set(0, h1 * Math.PI * 2, 0);
-        dummyObj.scale.set(
-          isBlossom ? 1.35 : 0.9 + (h1 % 0.4),
-          isBlossom ? 0.85 : 0.7 + (h1 % 0.85),
-          isBlossom ? 1.35 : 0.9 + (h1 % 0.4),
-        );
-        dummyObj.updateMatrix();
-        tuftInst.setMatrixAt(idx, dummyObj.matrix);
-
-        const swatch = isBlossom
-          ? grassSwatches[4 + (Math.abs(gx + gz) % 3)]
-          : grassSwatches[Math.abs(gx * 3 + gz) % 4];
-        tmpColor.set(swatch);
-        tuftInst.setColorAt(idx, tmpColor);
-        idx++;
-      }
-    }
-
-    // Hide unused instances cleanly below ground
-    dummyObj.scale.set(0.0001, 0.0001, 0.0001);
-    dummyObj.position.set(0, -10, 0);
-    dummyObj.updateMatrix();
-    while (idx < TUFT_COUNT) {
-      tuftInst.setMatrixAt(idx, dummyObj.matrix);
-      idx++;
-    }
-    tuftInst.instanceMatrix.needsUpdate = true;
-    if (tuftInst.instanceColor) tuftInst.instanceColor.needsUpdate = true;
-  }
-
   function rebuildPathsAndProps(world) {
     while (pathsGroup.children.length) {
       const ch = pathsGroup.children.pop();
       ch.traverse((o) => {
+        if (o.userData?.sharedProto) return;
         if (o.geometry) o.geometry.dispose();
         if (o.material) o.material.dispose();
       });
@@ -807,35 +787,38 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
 
       if (p.kind === "road") {
         const samples = Math.min(200, Math.max(36, Math.round(len * 1.4)));
-        pathsGroup.add(buildRibbonMesh(curve, samples, 2.48, 0.03, "#d5cdc0"));
-        pathsGroup.add(buildRibbonMesh(curve, samples, 2.08, 0.06, "#505560"));
+        pathsGroup.add(buildRibbonMesh(curve, samples, 2.52, 0.055, "#dfd7c5"));
+        pathsGroup.add(buildRibbonMesh(curve, samples, 2.1, 0.088, "#4b505c"));
 
         // Cream dashed road centerline
         const dashCount = Math.floor(len / 3.4);
-        const dashGeo = new THREE.BoxGeometry(0.18, 0.02, 1.25);
-        const dashMat = new THREE.MeshBasicMaterial({ color: "#f5ebd4" });
+        const dashGeo = new THREE.BoxGeometry(0.2, 0.03, 1.3);
+        const dashMat = new THREE.MeshBasicMaterial({
+          color: "#f6eed8",
+          polygonOffset: true,
+          polygonOffsetFactor: -3,
+        });
         for (let i = 0; i < dashCount; i++) {
           const u = (i + 0.5) / dashCount;
           const pt = curve.getPointAt(u);
           const tan = curve.getTangentAt(u);
           const dash = new THREE.Mesh(dashGeo, dashMat);
-          dash.position.set(pt.x, 0.075, pt.z);
+          dash.position.set(pt.x, 0.105, pt.z);
           dash.rotation.y = Math.atan2(tan.x, tan.z);
           pathsGroup.add(dash);
         }
       } else {
-        // Warm limestone stepping stones along footpath
-        const stoneCount = Math.max(3, Math.floor(len / 1.45));
-        const stoneGeo = new THREE.CylinderGeometry(0.55, 0.62, 0.09, 8);
-        const stoneMat = new THREE.MeshStandardMaterial({ color: "#e8dec6", roughness: 0.88 });
+        // Beveled micro-voxel limestone & sandstone flagstones aligned cleanly along footpath
+        const stoneCount = Math.max(3, Math.floor(len / 1.42));
         for (let i = 0; i <= stoneCount; i++) {
           const u = i / stoneCount;
           const pt = curve.getPointAt(u);
-          const stone = new THREE.Mesh(stoneGeo, stoneMat);
-          stone.position.set(pt.x, 0.04, pt.z);
-          stone.rotation.y = i * 0.9;
-          stone.scale.set(1 + (i % 2) * 0.15, 1, 0.88 + ((i + 1) % 2) * 0.15);
-          stone.receiveShadow = true;
+          const tan = curve.getTangentAt(u);
+          const stone = flagstoneProtos[i % flagstoneProtos.length].clone();
+          stone.userData.sharedProto = true;
+          stone.position.set(pt.x, -0.17, pt.z);
+          stone.rotation.y = Math.atan2(tan.x, tan.z) + (((i % 3) - 1) * 0.08);
+          stone.scale.set(1.0 + (i % 2) * 0.12, 1, 0.92 + ((i + 1) % 2) * 0.12);
           pathsGroup.add(stone);
         }
       }
@@ -893,7 +876,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     if (world.myCreationId) {
       highlightedId = world.myCreationId;
     }
-    refreshGrassTufts(cam.tx, cam.tz);
   }
 
   // Camera Navigation Gestures (Trackpad 2-finger scroll pan, Pinch/Cmd+Wheel zoom, Drag pan, Right/Alt-drag orbit)
@@ -1160,22 +1142,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     grassUniforms.uFocusXZ.value.set(cam.tx, cam.tz);
     updateTexelSnappedSun(cam.tx, cam.tz);
 
-    if (Math.hypot(cam.tx - lastGrassCenter[0], cam.tz - lastGrassCenter[1]) > 7.5) {
-      refreshGrassTufts(cam.tx, cam.tz);
-    }
-
-    // Drift sunlight pollen gently around camera target
-    const pArr = pollenGeo.attributes.position.array;
-    for (let i = 0; i < pollenCount; i++) {
-      const idx = i * 3;
-      pArr[idx + 1] = 1.2 + ((t * 0.35 + i * 1.7) % 12);
-      const relX = ((((i * 73) % 90) - 45 + Math.sin(t * 0.5 + i) * 3) % 90);
-      const relZ = ((((i * 97) % 90) - 45 + Math.cos(t * 0.4 + i) * 3) % 90);
-      pArr[idx] = cam.tx + relX;
-      pArr[idx + 2] = cam.tz + relZ;
-    }
-    pollenGeo.attributes.position.needsUpdate = true;
-
     // Step all creations & collect active transit vehicles for villager boarding
     const allEnts = Array.from(creationEntities.values());
     const ponds = (currentWorld?.props || []).filter((p) => p.kind === "pond");
@@ -1220,6 +1186,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     setPlacementBlueprint,
     focusCreationById,
     focusOn,
+    isPointerActive: () => Boolean(pointerGesture),
     getCreationEntity: (id) => creationEntities.get(id) || null,
   };
 }

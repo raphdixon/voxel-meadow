@@ -96,6 +96,25 @@
       >
         + Add your one thing
       </button>
+      <div
+        id="building-pill"
+        class="dock-pill dock-pill-building"
+        role="status"
+        aria-live="polite"
+        hidden
+      >
+        <span class="pill-spinner" aria-hidden="true"></span>
+        <span id="building-pill-label">Building your creation…</span>
+      </div>
+      <button
+        type="button"
+        id="ready-preview-btn"
+        class="dock-pill dock-pill-ready"
+        hidden
+      >
+        <span class="live-dot" aria-hidden="true"></span>
+        <span id="ready-preview-label">Place creation</span>
+      </button>
       <button type="button" id="locate-mine-btn" class="dock-pill dock-pill-placed" hidden>
         <span class="live-dot" aria-hidden="true"></span>
         <span id="locate-mine-label">Locate yours</span>
@@ -118,9 +137,6 @@
         <!-- Step 1: Compose (Image Upload and/or Description) -->
         <section id="step-compose" class="modal-step">
           <h1 id="modal-title" class="modal-title">Add one thing to the meadow</h1>
-          <p class="modal-subtitle">
-            Drop an image to extract something, or describe anything. Once placed, it comes alive forever.
-          </p>
 
           <label id="drop-zone" class="drop-zone" for="image-input">
             <input id="image-input" type="file" accept="image/*" hidden />
@@ -153,7 +169,7 @@
           <p id="form-error" class="form-error" role="alert" hidden></p>
 
           <button type="button" id="sculpt-btn" class="primary-btn">
-            <span id="sculpt-btn-label">Create voxel version</span>
+            <span id="sculpt-btn-label">Build</span>
           </button>
         </section>
 
@@ -161,7 +177,6 @@
         <section id="step-preview" class="modal-step" hidden>
           <div class="preview-stage-wrap">
             <canvas id="preview-canvas" aria-label="3D voxel preview"></canvas>
-            <span class="spin-hint">Drag to turn</span>
           </div>
 
           <div class="preview-meta">
@@ -176,7 +191,6 @@
             <button type="button" id="pick-spot-btn" class="secondary-btn">Pick spot</button>
             <button type="button" id="place-now-btn" class="primary-btn">Place in world</button>
           </div>
-          <p class="permanent-note">Each visitor places one permanent creation — once placed, it cannot be edited.</p>
         </section>
       </div>
     </dialog>

@@ -45,6 +45,13 @@ const camWalkBtn = document.getElementById("cam-walk-btn");
 const recenterBtn = document.getElementById("recenter-btn");
 const recenterCompass = document.getElementById("recenter-compass");
 
+const walkJoystick = document.getElementById("walk-joystick");
+const walkJoystickKnob = document.getElementById("walk-joystick-knob");
+const walkJoyUp = document.getElementById("walk-joy-up");
+const walkJoyDown = document.getElementById("walk-joy-down");
+const walkJoyLeft = document.getElementById("walk-joy-left");
+const walkJoyRight = document.getElementById("walk-joy-right");
+
 // UI states: "idle" | "picking" | "composing" | "building" | "ready" | "placed"
 let uiState = "idle";
 let myCreationId = null;
@@ -129,7 +136,43 @@ function stopJobTracking() {
   }
 }
 
+let engine = null;
+let currentCamMode = "pan";
+let sawTouchInput = false;
+let joyPointerId = null;
+
+function isMobileWalkViewport() {
+  if (sawTouchInput) return true;
+  if (window.matchMedia?.("(pointer: coarse)")?.matches) return true;
+  return window.innerWidth <= 768;
+}
+
+function resetWalkJoystick() {
+  joyPointerId = null;
+  walkJoystick?.classList.remove("is-active");
+  walkJoystickKnob?.setAttribute("transform", "translate(0 0)");
+  walkJoyUp?.classList.remove("is-lit");
+  walkJoyDown?.classList.remove("is-lit");
+  walkJoyLeft?.classList.remove("is-lit");
+  walkJoyRight?.classList.remove("is-lit");
+  engine?.setJoystickInput(0, 0);
+}
+
+function syncWalkJoystickVisibility() {
+  const show = !isOgCapture && currentCamMode === "walk" && isMobileWalkViewport();
+  if (walkJoystick) {
+    walkJoystick.hidden = !show;
+  }
+  if (show) {
+    document.body.dataset.walkMobile = "1";
+  } else {
+    delete document.body.dataset.walkMobile;
+    resetWalkJoystick();
+  }
+}
+
 function syncCameraModeUI(mode) {
+  currentCamMode = mode;
   const isPan = mode === "pan";
   const isOrbit = mode === "orbit";
   const isWalk = mode === "walk";
@@ -145,9 +188,10 @@ function syncCameraModeUI(mode) {
     camWalkBtn.classList.toggle("is-active", isWalk);
     camWalkBtn.setAttribute("aria-pressed", isWalk ? "true" : "false");
   }
+  syncWalkJoystickVisibility();
 }
 
-const engine = createMeadowWorldEngine(
+engine = createMeadowWorldEngine(
   worldCanvas,
   {
     onHoverCreation(creation, clientX, clientY, reading) {
@@ -230,6 +274,99 @@ recenterBtn?.addEventListener("click", () => {
   engine.recenterCamera();
   engine.setDragMode("pan");
 });
+
+window.addEventListener(
+  "pointerdown",
+  (e) => {
+    if (e.pointerType === "touch" && !sawTouchInput) {
+      sawTouchInput = true;
+      syncWalkJoystickVisibility();
+    }
+  },
+  { passive: true },
+);
+
+window.addEventListener("resize", () => {
+  syncWalkJoystickVisibility();
+});
+
+window.addEventListener("blur", () => {
+  if (joyPointerId !== null) resetWalkJoystick();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible" && joyPointerId !== null) {
+    resetWalkJoystick();
+  }
+});
+
+function updateWalkJoystickFromPoint(clientX, clientY) {
+  if (!walkJoystick) return;
+  const rect = walkJoystick.getBoundingClientRect();
+  const cx = rect.left + rect.width * 0.5;
+  const cy = rect.top + rect.height * 0.5;
+  const maxPx = Math.max(24, rect.width * 0.31);
+  const dx = clientX - cx;
+  const dy = clientY - cy;
+  const dist = Math.hypot(dx, dy);
+  const clampedPx = Math.min(maxPx, dist);
+  const ux = dist > 1e-4 ? dx / dist : 0;
+  const uy = dist > 1e-4 ? dy / dist : 0;
+
+  const maxSvg = 34;
+  const svgX = ux * (clampedPx / maxPx) * maxSvg;
+  const svgY = uy * (clampedPx / maxPx) * maxSvg;
+  walkJoystickKnob?.setAttribute("transform", `translate(${svgX.toFixed(1)} ${svgY.toFixed(1)})`);
+
+  const rawMag = clampedPx / maxPx;
+  const deadzone = 0.08;
+  const eff = rawMag <= deadzone ? 0 : (rawMag - deadzone) / (1 - deadzone);
+  const moveRight = ux * eff;
+  const moveFwd = -uy * eff;
+
+  walkJoyUp?.classList.toggle("is-lit", moveFwd > 0.28);
+  walkJoyDown?.classList.toggle("is-lit", moveFwd < -0.28);
+  walkJoyLeft?.classList.toggle("is-lit", moveRight < -0.28);
+  walkJoyRight?.classList.toggle("is-lit", moveRight > 0.28);
+
+  engine?.setJoystickInput(moveRight, moveFwd);
+}
+
+if (walkJoystick) {
+  walkJoystick.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  walkJoystick.addEventListener("pointerdown", (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (joyPointerId !== null) return;
+    joyPointerId = e.pointerId;
+    walkJoystick.classList.add("is-active");
+    hoverCard.hidden = true;
+    try {
+      walkJoystick.setPointerCapture(e.pointerId);
+    } catch {
+      // Synthetic pointer events in tests may omit active capture handles
+    }
+    updateWalkJoystickFromPoint(e.clientX, e.clientY);
+  });
+
+  walkJoystick.addEventListener("pointermove", (e) => {
+    if (joyPointerId !== e.pointerId) return;
+    e.stopPropagation();
+    e.preventDefault();
+    updateWalkJoystickFromPoint(e.clientX, e.clientY);
+  });
+
+  const endJoystickGesture = (e) => {
+    if (joyPointerId !== e.pointerId) return;
+    e.stopPropagation();
+    resetWalkJoystick();
+  };
+
+  walkJoystick.addEventListener("pointerup", endJoystickGesture);
+  walkJoystick.addEventListener("pointercancel", endJoystickGesture);
+  walkJoystick.addEventListener("lostpointercapture", endJoystickGesture);
+}
 
 function syncDockUI() {
   if (isOgCapture) return;

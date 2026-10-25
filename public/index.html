@@ -144,6 +144,22 @@
     <!-- Transient world note -->
     <div id="weave-toast" class="weave-toast" role="status" aria-live="polite" hidden></div>
 
+    <!-- Mobile First-Person Walk Joystick (forward/back + strafe) -->
+    <div id="walk-joystick" class="walk-joystick" aria-label="Walk movement joystick" hidden>
+      <svg class="walk-joystick-svg" viewBox="-64 -64 128 128" fill="none" aria-hidden="true">
+        <circle cx="0" cy="0" r="55" stroke="#161b18" stroke-opacity="0.1" stroke-width="1.2" />
+        <polyline id="walk-joy-up" class="walk-joy-chevron" points="-7,-41 0,-49 7,-41" />
+        <polyline id="walk-joy-down" class="walk-joy-chevron" points="-7,41 0,49 7,41" />
+        <polyline id="walk-joy-left" class="walk-joy-chevron" points="-41,-7 -49,0 -41,7" />
+        <polyline id="walk-joy-right" class="walk-joy-chevron" points="41,-7 49,0 41,7" />
+        <g id="walk-joystick-knob" transform="translate(0 0)">
+          <circle cx="0" cy="3" r="22" fill="#0f1c12" fill-opacity="0.22" />
+          <circle cx="0" cy="0" r="21.5" fill="#ffffff" stroke="#161b18" stroke-opacity="0.18" stroke-width="1.5" />
+          <circle cx="0" cy="0" r="7.5" fill="#161b18" fill-opacity="0.07" stroke="#161b18" stroke-opacity="0.22" stroke-width="1.4" />
+        </g>
+      </svg>
+    </div>
+
     <!-- Bottom-Anchored Explore & Build Dock (never blocks the 3D meadow) -->
     <div class="bottom-dock">
       <!-- 1. Explore-first single Add button -->

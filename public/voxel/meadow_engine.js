@@ -1606,8 +1606,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     jumpVy: 0,
     bobPhase: 0,
     settleT: 1,
-    walkTarget: null,
-    walkStuckSec: 0,
   };
 
   function screenToGround(clientX, clientY) {
@@ -1622,14 +1620,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       return [tmpHit.x, tmpHit.z];
     }
     return null;
-  }
-
-  function screenToGroundWalkTarget(clientX, clientY) {
-    const g = screenToGround(clientX, clientY);
-    if (!g) return null;
-    const d = Math.hypot(g[0] - fp.x, g[1] - fp.z);
-    if (d < 0.65 || d > 68) return null;
-    return { x: g[0], z: g[1] };
   }
 
   function getCitySignHoverItem() {
@@ -2061,8 +2051,21 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
   let dragMode = "pan";
   const pressedKeys = new Set();
-  let fpTouchMove = null;
+  const fpJoystick = { right: 0, fwd: 0 };
   let fpTouchLook = null;
+
+  function setJoystickInput(right, fwd) {
+    const rx = Number.isFinite(right) ? right : 0;
+    const fy = Number.isFinite(fwd) ? fwd : 0;
+    const mag = Math.hypot(rx, fy);
+    if (mag > 1) {
+      fpJoystick.right = rx / mag;
+      fpJoystick.fwd = fy / mag;
+    } else {
+      fpJoystick.right = rx;
+      fpJoystick.fwd = fy;
+    }
+  }
 
   function idleCursor() {
     if (fp.active) return "grab";
@@ -2197,8 +2200,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     fp.vz = 0;
     fp.jumpY = 0;
     fp.jumpVy = 0;
-    fp.walkTarget = null;
-    fp.walkStuckSec = 0;
     fp.settleT = prefersReducedMotion ? 1 : 0;
     fp.y = prefersReducedMotion ? FP_EYE_HEIGHT : FP_EYE_HEIGHT + 1.15;
   }
@@ -2210,7 +2211,8 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     activePointers.clear();
     multiPrev = null;
     hadMultiTouch = false;
-    fpTouchMove = null;
+    fpJoystick.right = 0;
+    fpJoystick.fwd = 0;
     fpTouchLook = null;
 
     placeFirstPersonNear(cam.tx, cam.tz, cam.az);
@@ -2227,8 +2229,8 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   function exitFirstPerson(toHome = false) {
     if (!fp.active) return;
     fp.active = false;
-    fp.walkTarget = null;
-    fpTouchMove = null;
+    fpJoystick.right = 0;
+    fpJoystick.fwd = 0;
     fpTouchLook = null;
     pointerGesture = null;
     activePointers.clear();
@@ -2351,7 +2353,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           );
           fp.x = nx;
           fp.z = nz;
-          fp.walkTarget = null;
           return;
         }
         lastTrackpadAt = nowFp;
@@ -2439,20 +2440,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
     if (fp.active) {
       if (e.pointerType === "touch") {
-        const rect = canvas.getBoundingClientRect();
-        const lx = e.clientX - rect.left;
-        const ly = e.clientY - rect.top;
-        const inMoveZone = lx < rect.width * 0.48 && ly > rect.height * 0.42;
-        if (!fpTouchMove && inMoveZone) {
-          fpTouchMove = {
-            id: e.pointerId,
-            startX: e.clientX,
-            startY: e.clientY,
-            curX: e.clientX,
-            curY: e.clientY,
-            moved: false,
-          };
-        } else if (!fpTouchLook) {
+        if (!fpTouchLook) {
           fpTouchLook = {
             id: e.pointerId,
             startX: e.clientX,
@@ -2506,28 +2494,19 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
   canvas.addEventListener("pointermove", (e) => {
     if (fp.active) {
-      if (fpTouchMove && fpTouchMove.id === e.pointerId) {
-        fpTouchMove.curX = e.clientX;
-        fpTouchMove.curY = e.clientY;
-        if (Math.hypot(e.clientX - fpTouchMove.startX, e.clientY - fpTouchMove.startY) > 6) {
-          fpTouchMove.moved = true;
-          fp.walkTarget = null;
-        }
-        return;
-      }
       if (fpTouchLook && fpTouchLook.id === e.pointerId) {
         const dx = e.clientX - fpTouchLook.lastX;
         const dy = e.clientY - fpTouchLook.lastY;
         fpTouchLook.lastX = e.clientX;
         fpTouchLook.lastY = e.clientY;
-        if (Math.hypot(e.clientX - fpTouchLook.startX, e.clientY - fpTouchLook.startY) > 5) {
+        if (Math.hypot(e.clientX - fpTouchLook.startX, e.clientY - fpTouchLook.startY) > 4) {
           fpTouchLook.moved = true;
         }
         if (fpTouchLook.moved) {
-          fp.goalYaw -= dx * 0.0056;
+          fp.goalYaw -= dx * 0.0092;
           fp.goalPitch = Math.max(
             FP_MIN_PITCH,
-            Math.min(FP_MAX_PITCH, fp.goalPitch - dy * 0.0048),
+            Math.min(FP_MAX_PITCH, fp.goalPitch - dy * 0.0072),
           );
         }
         return;
@@ -2664,23 +2643,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         highlightedId = picked.id;
       }
       callbacks.onSelectCreation?.(picked.data, liveFeedsById[picked.id] || null);
-      return;
-    }
-    const walkHit = screenToGroundWalkTarget(clientX, clientY);
-    if (walkHit) {
-      fp.walkTarget = walkHit;
-      fp.walkStuckSec = 0;
     }
   };
 
   const endGesture = (e) => {
     if (fp.active) {
-      if (fpTouchMove && fpTouchMove.id === e.pointerId) {
-        const wasTap = !fpTouchMove.moved && e.type === "pointerup";
-        fpTouchMove = null;
-        if (wasTap) handleFirstPersonTap(e.clientX, e.clientY);
-        return;
-      }
       if (fpTouchLook && fpTouchLook.id === e.pointerId) {
         const wasTap = !fpTouchLook.moved && e.type === "pointerup";
         fpTouchLook = null;
@@ -2764,6 +2731,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   };
   canvas.addEventListener("pointerup", endGesture);
   canvas.addEventListener("pointercancel", endGesture);
+  canvas.addEventListener("lostpointercapture", endGesture);
 
   const isKeyDown = (...tokens) => tokens.some((tk) => pressedKeys.has(tk));
 
@@ -2801,24 +2769,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       }
       if (e.code === "Space" && fp.jumpY <= 0.002) {
         fp.jumpVy = 5.2;
-      }
-      if (
-        isKeyDown(
-          "KeyW",
-          "w",
-          "KeyS",
-          "s",
-          "KeyA",
-          "a",
-          "KeyD",
-          "d",
-          "ArrowUp",
-          "arrowup",
-          "ArrowDown",
-          "arrowdown",
-        )
-      ) {
-        fp.walkTarget = null;
       }
       return;
     }
@@ -2965,23 +2915,12 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       fp.yaw += (fp.goalYaw - fp.yaw) * lookDamp;
       fp.pitch += (fp.goalPitch - fp.pitch) * lookDamp;
 
-      let inFwd = 0;
-      let inRight = 0;
+      let inFwd = fpJoystick.fwd;
+      let inRight = fpJoystick.right;
       if (isKeyDown("KeyW", "w", "ArrowUp", "arrowup")) inFwd += 1;
       if (isKeyDown("KeyS", "s", "ArrowDown", "arrowdown")) inFwd -= 1;
       if (isKeyDown("KeyD", "d")) inRight += 1;
       if (isKeyDown("KeyA", "a")) inRight -= 1;
-
-      if (fpTouchMove && fpTouchMove.moved) {
-        const jx = (fpTouchMove.curX - fpTouchMove.startX) / 46;
-        const jy = -(fpTouchMove.curY - fpTouchMove.startY) / 46;
-        const jMag = Math.hypot(jx, jy);
-        if (jMag > 0.08) {
-          const clampMag = Math.min(1, jMag);
-          inRight += (jx / jMag) * clampMag;
-          inFwd += (jy / jMag) * clampMag;
-        }
-      }
 
       const sprint = isKeyDown("ShiftLeft", "ShiftRight", "shift");
       const maxSpeed = sprint ? 9.6 : 5.8;
@@ -3000,17 +2939,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         const nr = inRight * scale;
         wishVx = (fwdX * nf + rightX * nr) * maxSpeed;
         wishVz = (fwdZ * nf + rightZ * nr) * maxSpeed;
-      } else if (fp.walkTarget) {
-        const dx = fp.walkTarget.x - fp.x;
-        const dz = fp.walkTarget.z - fp.z;
-        const dist = Math.hypot(dx, dz);
-        if (dist < 0.55) {
-          fp.walkTarget = null;
-        } else {
-          const autoSpeed = Math.min(maxSpeed, Math.max(2.0, dist * 1.8));
-          wishVx = (dx / dist) * autoSpeed;
-          wishVz = (dz / dist) * autoSpeed;
-        }
       }
 
       const velDamp = 1 - Math.exp(-dt * 14);
@@ -3022,16 +2950,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       const [rx, rz] = resolveWalkPosition(fp.x + fp.vx * dt, fp.z + fp.vz * dt);
       fp.x = rx;
       fp.z = rz;
-
-      if (fp.walkTarget) {
-        const movedDist = Math.hypot(fp.x - prevX, fp.z - prevZ);
-        if (movedDist < dt * 0.65) {
-          fp.walkStuckSec += dt;
-          if (fp.walkStuckSec > 0.4) fp.walkTarget = null;
-        } else {
-          fp.walkStuckSec = 0;
-        }
-      }
 
       if (fp.jumpY > 0 || fp.jumpVy > 0) {
         fp.jumpY += fp.jumpVy * dt;
@@ -3261,6 +3179,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     recenterCamera,
     setDragMode,
     getDragMode,
+    setJoystickInput,
     enterFirstPerson: () => setDragMode("walk"),
     exitFirstPerson: () => setDragMode("pan"),
     isFirstPerson: () => fp.active,
@@ -3281,12 +3200,14 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       fpZ: fp.z,
       fpYaw: fp.yaw,
       fpPitch: fp.pitch,
+      joyRight: fpJoystick.right,
+      joyFwd: fpJoystick.fwd,
     }),
     getPlotRadius: () => plotMarker.getPlotRadius(),
     isPointerActive: () =>
       Boolean(pointerGesture) ||
-      Boolean(fpTouchMove) ||
       Boolean(fpTouchLook) ||
+      Math.hypot(fpJoystick.right, fpJoystick.fwd) > 0.01 ||
       activePointers.size > 0,
     getCreationEntity: (id) => creationEntities.get(id) || null,
   };

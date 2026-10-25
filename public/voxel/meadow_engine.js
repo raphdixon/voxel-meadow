@@ -1624,18 +1624,16 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     if (!currentWorld) return;
     const creations = currentWorld.creations || [];
     const userLandmarks = creations.filter((c) => !c.isSeed && c.behavior?.type === "landmark");
-    // Center on a blend of central village green and newest user landmarks so the daily card showcases the active built spot!
+    const aspect = Math.max(0.5, window.innerWidth / Math.max(1, window.innerHeight));
+    const blend = aspect < 0.75 ? 0.16 : aspect < 1.15 ? 0.26 : 0.38;
     let cx = 0;
     let cz = -3;
     if (userLandmarks.length > 0) {
       const latest = userLandmarks[userLandmarks.length - 1];
-      cx = latest.x * 0.42;
-      cz = latest.z * 0.42 - 2;
-      cx = Math.max(-28, Math.min(28, cx));
-      cz = Math.max(-28, Math.min(28, cz));
+      cx = Math.max(-18, Math.min(18, latest.x * blend));
+      cz = Math.max(-18, Math.min(18, latest.z * blend - 2));
     }
-    const aspect = Math.max(0.5, window.innerWidth / Math.max(1, window.innerHeight));
-    const zoom = aspect < 0.8 ? 0.92 : aspect < 1.15 ? 0.96 : 0.98;
+    const zoom = aspect < 0.75 ? 0.64 : aspect < 1.15 ? 0.82 : 0.94;
     cam.tx = cam.goalTx = cx;
     cam.tz = cam.goalTz = cz;
     cam.zoom = cam.goalZoom = zoom;

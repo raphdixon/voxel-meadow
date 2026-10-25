@@ -402,6 +402,13 @@ export class WorldDO extends DurableObject<Env> {
       this.bumpVersion();
     }
 
+    const upgradedOgV2 = sql.exec(`SELECT value FROM meta WHERE key = 'upgrade_v8_og_v2'`).toArray();
+    if (upgradedOgV2.length === 0) {
+      sql.exec(`DELETE FROM og_snapshots`);
+      sql.exec(`DELETE FROM meta WHERE key = 'lastOgCaptureAt'`);
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v8_og_v2', '1')`);
+    }
+
     // Recover any interrupted sculpting jobs after a cold Worker/DO restart
     const orphaned = sql
       .exec(`SELECT job_id FROM build_jobs WHERE status = 'sculpting'`)

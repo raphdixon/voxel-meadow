@@ -1,5 +1,11 @@
 import { createMeadowWorldEngine } from "./voxel/meadow_engine.js";
 
+const urlParams = new URLSearchParams(location.search);
+const isOgCapture = urlParams.get("og") === "1";
+if (isOgCapture) {
+  document.body.dataset.ogCapture = "1";
+}
+
 const worldCanvas = document.getElementById("world-canvas");
 
 const addBtn = document.getElementById("add-btn");
@@ -42,8 +48,14 @@ let selectedImageDataUrl = null;
 let chosenSpot = null;
 let toastTimer = null;
 
+// Live multi-user build queue state
+let activeJob = null;
+let jobTickInterval = null;
+let jobPollInterval = null;
+let jobPollInFlight = false;
+
 function showToast(text, durationMs = 4200) {
-  if (!text) return;
+  if (!text || isOgCapture) return;
   weaveToast.textContent = text;
   weaveToast.hidden = false;
   if (toastTimer) clearTimeout(toastTimer);
@@ -52,42 +64,87 @@ function showToast(text, durationMs = 4200) {
   }, durationMs);
 }
 
-const engine = createMeadowWorldEngine(worldCanvas, {
-  onHoverCreation(creation, clientX, clientY, reading) {
-    if (!creation || uiState === "picking") {
-      hoverCard.hidden = true;
-      return;
-    }
-    hoverName.textContent = creation.name;
-    if (reading?.summary) {
-      hoverFeed.textContent = reading.summary;
-      hoverFeed.hidden = false;
-    } else {
-      hoverFeed.hidden = true;
-    }
-    hoverStatus.textContent = creation.behavior?.statusLine || creation.description || "";
-    hoverCard.style.left = `${clientX}px`;
-    hoverCard.style.top = `${clientY}px`;
-    hoverCard.hidden = false;
+function formatEta(seconds) {
+  const s = Math.max(2, Math.round(Number(seconds) || 15));
+  if (s < 60) return `~${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return rem > 0 ? `~${m}m ${rem}s` : `~${m}m`;
+}
+
+function renderActiveJobLabel() {
+  if (!activeJob) {
+    buildingPillLabel.textContent = "Queueing…";
+    return;
+  }
+  const elapsedSec = Math.max(0, Math.floor((Date.now() - activeJob.syncedAtMs) / 1000));
+  const remSec = Math.max(3, (activeJob.etaSeconds || 18) - elapsedSec);
+  if (activeJob.status === "queued" && activeJob.position >= 1) {
+    buildingPillLabel.textContent = `Queue #${activeJob.position} · ${formatEta(remSec)}`;
+  } else {
+    buildingPillLabel.textContent = `Sculpting · ${formatEta(remSec)}`;
+  }
+}
+
+function stopJobTracking() {
+  activeJob = null;
+  if (jobTickInterval) {
+    clearInterval(jobTickInterval);
+    jobTickInterval = null;
+  }
+  if (jobPollInterval) {
+    clearInterval(jobPollInterval);
+    jobPollInterval = null;
+  }
+}
+
+const engine = createMeadowWorldEngine(
+  worldCanvas,
+  {
+    onHoverCreation(creation, clientX, clientY, reading) {
+      if (!creation || uiState === "picking" || isOgCapture) {
+        hoverCard.hidden = true;
+        return;
+      }
+      hoverName.textContent = creation.name;
+      if (reading?.summary) {
+        hoverFeed.textContent = reading.summary;
+        hoverFeed.hidden = false;
+      } else {
+        hoverFeed.hidden = true;
+      }
+      hoverStatus.textContent = creation.behavior?.statusLine || creation.description || "";
+      hoverCard.style.left = `${clientX}px`;
+      hoverCard.style.top = `${clientY}px`;
+      hoverCard.hidden = false;
+    },
+    onSelectCreation(creation, reading) {
+      if (!creation || isOgCapture) return;
+      const detail = reading?.summary
+        ? `${reading.summary} · ${creation.behavior?.statusLine || creation.description}`
+        : creation.behavior?.statusLine || creation.description;
+      showToast(`${creation.name} — ${detail}`);
+    },
+    onPickGroundSpot(x, z) {
+      chosenSpot = { x, z };
+      uiState = "composing";
+      syncDockUI();
+      if (window.innerWidth > 640) {
+        promptInput.focus({ preventScroll: true });
+      }
+    },
+    onAutoNudgeSpot(x, z) {
+      if (chosenSpot) {
+        chosenSpot = { x, z };
+      }
+    },
   },
-  onSelectCreation(creation, reading) {
-    if (!creation) return;
-    const detail = reading?.summary
-      ? `${reading.summary} · ${creation.behavior?.statusLine || creation.description}`
-      : creation.behavior?.statusLine || creation.description;
-    showToast(`${creation.name} — ${detail}`);
-  },
-  onPickGroundSpot(x, z) {
-    chosenSpot = { x, z };
-    uiState = "composing";
-    syncDockUI();
-    if (window.innerWidth > 640) {
-      promptInput.focus({ preventScroll: true });
-    }
-  },
-});
+  { ogMode: isOgCapture },
+);
 
 function syncDockUI() {
+  if (isOgCapture) return;
+
   addBtn.hidden = true;
   pickSpotPill.hidden = true;
   bottomBuilder.hidden = true;
@@ -109,6 +166,7 @@ function syncDockUI() {
       break;
     case "composing":
       bottomBuilder.hidden = false;
+      engine.setPreviewPrompt(promptInput.value);
       engine.setSpotPickerState({
         mode: "staked",
         x: chosenSpot?.x ?? 16,
@@ -117,6 +175,7 @@ function syncDockUI() {
       break;
     case "building":
       buildingPill.hidden = false;
+      renderActiveJobLabel();
       engine.setSpotPickerState({
         mode: "building",
         x: chosenSpot?.x ?? 16,
@@ -144,7 +203,89 @@ function syncDockUI() {
   }
 }
 
-// 1. Click "+ Add" -> pick where on the grass it will go
+async function pollActiveJob() {
+  if (!activeJob || jobPollInFlight) return;
+  jobPollInFlight = true;
+  try {
+    const res = await fetch(`/api/job?id=${encodeURIComponent(activeJob.jobId)}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data.ok || !data.job) return;
+
+    const job = data.job;
+    if (job.status === "done") {
+      stopJobTracking();
+      sculptBtn.disabled = false;
+      if (data.world) {
+        worldData = data.world;
+        engine.applyWorldSnapshot(worldData);
+      }
+      if (data.feeds) {
+        engine.applyLiveFeeds(data.feeds);
+      }
+      myCreationId = job.creationId || data.world?.myCreationId || myCreationId;
+      readyCreation =
+        job.creation || worldData?.creations?.find((c) => c.id === myCreationId) || null;
+      uiState = "ready";
+      syncDockUI();
+      return;
+    }
+
+    if (job.status === "failed") {
+      stopJobTracking();
+      sculptBtn.disabled = false;
+      if (job.creationId) {
+        myCreationId = job.creationId;
+        uiState = "placed";
+        syncDockUI();
+        return;
+      }
+      uiState = "composing";
+      syncDockUI();
+      showFormError(job.error || "Could not build that right now — try again.");
+      return;
+    }
+
+    activeJob = {
+      ...job,
+      syncedAtMs: Date.now(),
+    };
+    renderActiveJobLabel();
+  } catch {
+    // ignore transient poll hiccups; next tick or WS broadcast will recover
+  } finally {
+    jobPollInFlight = false;
+  }
+}
+
+function startTrackingJob(jobInfo) {
+  stopJobTracking();
+  activeJob = {
+    ...jobInfo,
+    syncedAtMs: Date.now(),
+  };
+  uiState = "building";
+  syncDockUI();
+
+  jobTickInterval = setInterval(() => {
+    if (uiState === "building" && activeJob) {
+      renderActiveJobLabel();
+    }
+  }, 1000);
+
+  jobPollInterval = setInterval(() => {
+    if (uiState === "building" && activeJob) {
+      pollActiveJob();
+    }
+  }, 3000);
+}
+
+// Dynamically resize the 3D staked plot on the island as the visitor describes tiny vs colossal subjects!
+promptInput.addEventListener("input", () => {
+  engine.setPreviewPrompt(promptInput.value);
+});
+
+// 1. Click "+ Add" -> pick where on the island it will go
 addBtn.addEventListener("click", () => {
   if (myCreationId) {
     uiState = "placed";
@@ -152,24 +293,22 @@ addBtn.addEventListener("click", () => {
     return;
   }
   hoverCard.hidden = true;
+  engine.setPreviewPrompt(promptInput.value);
   uiState = "picking";
   syncDockUI();
 });
 
-// Cancel spot selection -> back to "+ Add"
 cancelPickBtn.addEventListener("click", () => {
   chosenSpot = null;
   uiState = "idle";
   syncDockUI();
 });
 
-// Move spot from inside bottom builder -> re-enter spot picking
 moveSpotBtn.addEventListener("click", () => {
   uiState = "picking";
   syncDockUI();
 });
 
-// Close bottom builder -> clear plot stake and return to "+ Add"
 closeBuilderBtn.addEventListener("click", () => {
   hideError();
   chosenSpot = null;
@@ -193,7 +332,6 @@ worldCanvas.addEventListener("pointerleave", () => {
   hoverCard.hidden = true;
 });
 
-// Click "Ready · Go to <Name>" -> smoothly fly camera to their finished creation!
 readyGotoBtn.addEventListener("click", () => {
   if (!myCreationId) return;
   hoverCard.hidden = true;
@@ -216,7 +354,6 @@ locateMineBtn.addEventListener("click", () => {
   }
 });
 
-// Image upload & client-side resize
 async function resizeImageFile(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -317,8 +454,7 @@ window.addEventListener("paste", (e) => {
   }
 });
 
-// Build in background at chosen spot -> show "Ready · Go to <Name>" when complete
-let buildProgressTimer = null;
+// Enqueue build into the multi-user workshop queue -> close builder immediately so visitor can explore while watching live Queue #N & ~ETA!
 sculptBtn.addEventListener("click", async () => {
   if (uiState === "building") return;
   hideError();
@@ -328,19 +464,13 @@ sculptBtn.addEventListener("click", async () => {
     return;
   }
 
+  engine.setPreviewPrompt(prompt);
   const spotX = chosenSpot?.x ?? null;
   const spotZ = chosenSpot?.z ?? null;
 
   uiState = "building";
   sculptBtn.disabled = true;
-  const phases = ["Building…", "Sculpting voxels…", "Placing in meadow…"];
-  let pIdx = 0;
-  buildingPillLabel.textContent = phases[0];
-  buildProgressTimer = setInterval(() => {
-    pIdx = Math.min(phases.length - 1, pIdx + 1);
-    buildingPillLabel.textContent = phases[pIdx];
-  }, 3200);
-
+  buildingPillLabel.textContent = "Joining queue…";
   syncDockUI();
 
   try {
@@ -360,6 +490,7 @@ sculptBtn.addEventListener("click", async () => {
     const data = await res.json();
 
     if (!res.ok || !data.ok) {
+      sculptBtn.disabled = false;
       if (data.alreadyPlaced && data.myCreationId) {
         myCreationId = data.myCreationId;
         uiState = "placed";
@@ -372,26 +503,25 @@ sculptBtn.addEventListener("click", async () => {
       return;
     }
 
+    if (data.job) {
+      startTrackingJob(data.job);
+      return;
+    }
+
+    // Direct synchronous fallback if ever returned
+    sculptBtn.disabled = false;
     worldData = data.world;
     myCreationId = data.creation.id;
     readyCreation = data.creation;
-
-    if (data.feeds) {
-      engine.applyLiveFeeds(data.feeds);
-    }
+    if (data.feeds) engine.applyLiveFeeds(data.feeds);
     engine.applyWorldSnapshot(worldData);
-
-    // Do NOT yank the camera automatically — let them click "Ready · Go to <Name>"!
     uiState = "ready";
     syncDockUI();
   } catch {
+    sculptBtn.disabled = false;
     uiState = "composing";
     syncDockUI();
     showFormError("Network hiccup while building — try again.");
-  } finally {
-    if (buildProgressTimer) clearInterval(buildProgressTimer);
-    buildProgressTimer = null;
-    sculptBtn.disabled = false;
   }
 });
 
@@ -416,7 +546,7 @@ async function refreshLiveFeeds() {
 }
 
 async function refreshDailyEligibility() {
-  if (!myCreationId || uiState === "building" || uiState === "ready") return;
+  if (isOgCapture || uiState === "building" || uiState === "ready") return;
   try {
     const res = await fetch("/api/world");
     if (!res.ok) return;
@@ -424,7 +554,9 @@ async function refreshDailyEligibility() {
     worldData = latest;
     myCreationId = latest.myCreationId || null;
     engine.applyWorldSnapshot(worldData);
-    if (!myCreationId && uiState === "placed") {
+    if (latest.myActiveJob && !myCreationId) {
+      startTrackingJob(latest.myActiveJob);
+    } else if (!myCreationId && uiState === "placed") {
       uiState = "idle";
       syncDockUI();
     }
@@ -435,7 +567,11 @@ async function refreshDailyEligibility() {
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
-    refreshDailyEligibility();
+    if (uiState === "building" && activeJob) {
+      pollActiveJob();
+    } else {
+      refreshDailyEligibility();
+    }
   }
 });
 
@@ -446,17 +582,28 @@ async function initWorld() {
       worldData = await res.json();
       myCreationId = worldData.myCreationId || null;
       engine.applyWorldSnapshot(worldData);
-      uiState = myCreationId ? "placed" : "idle";
-      syncDockUI();
+      if (!isOgCapture) {
+        if (myCreationId) {
+          uiState = "placed";
+          syncDockUI();
+        } else if (worldData.myActiveJob) {
+          startTrackingJob(worldData.myActiveJob);
+        } else {
+          uiState = "idle";
+          syncDockUI();
+        }
+      }
     }
   } catch (err) {
     console.error("Failed to fetch initial world:", err);
   }
 
   refreshLiveFeeds();
-  setInterval(refreshLiveFeeds, 90_000);
-  setInterval(refreshDailyEligibility, 10 * 60_000);
-  connectLiveWebSocket();
+  if (!isOgCapture) {
+    setInterval(refreshLiveFeeds, 90_000);
+    setInterval(refreshDailyEligibility, 10 * 60_000);
+    connectLiveWebSocket();
+  }
 }
 
 function connectLiveWebSocket() {
@@ -466,13 +613,32 @@ function connectLiveWebSocket() {
   ws.addEventListener("message", (ev) => {
     try {
       const msg = JSON.parse(String(ev.data));
+      if (msg.type === "queue_tick" && activeJob && uiState === "building") {
+        const qIdx = Array.isArray(msg.queuedIds) ? msg.queuedIds.indexOf(activeJob.jobId) : -1;
+        const isSculpting =
+          Array.isArray(msg.sculpting) && msg.sculpting.some((s) => s.jobId === activeJob.jobId);
+        if (qIdx >= 0) {
+          activeJob.status = "queued";
+          activeJob.position = qIdx + 1;
+          renderActiveJobLabel();
+        } else if (isSculpting) {
+          activeJob.status = "sculpting";
+          activeJob.position = 0;
+          renderActiveJobLabel();
+        }
+        pollActiveJob();
+        return;
+      }
+
       if ((msg.type === "creation_placed" || msg.type === "world_updated") && msg.world) {
         worldData = {
           ...msg.world,
           myCreationId,
         };
         engine.applyWorldSnapshot(worldData);
-        if (uiState === "placed" || uiState === "ready") {
+        if (uiState === "building" && activeJob) {
+          pollActiveJob();
+        } else if (uiState === "placed" || uiState === "ready") {
           syncDockUI();
         }
         refreshLiveFeeds();
@@ -482,9 +648,10 @@ function connectLiveWebSocket() {
         } else if (
           msg.type === "creation_placed" &&
           msg.creation &&
-          msg.creation.id !== myCreationId
+          msg.creation.id !== myCreationId &&
+          uiState !== "building"
         ) {
-          showToast(`Someone added "${msg.creation.name}" to the meadow!`, 4200);
+          showToast(`Someone added "${msg.creation.name}" to GeminIsland!`, 4200);
         }
       }
     } catch {

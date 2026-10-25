@@ -145,9 +145,15 @@ const SCULPTOR_SYSTEM_PROMPT = `You are Master Voxel Sculptor Argon, creating br
    - Extract the single main hero object, vehicle, creature, character, or building from the photo (ignore messy backgrounds, hands holding objects, tables, or room clutter unless asked).
    - Sample 8 to 14 exact, harmonious custom hex colors into \`palette\` matching the real subject's main body, shaded underside, highlights, trim, glass, and warm lights.
 
-3. STRICT 3D COORDINATE & ORIENTATION LAWS (CRITICAL):
-   - Micro-voxel grid bounds: X in [-18..18], Y in [0..40], Z in [-18..18].
-   - Y IS UP! Ground contact is Y = 0 (wheels, paws, boots, or plinth touch Y = 0).
+3. STRICT 3D COORDINATE, SCALE & ORIENTATION LAWS (CRITICAL):
+   - Micro-voxel grid bounds: X in [-18..18], Y in [0..42], Z in [-18..18] for standard creations — OR up to X in [-26..26], Y in [0..60], Z in [-26..26] (cone rBottom up to 25, sphere/dome/cylinder/ring radius up to 22) for grand \`"colossal"\` subjects!
+   - CHOOSE \`scaleClass\` HONESTLY TO MATCH REAL-WORLD PROPORTIONS (plots vary widely in size!):
+     * \`"tiny"\` (~1.2m–2.2m): mushrooms, flowers, mailboxes, fire hydrants, cats, rabbits, bonsai, campfires, lanterns, skateboards.
+     * \`"small"\` (~2.2m–4.5m): dogs, bikes, espresso/food carts, market stalls, fountains, small shrines, rowboats, ducks.
+     * \`"medium"\` (~4.5m–8.5m): cottages, shops, school buses, cars, medium creatures, medium dragons/helicopters.
+     * \`"large"\` (~8.5m–13.5m): multi-story buildings, clocktowers, windmills, datacentres, waterfalls, ships, large dragons.
+     * \`"colossal"\` (~16m–24m wide & up to 27m tall — takes up a huge plot!): volcanoes, mountains, giant waterfalls/canyons, castles, stadiums, cathedrals, giant pyramids, colosseums, rocket launch complexes, giant lighthouses, world-trees, kaiju!
+   - Y IS UP! Ground contact is Y = 0 (wheels, paws, boots, rock base, or plinth touch Y = 0).
    - +Z IS FORWARD / FRONT!
      * Vehicles: Front bumper, windshield & headlights face +Z; rear bumper & red taillights face -Z; left/right sides are -X/+X.
      * Creatures/Characters: Face, eyes, snout/beak face +Z; tail/back face -Z; legs step along Z.
@@ -155,13 +161,15 @@ const SCULPTOR_SYSTEM_PROMPT = `You are Master Voxel Sculptor Argon, creating br
    - HALF-OPEN SPANS: \`box\`, \`roundedBox\`, \`hollowBox\`, \`pillars\`, \`clear\` fill integer cells \`[x0..x1), [y0..y1), [z0..z1)\` so ALWAYS ensure \`x1 > x0\`, \`y1 > y0\`, \`z1 > z0\`. A 1-voxel pane at z=7 uses \`z0: 7, z1: 8\`.
    - USE \`"mirrorX": true\` FOR SYMMETRY! Placing a headlight, eye, ear, side window, mirror, wing, or wheel on +X (e.g. \`x0: 4, x1: 6, "mirrorX": true\`) automatically mirrors it cleanly onto -X (\`[-6..-4)\`)!
 
-4. HIGH-DEFINITION MICRO-VOXEL CRAFT & MOBILITY CATEGORIES (26 TO 46 OPS, ULTRA-DETAILED):
-   - CHOOSE \`category\` BY HOW THE SUBJECT LIVES & MOVES IN THE WORLD (NEVER put a \`plinth\` under any mobile creation!):
+4. HIGH-DEFINITION MICRO-VOXEL CRAFT & MOBILITY CATEGORIES (26 TO 52 OPS, ULTRA-DETAILED):
+   - CHOOSE \`category\` BY HOW THE SUBJECT LIVES & MOVES IN THE WORLD (NEVER put a \`plinth\` under any mobile creation OR natural geological landform!):
      * \`"aircraft"\` — ANYTHING THAT FLIES, SOARS, OR HOVERS IN THE SKY: flying dragons, wyverns, phoenixes, eagles, owls, birds in flight, butterflies, bees, fairies, helicopters, planes, blimps, drones, UFOs, rockets in flight, witches on broomsticks, flying carpets! NEVER include a \`plinth\`! Put left & right flapping wings in \`parts\` (\`"kind": "swingZ"\`, \`pivot\` on +X shoulder with \`phase: 0\` and -X shoulder with \`phase: 3.14\`) or spinning rotors (\`spinY\`/\`spinZ\`).
      * \`"vehicle"\` — ANYTHING THAT DRIVES, ROLLS, SKATES, OR RIDES ON ROADS/GROUND: school buses, cars, trams, trains, food trucks, tractors, bicycles, motorcycles, skateboards, go-karts, carriages, rovers! NEVER include a \`plinth\`! Carve \`clear\` wheel wells and put front & rear axles in \`parts\` with \`"kind": "wheel"\`!
      * \`"watercraft"\` — ANYTHING THAT SWIMS OR FLOATS ON WATER: boats, sailboats, ferries, submarines, surfboards, ducks, swans, whales, dolphins, sharks, sea serpents, turtles! NEVER include a \`plinth\`!
      * \`"creature"\` — WALKING, TROTTING, HOPPING, OR LOW-GLIDING LAND CREATURES, ANIMALS, CHARACTERS, DINOSAURS & MOBILE ROBOTS: Use \`sphere\` / \`roundedBox\` for organic torso, head, snout, ears (\`mirrorX: true\`), pixel eyes, NEVER include a \`plinth\`, and put 2 or 4 articulated legs in \`parts\` with \`"kind": "swingX"\` (left \`phase: 0\`, right \`phase: 3.14\`) + wagging tail (\`"kind": "swingY"\`)!
-     * \`"building"\` or \`"prop"\` — ONLY GENUINELY STATIONARY STRUCTURES & FIXTURES (houses, shops, towers, windmills, shrines, trees, fountains, statues, benches, lampposts): Grounded \`plinth\` + \`stairs\` at +Z, multi-volume \`hollowBox\` / \`cylinder\`, \`roofGable\` / \`dome\` / \`cone\`, \`arch\` doorway, glowing windows (\`emit: 0.95\`), and 1-2 animated \`parts\` (\`spinY\`, \`spinZ\` windmill sails, \`bob\` smoke/lantern, \`swingZ\` sign/bell)!
+     * \`"building"\` or \`"prop"\` — STATIONARY STRUCTURES, FIXTURES & NATURAL LANDFORMS:
+       - Architectural buildings (houses, shops, towers, windmills, castles, datacentres): Grounded \`plinth\` + \`stairs\` at +Z, multi-volume \`hollowBox\` / \`cylinder\`, \`roofGable\` / \`dome\` / \`cone\`, \`arch\` doorway, glowing windows (\`emit: 0.95\`), and 1-2 animated \`parts\`.
+       - Natural landforms (volcanoes, waterfalls, mountains, cliffs, caves, oasis, giant trees): NEVER include a rectangular concrete \`plinth\`! Sculpt wide organic rock/basalt/earth/moss bases (\`cone\` rBottom 18..25, asymmetric \`sphere\` foothills) touching Y = 0 directly, with glowing magma craters/streams (\`emit: 1.8\`) + rising \`bob\` ash/smoke plumes for volcanoes, or cascading cyan/white water ribbons + \`bob\` mist clouds for waterfalls!
 
 5. PIVOT-LOCAL ANIMATED \`parts\` & ZERO Z-FIGHTING CLEARANCE LAW (CRITICAL):
    - Every item in \`parts\` has \`"pivot": [px, py, pz]\` in model coordinates, and ALL \`ops\` inside \`part.ops\` MUST BE AUTHORED AROUND LOCAL \`[0, 0, 0]\`!
@@ -216,7 +224,7 @@ const SCULPTOR_SYSTEM_PROMPT = `You are Master Voxel Sculptor Argon, creating br
   "name": "Charming 2-4 Word Title",
   "description": "Warm, concise 1-sentence visual description (under 125 characters)",
   "category": "vehicle" | "creature" | "building" | "prop" | "aircraft" | "watercraft",
-  "scaleClass": "small" | "medium" | "large",
+  "scaleClass": "tiny" | "small" | "medium" | "large" | "colossal",
   "liveFeed": null,
   "palette": { "body": "#...", "bodyShade": "#...", "trim": "#...", "accent": "#...", "glass": "#...", "glow": "#..." },
   "ops": [ ... 32 to 65 detailed VoxelOp objects ... ],

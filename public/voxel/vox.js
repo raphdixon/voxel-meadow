@@ -5,10 +5,34 @@ import * as THREE from "../vendor/three-bundle.js";
 
 export const VOXEL_UNIT = 0.25;
 export const SCALE_FACTORS = {
+  tiny: 0.4,
   small: 0.56,
   medium: 0.92,
   large: 1.14,
+  colossal: 1.72,
 };
+
+export function getWorldVoxelSize(scaleClass) {
+  return VOXEL_UNIT * (SCALE_FACTORS[scaleClass] || SCALE_FACTORS.medium);
+}
+
+export function getCreationFootprintRadius(scaleClass, footprintX = 14, footprintZ = 14) {
+  const voxSize = getWorldVoxelSize(scaleClass);
+  const maxSpan = Math.max(4, footprintX || 14, footprintZ || 14);
+  const minSpan = Math.max(4, Math.min(footprintX || 14, footprintZ || 14));
+  const effectiveHalfSpan = (maxSpan * 0.72 + minSpan * 0.28) * 0.5 * voxSize;
+  const minR =
+    scaleClass === "colossal"
+      ? 7.2
+      : scaleClass === "large"
+        ? 3.8
+        : scaleClass === "medium"
+          ? 2.6
+          : scaleClass === "small"
+            ? 1.7
+            : 1.05;
+  return Number(Math.max(minR, Math.min(14.5, effectiveHalfSpan + 0.35)).toFixed(2));
+}
 
 export const PALETTE = {
   grass: "#86c864",
@@ -84,6 +108,12 @@ export const PALETTE = {
   screenCyan: "#64f5df",
   screenGreen: "#5ef28c",
   fire: "#ff7426",
+  lava: "#ff5a1f",
+  basalt: "#363840",
+  ash: "#6c6e75",
+  sand: "#ead39c",
+  moss: "#4b9645",
+  snow: "#f3f7fc",
 };
 
 const AO_LEVELS = [0.22, 0.48, 0.76, 1.0];

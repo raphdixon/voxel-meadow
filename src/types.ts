@@ -1,5 +1,5 @@
 export type CreationCategory = "vehicle" | "creature" | "building" | "prop" | "aircraft" | "watercraft";
-export type ScaleClass = "small" | "medium" | "large";
+export type ScaleClass = "tiny" | "small" | "medium" | "large" | "colossal";
 
 export type LiveFeedKind = "weather" | "surf" | "wind" | "time" | "moon" | "iss";
 
@@ -188,11 +188,38 @@ export interface WorldCreation {
   isSeed?: boolean;
 }
 
+export type PathKind =
+  | "road"
+  | "footpath"
+  | "dirt_trail"
+  | "cobblestone"
+  | "boardwalk"
+  | "volcanic_trail";
+
 export interface WorldPath {
   id: string;
-  kind: "road" | "footpath";
+  kind: PathKind;
   points: [number, number][];
   closed?: boolean;
+}
+
+export type TerrainBiomeKind =
+  | "meadow_clover"
+  | "sandy_shore"
+  | "misty_moss"
+  | "volcanic_basalt"
+  | "snow_frost"
+  | "stone_plaza"
+  | "autumn_grove"
+  | "desert_mesa";
+
+export interface WorldTerrainZone {
+  id: string;
+  biome: TerrainBiomeKind;
+  x: number;
+  z: number;
+  radius: number;
+  intensity?: number;
 }
 
 export interface WorldProp {
@@ -217,13 +244,28 @@ export interface WorldVillager {
   usesTransit: boolean;
 }
 
+export interface BuildQueueJobInfo {
+  jobId: string;
+  status: "queued" | "sculpting" | "done" | "failed";
+  /** 0 when actively sculpting right now; >= 1 for your spot in the waiting queue */
+  position: number;
+  activeCount: number;
+  queuedCount: number;
+  etaSeconds: number;
+  creationId?: string | null;
+  creation?: WorldCreation | null;
+  error?: string | null;
+}
+
 export interface WorldStateSnapshot {
   version: number;
   creations: WorldCreation[];
   paths: WorldPath[];
   props: WorldProp[];
+  terrainZones: WorldTerrainZone[];
   villagers: WorldVillager[];
   contributorCount: number;
   myCreationId: string | null;
+  myActiveJob?: BuildQueueJobInfo | null;
   lastWeaveNote: string;
 }

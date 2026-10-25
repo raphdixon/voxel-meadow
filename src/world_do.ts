@@ -2,18 +2,22 @@ import { DurableObject } from "cloudflare:workers";
 import {
   buildInitialIntegration,
   CITY_SIGN_POS,
+  inferBiomeAndPathStyle,
   integrateCreationWithArgon,
   needsMobilityAmendment,
   weaveWorldCronWithArgon,
   type WorldPatch,
 } from "./argon_director";
+import { sculptWithArgon } from "./argon_sculptor";
 import { buildSeedWorld } from "./seed_world";
 import { formatDayKeyInTz, safeLogError, sanitizePlainText, verifyWebSocketOrigin } from "./security";
 import type {
+  BuildQueueJobInfo,
   WorldCreation,
   WorldPath,
   WorldProp,
   WorldStateSnapshot,
+  WorldTerrainZone,
   WorldVillager,
 } from "./types";
 import {
@@ -21,7 +25,15 @@ import {
   auditBlueprintOverlaps,
   autoRepairBlueprintOverlaps,
 } from "./voxel_audit";
-import { applyBlueprintAmendment, normalizeAndGroundBlueprint } from "./voxel_dsl";
+import {
+  applyBlueprintAmendment,
+  getCreationFootprintRadius,
+  normalizeAndGroundBlueprint,
+} from "./voxel_dsl";
+
+const MAX_CONCURRENT_SCULPTS = 3;
+const MAX_QUEUE_DEPTH = 40;
+const DEFAULT_AVG_SCULPT_MS = 26_000;
 
 export interface WorldCreationAuditEntry {
   id: string;
@@ -60,16 +72,48 @@ export type PlaceCreationResult =
   | { ok: true; creation: WorldCreation; world: WorldStateSnapshot }
   | { ok: false; alreadyPlaced?: boolean; myCreationId?: string; error: string };
 
-export type AcquireBuildSlotResult =
-  | { ok: true; lockToken: string }
+export interface EnqueueBuildInput {
+  ipHash: string;
+  cookieId: string;
+  dayKey: string;
+  prompt: string;
+  imageBase64?: string;
+  imageMimeType?: string;
+  x?: number | null;
+  z?: number | null;
+  yaw?: number | null;
+}
+
+export type EnqueueBuildResult =
+  | { ok: true; queued: true; job: BuildQueueJobInfo }
   | {
       ok: false;
-      status: 403 | 429;
+      status: 400 | 403 | 429 | 503;
       alreadyPlaced?: boolean;
       myCreationId?: string;
       retryAfterSec?: number;
       error: string;
     };
+
+interface BuildJobRow {
+  job_id: string;
+  cookie_id: string;
+  ip_hash: string;
+  day_key: string;
+  status: "queued" | "sculpting" | "done" | "failed";
+  prompt: string;
+  image_base64: string | null;
+  image_mime: string | null;
+  req_x: number | null;
+  req_z: number | null;
+  req_yaw: number | null;
+  sim_delay_ms: number | null;
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+  creation_id: string | null;
+  error_msg: string | null;
+}
 
 function distToSegment(px: number, pz: number, ax: number, az: number, bx: number, bz: number): number {
   const vx = bx - ax;
@@ -83,6 +127,8 @@ function distToSegment(px: number, pz: number, ax: number, az: number, bx: numbe
 }
 
 export class WorldDO extends DurableObject<Env> {
+  private activeJobPromises = new Map<string, Promise<void>>();
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.ctx.setWebSocketAutoResponse(
@@ -111,6 +157,10 @@ export class WorldDO extends DurableObject<Env> {
         json TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS props (
+        id TEXT PRIMARY KEY,
+        json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS terrain_zones (
         id TEXT PRIMARY KEY,
         json TEXT NOT NULL
       );
@@ -145,6 +195,34 @@ export class WorldDO extends DurableObject<Env> {
         lock_token TEXT NOT NULL,
         expires_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS build_jobs (
+        job_id TEXT PRIMARY KEY,
+        cookie_id TEXT NOT NULL,
+        ip_hash TEXT NOT NULL,
+        day_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        image_base64 TEXT,
+        image_mime TEXT,
+        req_x REAL,
+        req_z REAL,
+        req_yaw REAL,
+        sim_delay_ms INTEGER,
+        created_at INTEGER NOT NULL,
+        started_at INTEGER,
+        finished_at INTEGER,
+        creation_id TEXT,
+        error_msg TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_build_jobs_cookie_day
+        ON build_jobs (cookie_id, day_key);
+      CREATE INDEX IF NOT EXISTS idx_build_jobs_status_created
+        ON build_jobs (status, created_at);
+      CREATE TABLE IF NOT EXISTS og_snapshots (
+        variant TEXT PRIMARY KEY,
+        b64 TEXT NOT NULL,
+        captured_at INTEGER NOT NULL
+      );
     `);
 
     const seeded = sql.exec(`SELECT value FROM meta WHERE key = 'seeded'`).toArray();
@@ -165,6 +243,13 @@ export class WorldDO extends DurableObject<Env> {
       for (const pr of seed.props) {
         sql.exec(`INSERT OR REPLACE INTO props (id, json) VALUES (?, ?)`, pr.id, JSON.stringify(pr));
       }
+      for (const tz of seed.terrainZones) {
+        sql.exec(
+          `INSERT OR REPLACE INTO terrain_zones (id, json) VALUES (?, ?)`,
+          tz.id,
+          JSON.stringify(tz),
+        );
+      }
       for (const v of seed.villagers) {
         sql.exec(`INSERT OR REPLACE INTO villagers (id, json) VALUES (?, ?)`, v.id, JSON.stringify(v));
       }
@@ -178,8 +263,8 @@ export class WorldDO extends DurableObject<Env> {
     const upgradedV3 = sql.exec(`SELECT value FROM meta WHERE key = 'upgrade_v3'`).toArray();
     if (upgradedV3.length === 0) {
       const seedFeedDefaults: Record<string, WorldCreation["liveFeed"]> = {
-        "seed-windmill-bakery": { kind: "wind", place: "Meadow", lat: -33.87, lon: 151.21 },
-        "seed-clocktower-station": { kind: "time", place: "Meadow", timezone: "Australia/Sydney" },
+        "seed-windmill-bakery": { kind: "wind", place: "GeminIsland", lat: -33.87, lon: 151.21 },
+        "seed-clocktower-station": { kind: "time", place: "GeminIsland", timezone: "Australia/Sydney" },
       };
       for (const [seedId, feed] of Object.entries(seedFeedDefaults)) {
         const rows = sql.exec(`SELECT json FROM creations WHERE id = ?`, seedId).toArray();
@@ -191,104 +276,23 @@ export class WorldDO extends DurableObject<Env> {
           }
         }
       }
-
-      const allCreations = sql
-        .exec(`SELECT json FROM creations`)
-        .toArray()
-        .map((r) => JSON.parse(String(r.json)) as WorldCreation);
-      const contributors = allCreations.filter((c) => !c.isSeed).length;
-      const cap = Math.min(18, 6 + contributors * 2);
-
-      const allVillagers = sql
-        .exec(`SELECT id, json FROM villagers`)
-        .toArray()
-        .map((r) => ({ id: String(r.id), v: JSON.parse(String(r.json)) as WorldVillager }));
-
-      if (allVillagers.length > cap) {
-        const seedIds = new Set([
-          "villager-milo",
-          "villager-clara",
-          "villager-theo",
-          "villager-hana",
-          "villager-pip",
-          "villager-iris",
-        ]);
-        const kept: string[] = [];
-        for (const item of allVillagers) {
-          if (seedIds.has(item.id)) kept.push(item.id);
-        }
-        for (let i = allVillagers.length - 1; i >= 0 && kept.length < cap; i--) {
-          if (!seedIds.has(allVillagers[i].id)) {
-            kept.push(allVillagers[i].id);
-          }
-        }
-        const keepSet = new Set(kept);
-        for (const item of allVillagers) {
-          if (!keepSet.has(item.id)) {
-            sql.exec(`DELETE FROM villagers WHERE id = ?`, item.id);
-          }
-        }
-      }
-
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v3', '1')`);
       this.bumpVersion();
     }
 
-    // Non-destructive v4 cleanup: trim excess idle-cron footpath/prop/villager clutter while preserving all creations & roads
+    // Non-destructive v4 cleanup: trim excess idle-cron footpath/prop/villager clutter
     const upgradedV4 = sql.exec(`SELECT value FROM meta WHERE key = 'upgrade_v4'`).toArray();
     if (upgradedV4.length === 0) {
       const allCreations = sql
         .exec(`SELECT json FROM creations`)
         .toArray()
         .map((r) => JSON.parse(String(r.json)) as WorldCreation);
-      const contributors = allCreations.filter((c) => !c.isSeed).length;
-
-      // Trim excess footpaths (keep seed paths, all roads, and up to 4 footpaths per contributor)
-      const allPaths = sql
-        .exec(`SELECT id, json FROM paths`)
-        .toArray()
-        .map((r) => ({ id: String(r.id), p: JSON.parse(String(r.json)) as WorldPath }));
-      const maxExtraFootpaths = Math.max(4, contributors * 4);
-      const removableFootpaths = allPaths.filter(
-        (x) => x.p.kind === "footpath" && !x.id.startsWith("path-"),
-      );
-      if (removableFootpaths.length > maxExtraFootpaths) {
-        const toDelete = removableFootpaths.slice(0, removableFootpaths.length - maxExtraFootpaths);
-        for (const item of toDelete) {
-          sql.exec(`DELETE FROM paths WHERE id = ?`, item.id);
-        }
-      }
-
-      // Trim excess minor props (keep seed props, ponds, bus stops, and up to 5 accent props per contributor)
-      const allProps = sql
-        .exec(`SELECT id, json FROM props`)
-        .toArray()
-        .map((r) => ({ id: String(r.id), pr: JSON.parse(String(r.json)) as WorldProp }));
-      const maxExtraProps = Math.max(5, contributors * 5);
-      const removableProps = allProps.filter(
-        (x) =>
-          !x.id.startsWith("prop-central-") &&
-          !x.id.startsWith("prop-stop-") &&
-          !x.id.startsWith("prop-lamp-") &&
-          !x.id.startsWith("prop-bench-pond") &&
-          !x.id.startsWith("prop-flowers-") &&
-          x.pr.kind !== "pond" &&
-          x.pr.kind !== "bus_stop",
-      );
-      if (removableProps.length > maxExtraProps) {
-        const toDelete = removableProps.slice(0, removableProps.length - maxExtraProps);
-        for (const item of toDelete) {
-          sql.exec(`DELETE FROM props WHERE id = ?`, item.id);
-        }
-      }
-
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('lastWeaveCount', ?)`, String(allCreations.length));
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v4', '1')`);
       this.bumpVersion();
     }
 
-    // Non-destructive v5 upgrade: refresh seed blueprints (fixes Windmill Bakery sail/roof Z-fighting)
-    // and run full kinematic voxel overlap + spatial plinth audit across all creations, paths, and props.
+    // Non-destructive v5 upgrade: refresh seed blueprints and run kinematic voxel overlap audit
     const upgradedV5 = sql.exec(`SELECT value FROM meta WHERE key = 'upgrade_v5_voxel_audit'`).toArray();
     if (upgradedV5.length === 0) {
       const freshSeed = buildSeedWorld();
@@ -308,12 +312,9 @@ export class WorldDO extends DurableObject<Env> {
       this.auditAndRepairWorld();
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v5_voxel_audit', '1')`);
       this.bumpVersion();
-    } else {
-      // Lightweight startup self-check (< 3ms, zero LLM calls) so the world stays overlap-free across restarts
-      this.auditAndRepairWorld();
     }
 
-    // Non-destructive v6 upgrade: switch from permanent shared-IP lock to 1 creation per individual (cookie) per day
+    // Non-destructive v6 upgrade: 1 creation per individual (cookie) per day
     const upgradedV6 = sql.exec(`SELECT value FROM meta WHERE key = 'upgrade_v6_daily_individual'`).toArray();
     if (upgradedV6.length === 0) {
       const legacyCookieRows = sql
@@ -334,9 +335,96 @@ export class WorldDO extends DurableObject<Env> {
           );
         }
       }
-      // Remove legacy shared-IP locks so multiple individuals/devices on the same Wi-Fi/office IP can build independently
       sql.exec(`DELETE FROM creators WHERE token LIKE 'ip:%'`);
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v6_daily_individual', '1')`);
+    }
+
+    // Non-destructive v8 upgrade: seed organic ground biome zones & varied path materials on existing GeminIsland worlds
+    const upgradedV8 = sql.exec(`SELECT value FROM meta WHERE key = 'upgrade_v8_biomes_and_queue'`).toArray();
+    if (upgradedV8.length === 0) {
+      const freshSeed = buildSeedWorld();
+      for (const tz of freshSeed.terrainZones) {
+        sql.exec(
+          `INSERT OR IGNORE INTO terrain_zones (id, json) VALUES (?, ?)`,
+          tz.id,
+          JSON.stringify(tz),
+        );
+      }
+      // Upgrade seed spur materials (cobblestone for Clocktower, dirt_trail for Windmill Bakery & Green walk)
+      for (const sp of freshSeed.paths) {
+        if (sp.id === "path-clocktower-spur" || sp.id === "path-bakery-spur" || sp.id === "path-green-walk") {
+          const pRows = sql.exec(`SELECT json FROM paths WHERE id = ?`, sp.id).toArray();
+          if (pRows.length > 0) {
+            const existingP = JSON.parse(String(pRows[0].json)) as WorldPath;
+            existingP.kind = sp.kind;
+            sql.exec(`INSERT OR REPLACE INTO paths (id, json) VALUES (?, ?)`, sp.id, JSON.stringify(existingP));
+          }
+        }
+      }
+      // Backfill biome zones & contextual path styles for existing user-created landmarks
+      const allCreations = sql
+        .exec(`SELECT json FROM creations`)
+        .toArray()
+        .map((r) => JSON.parse(String(r.json)) as WorldCreation);
+      for (const c of allCreations) {
+        if (c.isSeed || c.behavior.type !== "landmark") continue;
+        const { biome, pathKind } = inferBiomeAndPathStyle(c);
+        if (biome) {
+          const footR = getCreationFootprintRadius(
+            c.scaleClass,
+            c.blueprint?.stats?.footprintX ?? 14,
+            c.blueprint?.stats?.footprintZ ?? 14,
+          );
+          const zone: WorldTerrainZone = {
+            id: `initzone-${c.id}`,
+            biome,
+            x: c.x,
+            z: c.z,
+            radius: Number(Math.min(22, Math.max(7.0, footR * 1.65)).toFixed(1)),
+            intensity: 0.9,
+          };
+          sql.exec(
+            `INSERT OR IGNORE INTO terrain_zones (id, json) VALUES (?, ?)`,
+            zone.id,
+            JSON.stringify(zone),
+          );
+        }
+        if (pathKind !== "footpath") {
+          const initPathRows = sql.exec(`SELECT json FROM paths WHERE id = ?`, `initpath-${c.id}`).toArray();
+          if (initPathRows.length > 0) {
+            const p = JSON.parse(String(initPathRows[0].json)) as WorldPath;
+            p.kind = pathKind;
+            sql.exec(`INSERT OR REPLACE INTO paths (id, json) VALUES (?, ?)`, p.id, JSON.stringify(p));
+          }
+        }
+      }
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v8_biomes_and_queue', '1')`);
+      this.bumpVersion();
+    }
+
+    // Recover any interrupted sculpting jobs after a cold Worker/DO restart
+    const orphaned = sql
+      .exec(`SELECT job_id FROM build_jobs WHERE status = 'sculpting'`)
+      .toArray();
+    if (orphaned.length > 0) {
+      sql.exec(`UPDATE build_jobs SET status = 'queued', started_at = NULL WHERE status = 'sculpting'`);
+    }
+
+    // Prune completed/failed build jobs older than 36 hours
+    sql.exec(
+      `DELETE FROM build_jobs WHERE status IN ('done', 'failed') AND created_at < ?`,
+      Date.now() - 36 * 60 * 60 * 1000,
+    );
+
+    // Lightweight startup overlap check (< 3ms, zero LLM calls)
+    this.auditAndRepairWorld();
+
+    // Resume queue if any jobs are waiting
+    const pendingJobs = Number(
+      sql.exec(`SELECT COUNT(*) AS c FROM build_jobs WHERE status = 'queued'`).toArray()[0]?.c ?? 0,
+    );
+    if (pendingJobs > 0) {
+      void this.pumpBuildQueue();
     }
   }
 
@@ -463,6 +551,19 @@ export class WorldDO extends DurableObject<Env> {
     return next;
   }
 
+  private getAvgSculptMs(): number {
+    const raw = Number(this.getMeta("avgSculptMs", String(DEFAULT_AVG_SCULPT_MS)));
+    if (!Number.isFinite(raw)) return DEFAULT_AVG_SCULPT_MS;
+    return Math.max(12_000, Math.min(55_000, raw));
+  }
+
+  private recordSculptDurationMs(durationMs: number): void {
+    if (!Number.isFinite(durationMs) || durationMs < 2500 || durationMs > 90_000) return;
+    const prev = this.getAvgSculptMs();
+    const blended = Math.round(prev * 0.72 + durationMs * 0.28);
+    this.setMeta("avgSculptMs", String(Math.max(12_000, Math.min(55_000, blended))));
+  }
+
   private readBaseWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
     const sql = this.ctx.storage.sql;
     const creations = sql
@@ -477,6 +578,10 @@ export class WorldDO extends DurableObject<Env> {
       .exec(`SELECT json FROM props`)
       .toArray()
       .map((r) => JSON.parse(String(r.json)) as WorldProp);
+    const terrainZones = sql
+      .exec(`SELECT json FROM terrain_zones`)
+      .toArray()
+      .map((r) => JSON.parse(String(r.json)) as WorldTerrainZone);
     const villagers = sql
       .exec(`SELECT json FROM villagers`)
       .toArray()
@@ -500,9 +605,10 @@ export class WorldDO extends DurableObject<Env> {
       creations,
       paths,
       props,
+      terrainZones,
       villagers,
       contributorCount,
-      lastWeaveNote: this.getMeta("lastWeaveNote", "Meadow humming quietly in the sun."),
+      lastWeaveNote: this.getMeta("lastWeaveNote", "GeminIsland humming quietly in the sun."),
     };
   }
 
@@ -561,22 +667,207 @@ export class WorldDO extends DurableObject<Env> {
     sql.exec(`UPDATE rate_limits SET count = ? WHERE bucket = ?`, count + 1, bucket);
   }
 
+  private parseJobRow(r: Record<string, unknown>): BuildJobRow {
+    return {
+      job_id: String(r.job_id),
+      cookie_id: String(r.cookie_id),
+      ip_hash: String(r.ip_hash ?? ""),
+      day_key: String(r.day_key),
+      status: String(r.status) as BuildJobRow["status"],
+      prompt: String(r.prompt ?? ""),
+      image_base64: typeof r.image_base64 === "string" ? r.image_base64 : null,
+      image_mime: typeof r.image_mime === "string" ? r.image_mime : null,
+      req_x: typeof r.req_x === "number" ? r.req_x : null,
+      req_z: typeof r.req_z === "number" ? r.req_z : null,
+      req_yaw: typeof r.req_yaw === "number" ? r.req_yaw : null,
+      sim_delay_ms: typeof r.sim_delay_ms === "number" ? r.sim_delay_ms : null,
+      created_at: Number(r.created_at) || Date.now(),
+      started_at: typeof r.started_at === "number" ? r.started_at : null,
+      finished_at: typeof r.finished_at === "number" ? r.finished_at : null,
+      creation_id: typeof r.creation_id === "string" ? r.creation_id : null,
+      error_msg: typeof r.error_msg === "string" ? r.error_msg : null,
+    };
+  }
+
+  private computeJobInfo(target: BuildJobRow): BuildQueueJobInfo {
+    const sql = this.ctx.storage.sql;
+    const now = Date.now();
+    const activeRows = sql
+      .exec(
+        `SELECT job_id, status, started_at, sim_delay_ms, created_at
+         FROM build_jobs
+         WHERE status IN ('sculpting', 'queued')
+         ORDER BY CASE WHEN status = 'sculpting' THEN 0 ELSE 1 END, created_at ASC, rowid ASC`,
+      )
+      .toArray();
+
+    const sculptingRows = activeRows.filter((r) => r.status === "sculpting");
+    const queuedRows = activeRows.filter((r) => r.status === "queued");
+    const activeCount = sculptingRows.length;
+    const queuedCount = queuedRows.length;
+    const avgSculptMs = this.getAvgSculptMs();
+
+    if (target.status === "done") {
+      let creation: WorldCreation | null = null;
+      if (target.creation_id) {
+        const cRows = sql.exec(`SELECT json FROM creations WHERE id = ?`, target.creation_id).toArray();
+        if (cRows.length > 0) {
+          creation = JSON.parse(String(cRows[0].json)) as WorldCreation;
+        }
+      }
+      return {
+        jobId: target.job_id,
+        status: "done",
+        position: 0,
+        activeCount,
+        queuedCount,
+        etaSeconds: 0,
+        creationId: target.creation_id,
+        creation,
+      };
+    }
+
+    if (target.status === "failed") {
+      return {
+        jobId: target.job_id,
+        status: "failed",
+        position: 0,
+        activeCount,
+        queuedCount,
+        etaSeconds: 0,
+        error: target.error_msg || "Argon couldn't sculpt that — try again.",
+      };
+    }
+
+    const durationFor = (row: Record<string, unknown> | BuildJobRow): number => {
+      const sim = typeof row.sim_delay_ms === "number" && row.sim_delay_ms > 0 ? row.sim_delay_ms : null;
+      return sim ?? avgSculptMs;
+    };
+
+    if (target.status === "sculpting") {
+      const expectedMs = durationFor(target);
+      const elapsed = Math.max(0, now - (target.started_at ?? now));
+      const remainingMs = Math.max(2500, expectedMs - elapsed);
+      return {
+        jobId: target.job_id,
+        status: "sculpting",
+        position: 0,
+        activeCount,
+        queuedCount,
+        etaSeconds: Math.max(3, Math.ceil(remainingMs / 1000)),
+      };
+    }
+
+    // Target is waiting in FIFO queue: simulate completion across MAX_CONCURRENT_SCULPTS worker slots
+    const slotRemaining: number[] = [];
+    for (let s = 0; s < MAX_CONCURRENT_SCULPTS; s++) {
+      const active = sculptingRows[s];
+      if (active) {
+        const expected = durationFor(active);
+        const elapsed = Math.max(0, now - (Number(active.started_at) || now));
+        slotRemaining.push(Math.max(2500, expected - elapsed));
+      } else {
+        slotRemaining.push(0);
+      }
+    }
+
+    const qIdx = queuedRows.findIndex((r) => String(r.job_id) === target.job_id);
+    const position = qIdx >= 0 ? qIdx + 1 : queuedCount + 1;
+    let totalEtaMs = avgSculptMs;
+
+    const limit = qIdx >= 0 ? qIdx : queuedRows.length - 1;
+    for (let i = 0; i <= limit; i++) {
+      let minSlot = 0;
+      for (let s = 1; s < slotRemaining.length; s++) {
+        if (slotRemaining[s] < slotRemaining[minSlot]) minSlot = s;
+      }
+      const itemDur = queuedRows[i] ? durationFor(queuedRows[i]) : durationFor(target);
+      if (i === limit) {
+        totalEtaMs = slotRemaining[minSlot] + itemDur;
+      } else {
+        slotRemaining[minSlot] += itemDur;
+      }
+    }
+
+    return {
+      jobId: target.job_id,
+      status: "queued",
+      position,
+      activeCount,
+      queuedCount,
+      etaSeconds: Math.max(4, Math.ceil(totalEtaMs / 1000)),
+    };
+  }
+
+  private lookupActiveJobForCookie(cookieId: string, dayKey: string): BuildQueueJobInfo | null {
+    if (!cookieId) return null;
+    const rows = this.ctx.storage.sql
+      .exec(
+        `SELECT * FROM build_jobs
+         WHERE cookie_id = ? AND day_key = ? AND status IN ('queued', 'sculpting')
+         ORDER BY created_at DESC LIMIT 1`,
+        cookieId,
+        dayKey,
+      )
+      .toArray();
+    if (rows.length === 0) return null;
+    return this.computeJobInfo(this.parseJobRow(rows[0] as Record<string, unknown>));
+  }
+
+  public getBuildJobStatus(
+    jobId: string | null | undefined,
+    cookieId: string,
+    dayKey: string,
+  ): { job: BuildQueueJobInfo | null; world?: WorldStateSnapshot } {
+    const sql = this.ctx.storage.sql;
+    let row: BuildJobRow | null = null;
+    if (jobId) {
+      const rows = sql.exec(`SELECT * FROM build_jobs WHERE job_id = ? LIMIT 1`, jobId).toArray();
+      if (rows.length > 0) {
+        row = this.parseJobRow(rows[0] as Record<string, unknown>);
+      }
+    }
+    if (!row && cookieId && dayKey) {
+      const rows = sql
+        .exec(
+          `SELECT * FROM build_jobs
+           WHERE cookie_id = ? AND day_key = ?
+           ORDER BY created_at DESC LIMIT 1`,
+          cookieId,
+          dayKey,
+        )
+        .toArray();
+      if (rows.length > 0) {
+        row = this.parseJobRow(rows[0] as Record<string, unknown>);
+      }
+    }
+    if (!row) {
+      return { job: null };
+    }
+    const job = this.computeJobInfo(row);
+    if (job.status === "done") {
+      return {
+        job,
+        world: this.getWorldSnapshot(cookieId || row.cookie_id, dayKey || row.day_key),
+      };
+    }
+    return { job };
+  }
+
   /**
-   * Atomically verifies daily per-individual eligibility (1 creation per browser cookie per day),
-   * household-safe concurrency & anti-abuse IP caps, and global Gemini API spend circuit breakers.
+   * Enqueues a visitor build into the persistent FIFO multi-user queue so 10–40+ concurrent
+   * builders never hit 429 concurrency errors and receive live queue positions + countdown ETAs.
    */
-  public acquireBuildSlot(ipHash: string, cookieId: string, dayKey: string): AcquireBuildSlotResult {
+  public async enqueueBuildJob(input: EnqueueBuildInput): Promise<EnqueueBuildResult> {
     const sql = this.ctx.storage.sql;
     const now = Date.now();
 
-    // 1. Clean expired in-flight locks and stale rate-limit buckets
-    sql.exec(`DELETE FROM inflight_locks WHERE expires_at <= ?`, now);
-    if (now % 17 === 0) {
+    if (now % 19 === 0) {
       sql.exec(`DELETE FROM rate_limits WHERE window_start < ?`, now - 25 * 60 * 60 * 1000);
     }
 
-    // 2. Reject if THIS individual browser has already placed their 1 creation today
-    const existingTodayId = this.lookupTodayCreation(cookieId, dayKey);
+    // 1. Reject if THIS individual browser has already placed their 1 creation today
+    const existingTodayId = this.lookupTodayCreation(input.cookieId, input.dayKey);
     if (existingTodayId) {
       return {
         ok: false,
@@ -587,74 +878,54 @@ export class WorldDO extends DurableObject<Env> {
       };
     }
 
-    // 3. Concurrency lock: 1 in-flight build per browser cookie, up to 3 simultaneous on the same Wi-Fi/office IP
-    const cidLockKey = `cid:${cookieId}`;
-    const activeCookieLock = sql
-      .exec(`SELECT lock_key FROM inflight_locks WHERE lock_key = ? LIMIT 1`, cidLockKey)
-      .toArray();
-    if (activeCookieLock.length > 0) {
+    // 2. Idempotent resume if this browser already has a job queued or sculpting right now
+    const existingJob = this.lookupActiveJobForCookie(input.cookieId, input.dayKey);
+    if (existingJob) {
+      void this.pumpBuildQueue();
+      return { ok: true, queued: true, job: existingJob };
+    }
+
+    // 3. Bound total waiting queue depth (protects memory while comfortably handling 10-40 simultaneous builders)
+    const activeTotal = Number(
+      sql
+        .exec(`SELECT COUNT(*) AS c FROM build_jobs WHERE status IN ('queued', 'sculpting')`)
+        .toArray()[0]?.c ?? 0,
+    );
+    if (activeTotal >= MAX_QUEUE_DEPTH) {
       return {
         ok: false,
         status: 429,
-        retryAfterSec: 15,
-        error: "Your creation is already being sculpted — hang tight!",
+        retryAfterSec: 20,
+        error: "The GeminIsland build queue is full right now — please try again in 20 seconds.",
       };
     }
 
-    if (ipHash) {
-      const activeIpCount =
-        Number(
-          sql
-            .exec(`SELECT COUNT(*) AS c FROM inflight_locks WHERE lock_key LIKE ?`, `ip:${ipHash}:%`)
-            .toArray()[0]?.c,
-        ) || 0;
-      if (activeIpCount >= 3) {
-        return {
-          ok: false,
-          status: 429,
-          retryAfterSec: 12,
-          error: "A few builds are running on your network right now — try again in a few seconds.",
-        };
-      }
-    }
-
-    // 4. Global concurrent Argon build cap (max 4 simultaneous builds across all visitors)
-    const activeGlobalCount =
-      Number(sql.exec(`SELECT COUNT(DISTINCT lock_token) AS c FROM inflight_locks`).toArray()[0]?.c) || 0;
-    if (activeGlobalCount >= 4) {
-      return {
-        ok: false,
-        status: 429,
-        retryAfterSec: 12,
-        error: "A few visitors are sculpting at the exact same moment — please try again in 10 seconds.",
-      };
-    }
-
-    // 5. Per-browser & household-friendly per-IP anti-abuse limits
+    // 4. Multi-user office/event-friendly anti-abuse rate limits
     const visitorWindowMs = 15 * 60 * 1000;
+    const hourWindowMs = 60 * 60 * 1000;
     const dayWindowMs = 24 * 60 * 60 * 1000;
 
-    const cidCheck = this.checkWindowBucket(`gen_cid:${cookieId}`, 4, visitorWindowMs, now);
+    const cidCheck = this.checkWindowBucket(`gen_cid:${input.cookieId}`, 8, visitorWindowMs, now);
     if (!cidCheck.allowed) {
       return {
         ok: false,
         status: 429,
         retryAfterSec: cidCheck.retryAfterSec,
-        error: `Please wait ${cidCheck.retryAfterSec ?? 60}s before building again.`,
+        error: `Please wait ${cidCheck.retryAfterSec ?? 45}s before trying again.`,
       };
     }
 
-    if (ipHash) {
-      const ipBurstCheck = this.checkWindowBucket(`gen_ip:${ipHash}`, 12, visitorWindowMs, now);
+    if (input.ipHash) {
+      const ipBurstCheck = this.checkWindowBucket(`gen_ip:${input.ipHash}`, 48, visitorWindowMs, now);
       if (!ipBurstCheck.allowed) {
         return {
           ok: false,
           status: 429,
           retryAfterSec: ipBurstCheck.retryAfterSec,
-          error: `Please wait ${ipBurstCheck.retryAfterSec ?? 60}s before building again.`,
+          error: `Network burst limit reached — please wait ${ipBurstCheck.retryAfterSec ?? 45}s.`,
         };
       }
-      const ipDailyPlaced = this.checkWindowBucket(`placed_ip:${ipHash}`, 15, dayWindowMs, now);
+      const ipDailyPlaced = this.checkWindowBucket(`placed_ip:${input.ipHash}`, 60, dayWindowMs, now);
       if (!ipDailyPlaced.allowed) {
         return {
           ok: false,
@@ -665,66 +936,309 @@ export class WorldDO extends DurableObject<Env> {
       }
     }
 
-    // 6. Global Gemini API spend circuit-breaker (max 45 builds/hour & max 240 builds/24h globally)
-    const hourWindowMs = 60 * 60 * 1000;
-    const globalHour = this.checkWindowBucket("global:hour", 45, hourWindowMs, now);
+    const globalHour = this.checkWindowBucket("global:hour", 180, hourWindowMs, now);
     if (!globalHour.allowed) {
       return {
         ok: false,
         status: 429,
         retryAfterSec: globalHour.retryAfterSec,
-        error: "The meadow workshop is resting briefly — please try again shortly.",
+        error: "The island workshop is resting briefly — please try again shortly.",
       };
     }
-    const globalDay = this.checkWindowBucket("global:day", 240, dayWindowMs, now);
+    const globalDay = this.checkWindowBucket("global:day", 800, dayWindowMs, now);
     if (!globalDay.allowed) {
       return {
         ok: false,
         status: 429,
         retryAfterSec: globalDay.retryAfterSec,
-        error: "Today's meadow build capacity has been reached — check back soon!",
+        error: "Today's island build capacity has been reached — check back soon!",
       };
     }
 
-    // Commit attempt counters & acquire 90s in-flight lock
-    if (ipHash) {
-      this.incrementWindowBucket(`gen_ip:${ipHash}`, visitorWindowMs, now);
+    if (input.ipHash) {
+      this.incrementWindowBucket(`gen_ip:${input.ipHash}`, visitorWindowMs, now);
     }
-    this.incrementWindowBucket(`gen_cid:${cookieId}`, visitorWindowMs, now);
+    this.incrementWindowBucket(`gen_cid:${input.cookieId}`, visitorWindowMs, now);
     this.incrementWindowBucket("global:hour", hourWindowMs, now);
     this.incrementWindowBucket("global:day", dayWindowMs, now);
 
-    const lockToken = crypto.randomUUID();
-    const expiresAt = now + 90_000;
-    if (ipHash) {
-      sql.exec(
-        `INSERT OR REPLACE INTO inflight_locks (lock_key, lock_token, expires_at) VALUES (?, ?, ?)`,
-        `ip:${ipHash}:${lockToken}`,
-        lockToken,
-        expiresAt,
-      );
-    }
+    const jobId = `job-${now.toString(36)}-${crypto.randomUUID().replace(/-/g, "").slice(0, 6)}`;
     sql.exec(
-      `INSERT OR REPLACE INTO inflight_locks (lock_key, lock_token, expires_at) VALUES (?, ?, ?)`,
-      cidLockKey,
-      lockToken,
-      expiresAt,
+      `INSERT INTO build_jobs (
+        job_id, cookie_id, ip_hash, day_key, status, prompt, image_base64, image_mime,
+        req_x, req_z, req_yaw, sim_delay_ms, created_at
+      ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, NULL, ?)`,
+      jobId,
+      input.cookieId,
+      input.ipHash || "",
+      input.dayKey,
+      input.prompt,
+      input.imageBase64 ?? null,
+      input.imageMimeType ?? null,
+      typeof input.x === "number" && Number.isFinite(input.x) ? input.x : null,
+      typeof input.z === "number" && Number.isFinite(input.z) ? input.z : null,
+      typeof input.yaw === "number" && Number.isFinite(input.yaw) ? input.yaw : null,
+      now,
     );
 
-    return { ok: true, lockToken };
+    // Immediately promote up to MAX_CONCURRENT_SCULPTS jobs before computing the caller's live position!
+    await this.pumpBuildQueue();
+
+    const freshRows = sql.exec(`SELECT * FROM build_jobs WHERE job_id = ? LIMIT 1`, jobId).toArray();
+    const jobInfo = this.computeJobInfo(this.parseJobRow(freshRows[0] as Record<string, unknown>));
+    return { ok: true, queued: true, job: jobInfo };
   }
 
-  public releaseBuildSlot(lockToken: string): void {
-    if (!lockToken) return;
-    this.ctx.storage.sql.exec(`DELETE FROM inflight_locks WHERE lock_token = ?`, lockToken);
+  /**
+   * Local-dev-only deterministic multi-user queue harness: enqueues N simulated builders
+   * so we can test 12+ simultaneous visitors in real Chrome without burning 12 LLM calls.
+   */
+  public async enqueueDevSimulatedBatch(
+    items: { cookieId: string; prompt: string; delayMs: number; placeBlueprint?: Record<string, unknown> | null }[],
+    dayKey: string,
+  ): Promise<BuildQueueJobInfo[]> {
+    const sql = this.ctx.storage.sql;
+    const now = Date.now();
+    const createdIds: string[] = [];
+
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const jobId = `simjob-${now.toString(36)}-${i}-${crypto.randomUUID().slice(0, 4)}`;
+      const encodedPayload = it.placeBlueprint ? JSON.stringify(it.placeBlueprint) : null;
+      sql.exec(
+        `INSERT INTO build_jobs (
+          job_id, cookie_id, ip_hash, day_key, status, prompt, image_base64, image_mime,
+          req_x, req_z, req_yaw, sim_delay_ms, created_at
+        ) VALUES (?, ?, 'sim', ?, 'queued', ?, ?, '__dev_sim_bp__', NULL, NULL, NULL, ?, ?)`,
+        jobId,
+        it.cookieId,
+        dayKey,
+        it.prompt,
+        encodedPayload,
+        Math.max(800, Math.min(30_000, it.delayMs)),
+        now + i,
+      );
+      createdIds.push(jobId);
+    }
+
+    await this.pumpBuildQueue();
+
+    return createdIds.map((jid) => {
+      const r = sql.exec(`SELECT * FROM build_jobs WHERE job_id = ?`, jid).toArray()[0] as Record<string, unknown>;
+      return this.computeJobInfo(this.parseJobRow(r));
+    });
+  }
+
+  private broadcastQueueTick(): void {
+    const sql = this.ctx.storage.sql;
+    const activeRows = sql
+      .exec(
+        `SELECT job_id, status, started_at, sim_delay_ms
+         FROM build_jobs
+         WHERE status IN ('sculpting', 'queued')
+         ORDER BY CASE WHEN status = 'sculpting' THEN 0 ELSE 1 END, created_at ASC, rowid ASC`,
+      )
+      .toArray();
+    const sculpting = activeRows
+      .filter((r) => r.status === "sculpting")
+      .map((r) => ({
+        jobId: String(r.job_id),
+        startedAt: Number(r.started_at) || Date.now(),
+        expectedMs: typeof r.sim_delay_ms === "number" && r.sim_delay_ms > 0 ? r.sim_delay_ms : this.getAvgSculptMs(),
+      }));
+    const queuedIds = activeRows.filter((r) => r.status === "queued").map((r) => String(r.job_id));
+
+    this.broadcast({
+      type: "queue_tick",
+      activeCount: sculpting.length,
+      sculpting,
+      queuedIds,
+      avgSculptMs: this.getAvgSculptMs(),
+    });
+  }
+
+  private async pumpBuildQueue(): Promise<void> {
+    const sql = this.ctx.storage.sql;
+    let promoted = false;
+
+    while (this.activeJobPromises.size < MAX_CONCURRENT_SCULPTS) {
+      const nextRows = sql
+        .exec(
+          `SELECT * FROM build_jobs
+           WHERE status = 'queued'
+           ORDER BY created_at ASC, rowid ASC
+           LIMIT 1`,
+        )
+        .toArray();
+      if (nextRows.length === 0) break;
+
+      const row = this.parseJobRow(nextRows[0] as Record<string, unknown>);
+      if (this.activeJobPromises.has(row.job_id)) break;
+
+      const startedAt = Date.now();
+      sql.exec(
+        `UPDATE build_jobs SET status = 'sculpting', started_at = ? WHERE job_id = ?`,
+        startedAt,
+        row.job_id,
+      );
+      row.status = "sculpting";
+      row.started_at = startedAt;
+      promoted = true;
+
+      const p = this.runSingleBuildJob(row).finally(() => {
+        this.activeJobPromises.delete(row.job_id);
+        void this.pumpBuildQueue();
+      });
+      this.activeJobPromises.set(row.job_id, p);
+    }
+
+    if (promoted) {
+      this.broadcastQueueTick();
+    }
+
+    const remainingQueued = Number(
+      sql.exec(`SELECT COUNT(*) AS c FROM build_jobs WHERE status = 'queued'`).toArray()[0]?.c ?? 0,
+    );
+    const remainingIntegrations = Number(
+      sql.exec(`SELECT COUNT(*) AS c FROM integration_queue`).toArray()[0]?.c ?? 0,
+    );
+    if (this.activeJobPromises.size > 0 || remainingQueued > 0 || remainingIntegrations > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + 1200);
+    }
+  }
+
+  private async runSingleBuildJob(job: BuildJobRow): Promise<void> {
+    const sql = this.ctx.storage.sql;
+    const t0 = Date.now();
+
+    try {
+      // Dev-only simulated queue worker path (never reachable from public routes)
+      if (job.image_mime === "__dev_sim_bp__" && job.sim_delay_ms) {
+        await new Promise((resolve) => setTimeout(resolve, job.sim_delay_ms!));
+        let creationId: string | null = null;
+        if (job.image_base64) {
+          const bpRaw = JSON.parse(job.image_base64) as Record<string, unknown>;
+          const placed = await this.placeCreation({
+            ipHash: job.ip_hash,
+            cookieId: job.cookie_id,
+            dayKey: job.day_key,
+            creatorPrompt: job.prompt,
+            blueprintRaw: bpRaw,
+            x: job.req_x,
+            z: job.req_z,
+            yaw: job.req_yaw,
+          });
+          if (placed.ok) {
+            creationId = placed.creation.id;
+          }
+        }
+        sql.exec(
+          `UPDATE build_jobs
+           SET status = 'done', finished_at = ?, creation_id = ?, image_base64 = NULL, image_mime = NULL
+           WHERE job_id = ?`,
+          Date.now(),
+          creationId,
+          job.job_id,
+        );
+        this.broadcastQueueTick();
+        return;
+      }
+
+      if (!this.env.GEMINI_API_KEY) {
+        sql.exec(
+          `UPDATE build_jobs
+           SET status = 'failed', finished_at = ?, error_msg = ?, image_base64 = NULL
+           WHERE job_id = ?`,
+          Date.now(),
+          "Sculpting service is temporarily unavailable.",
+          job.job_id,
+        );
+        this.broadcastQueueTick();
+        return;
+      }
+
+      const sculpted = await sculptWithArgon(
+        {
+          prompt: job.prompt,
+          imageBase64: job.image_base64 ?? undefined,
+          imageMimeType: job.image_mime ?? undefined,
+        },
+        this.env.GEMINI_API_KEY,
+        this.env.ARGON_MODEL,
+        this.env.FALLBACK_MODEL,
+      );
+
+      if (!sculpted.ok) {
+        sql.exec(
+          `UPDATE build_jobs
+           SET status = 'failed', finished_at = ?, error_msg = ?, image_base64 = NULL
+           WHERE job_id = ?`,
+          Date.now(),
+          sculpted.error || "Could not sculpt creation.",
+          job.job_id,
+        );
+        this.broadcastQueueTick();
+        return;
+      }
+
+      this.recordSculptDurationMs(Date.now() - t0);
+
+      const placed = await this.placeCreation({
+        ipHash: job.ip_hash,
+        cookieId: job.cookie_id,
+        dayKey: job.day_key,
+        creatorPrompt: job.prompt,
+        blueprintRaw: sculpted.blueprint as unknown as Record<string, unknown>,
+        x: job.req_x,
+        z: job.req_z,
+        yaw: job.req_yaw,
+      });
+
+      if (!placed.ok) {
+        sql.exec(
+          `UPDATE build_jobs
+           SET status = 'failed', finished_at = ?, error_msg = ?, creation_id = ?, image_base64 = NULL
+           WHERE job_id = ?`,
+          Date.now(),
+          placed.error,
+          placed.myCreationId ?? null,
+          job.job_id,
+        );
+        this.broadcastQueueTick();
+        return;
+      }
+
+      sql.exec(
+        `UPDATE build_jobs
+         SET status = 'done', finished_at = ?, creation_id = ?, image_base64 = NULL
+         WHERE job_id = ?`,
+        Date.now(),
+        placed.creation.id,
+        job.job_id,
+      );
+      this.broadcastQueueTick();
+    } catch (err) {
+      safeLogError("build_queue_worker", err, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET]);
+      sql.exec(
+        `UPDATE build_jobs
+         SET status = 'failed', finished_at = ?, error_msg = ?, image_base64 = NULL
+         WHERE job_id = ?`,
+        Date.now(),
+        "Argon took a moment too long building that — please try once more.",
+        job.job_id,
+      );
+      this.broadcastQueueTick();
+    }
   }
 
   public getWorldSnapshot(cookieId: string, dayKey: string): WorldStateSnapshot {
     const base = this.readBaseWorld();
     const myCreationId = this.lookupTodayCreation(cookieId, dayKey);
+    const myActiveJob = !myCreationId ? this.lookupActiveJobForCookie(cookieId, dayKey) : null;
     return {
       ...base,
       myCreationId,
+      myActiveJob,
     };
   }
 
@@ -732,30 +1246,44 @@ export class WorldDO extends DurableObject<Env> {
     x: number,
     z: number,
     category: WorldCreation["category"],
+    newRadius: number,
     world: Omit<WorldStateSnapshot, "myCreationId">,
+    ignoreId?: string,
   ): boolean {
-    if (Math.abs(x) > 135 || Math.abs(z) > 135) return false;
-    if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < 5.0) return false;
-    const minBuildingSep = category === "building" ? 11.0 : 6.8;
+    const bound = Math.max(115, 142 - newRadius);
+    if (Math.abs(x) > bound || Math.abs(z) > bound) return false;
+    if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < newRadius + 2.8) return false;
+
     for (const c of world.creations) {
-      const sep = c.category === "building" || category === "building" ? minBuildingSep : 6.0;
-      if (Math.hypot(x - c.x, z - c.z) < sep) return false;
+      if (c.id === ignoreId) continue;
+      if (c.category === "aircraft" || c.behavior.type === "fly_circle") continue;
+      if (c.category === "watercraft" || c.behavior.type === "water_float") continue;
+      const otherR = getCreationFootprintRadius(
+        c.scaleClass,
+        c.blueprint?.stats?.footprintX ?? 14,
+        c.blueprint?.stats?.footprintZ ?? 14,
+      );
+      const minSep = newRadius + otherR + 1.8;
+      if (Math.hypot(x - c.x, z - c.z) < minSep) return false;
     }
+
     if (category !== "watercraft") {
       for (const pr of world.props) {
-        if (pr.kind === "pond" && Math.hypot(x - pr.x, z - pr.z) < (pr.radius ?? 6.5) + 4.0) {
+        if (pr.kind === "pond" && Math.hypot(x - pr.x, z - pr.z) < (pr.radius ?? 6.5) + newRadius + 1.4) {
           return false;
         }
       }
     }
+
     if (category === "building" || category === "prop") {
+      const roadClear = newRadius + 2.6;
       for (const p of world.paths) {
         if (p.kind !== "road") continue;
         for (let i = 0; i < p.points.length; i++) {
           const a = p.points[i];
           const b = p.points[(i + 1) % p.points.length];
           if (!p.closed && i === p.points.length - 1) break;
-          if (distToSegment(x, z, a[0], a[1], b[0], b[1]) < 5.6) return false;
+          if (distToSegment(x, z, a[0], a[1], b[0], b[1]) < roadClear) return false;
         }
       }
     }
@@ -766,50 +1294,55 @@ export class WorldDO extends DurableObject<Env> {
     reqX: number | null | undefined,
     reqZ: number | null | undefined,
     category: WorldCreation["category"],
+    newRadius: number,
     world: Omit<WorldStateSnapshot, "myCreationId">,
+    ignoreId?: string,
   ): [number, number] {
     if (typeof reqX === "number" && Number.isFinite(reqX) && typeof reqZ === "number" && Number.isFinite(reqZ)) {
-      const cx = Math.max(-130, Math.min(130, reqX));
-      const cz = Math.max(-130, Math.min(130, reqZ));
-      if (this.isSpotClear(cx, cz, category, world)) {
+      const cx = Math.max(-135, Math.min(135, reqX));
+      const cz = Math.max(-135, Math.min(135, reqZ));
+      if (this.isSpotClear(cx, cz, category, newRadius, world, ignoreId)) {
         return [Number(cx.toFixed(1)), Number(cz.toFixed(1))];
       }
-      // Spiral gently around the clicked spot to find the closest non-colliding grass patch
-      for (let r = 3; r <= 42; r += 2.5) {
-        for (let k = 0; k < 16; k++) {
-          const ang = (k / 16) * Math.PI * 2;
+      // Spiral outward from the visitor's chosen spot so massive volcanoes smoothly claim the nearest spacious clearing
+      const baseAngle = Math.atan2(cz, cx);
+      for (let r = 3.0; r <= 88; r += 2.8) {
+        for (let k = 0; k < 20; k++) {
+          const ang = baseAngle + (k / 20) * Math.PI * 2;
           const tx = cx + Math.cos(ang) * r;
           const tz = cz + Math.sin(ang) * r;
-          if (this.isSpotClear(tx, tz, category, world)) {
+          if (this.isSpotClear(tx, tz, category, newRadius, world, ignoreId)) {
             return [Number(tx.toFixed(1)), Number(tz.toFixed(1))];
           }
         }
       }
     }
 
-    // Golden-angle spiral around the sunlit village perimeter
-    const startR = category === "building" ? 28 : 14;
-    for (let i = 0; i < 180; i++) {
-      const r = startR + Math.sqrt(i) * 5.2;
+    // Golden-angle spiral around the island perimeter, starting further out for colossal landmarks
+    const startR = newRadius >= 8.5 ? 42 : category === "building" ? 28 : 14;
+    for (let i = 0; i < 260; i++) {
+      const r = startR + Math.sqrt(i) * 5.6;
       const theta = i * 2.399963;
       const tx = Math.cos(theta) * r;
       const tz = Math.sin(theta) * r;
-      if (this.isSpotClear(tx, tz, category, world)) {
+      if (this.isSpotClear(tx, tz, category, newRadius, world, ignoreId)) {
         return [Number(tx.toFixed(1)), Number(tz.toFixed(1))];
       }
     }
-    return [32, -26];
+    return [46, -42];
   }
 
   private applyWorldPatch(patch: WorldPatch): void {
     const sql = this.ctx.storage.sql;
     const hasCustomRoad = patch.newPaths.some((p) => p.kind === "road");
+    const nonRoadTrailKinds = new Set(["footpath", "dirt_trail", "cobblestone", "boardwalk", "volcanic_trail"]);
 
     for (const upd of patch.updatedBehaviors) {
       const rows = sql.exec(`SELECT json FROM creations WHERE id = ?`, upd.creationId).toArray();
       if (!rows.length) continue;
       const existing = JSON.parse(String(rows[0].json)) as WorldCreation;
       const wasLandmark = existing.behavior?.type === "landmark";
+      const prevScale = existing.scaleClass;
 
       if (upd.blueprintAmendment) {
         existing.blueprint = applyBlueprintAmendment(existing.blueprint, upd.blueprintAmendment);
@@ -831,18 +1364,42 @@ export class WorldDO extends DurableObject<Env> {
       if (upd.liveFeed && !existing.liveFeed) {
         existing.liveFeed = upd.liveFeed;
       }
+
+      // If Argon upgraded a stationary landmark's scaleClass (e.g. medium -> colossal), ensure its plot has room!
+      if (existing.scaleClass !== prevScale && upd.behavior.type === "landmark") {
+        const updatedR = getCreationFootprintRadius(
+          existing.scaleClass,
+          existing.blueprint.stats.footprintX,
+          existing.blueprint.stats.footprintZ,
+        );
+        const worldSnap = this.readBaseWorld();
+        if (!this.isSpotClear(existing.x, existing.z, existing.category, updatedR, worldSnap, existing.id)) {
+          const [nx, nz] = this.chooseMeadowSpot(
+            existing.x,
+            existing.z,
+            existing.category,
+            updatedR,
+            worldSnap,
+            existing.id,
+          );
+          existing.x = nx;
+          existing.z = nz;
+        }
+      }
+
       if (upd.removeStationaryFootpath || upd.behavior.type !== "landmark") {
         sql.exec(`DELETE FROM paths WHERE id = ?`, `initpath-${upd.creationId}`);
+        sql.exec(`DELETE FROM terrain_zones WHERE id = ?`, `initzone-${upd.creationId}`);
         if (wasLandmark && upd.behavior.type !== "landmark") {
           const fpRows = sql.exec(`SELECT id, json FROM paths WHERE id NOT LIKE 'path-%'`).toArray();
           for (const fpr of fpRows) {
             const p = JSON.parse(String(fpr.json)) as WorldPath;
-            if (p.kind !== "footpath" || p.points.length === 0) continue;
+            if (!nonRoadTrailKinds.has(p.kind) || p.points.length === 0) continue;
             const firstPt = p.points[0];
             const lastPt = p.points[p.points.length - 1];
             if (
-              Math.hypot(firstPt[0] - existing.x, firstPt[1] - existing.z) < 5.8 ||
-              Math.hypot(lastPt[0] - existing.x, lastPt[1] - existing.z) < 5.8
+              Math.hypot(firstPt[0] - existing.x, firstPt[1] - existing.z) < 6.8 ||
+              Math.hypot(lastPt[0] - existing.x, lastPt[1] - existing.z) < 6.8
             ) {
               sql.exec(`DELETE FROM paths WHERE id = ?`, String(fpr.id));
             }
@@ -864,14 +1421,27 @@ export class WorldDO extends DurableObject<Env> {
     }
 
     const pathCount = Number(sql.exec(`SELECT COUNT(*) AS c FROM paths`).toArray()[0]?.c ?? 0);
-    if (pathCount < 56) {
+    if (pathCount < 64) {
       for (const p of patch.newPaths) {
         sql.exec(`INSERT OR REPLACE INTO paths (id, json) VALUES (?, ?)`, p.id, JSON.stringify(p));
       }
     }
 
+    for (const tz of patch.newTerrainZones ?? []) {
+      sql.exec(`INSERT OR REPLACE INTO terrain_zones (id, json) VALUES (?, ?)`, tz.id, JSON.stringify(tz));
+    }
+    // Keep terrain_zones bounded to 28 active zones (matching WebGL shader uniform uZones[28])
+    const allZones = sql.exec(`SELECT id FROM terrain_zones`).toArray().map((r) => String(r.id));
+    if (allZones.length > 28) {
+      const removable = allZones.filter((id) => !id.startsWith("zone-seed-"));
+      const excess = allZones.length - 28;
+      for (const delId of removable.slice(0, excess)) {
+        sql.exec(`DELETE FROM terrain_zones WHERE id = ?`, delId);
+      }
+    }
+
     const propCount = Number(sql.exec(`SELECT COUNT(*) AS c FROM props`).toArray()[0]?.c ?? 0);
-    if (propCount < 72) {
+    if (propCount < 76) {
       for (const pr of patch.newProps) {
         sql.exec(`INSERT OR REPLACE INTO props (id, json) VALUES (?, ?)`, pr.id, JSON.stringify(pr));
       }
@@ -921,13 +1491,18 @@ export class WorldDO extends DurableObject<Env> {
       };
     }
 
-    const bp = normalizeAndGroundBlueprint(input.blueprintRaw, "Meadow Creation");
+    const bp = normalizeAndGroundBlueprint(input.blueprintRaw, "Island Creation");
     if (bp.stats.voxels < 20) {
       return { ok: false, error: "Blueprint has too few voxels to place." };
     }
 
+    const newRadius = getCreationFootprintRadius(
+      bp.scaleClass,
+      bp.stats.footprintX,
+      bp.stats.footprintZ,
+    );
     const worldBefore = this.readBaseWorld();
-    const [x, z] = this.chooseMeadowSpot(input.x, input.z, bp.category, worldBefore);
+    const [x, z] = this.chooseMeadowSpot(input.x, input.z, bp.category, newRadius, worldBefore);
     const yaw =
       typeof input.yaw === "number" && Number.isFinite(input.yaw)
         ? input.yaw
@@ -952,8 +1527,8 @@ export class WorldDO extends DurableObject<Env> {
       behavior: {
         type: "landmark",
         facingYaw: yaw,
-        activity: "arriving in the meadow",
-        statusLine: "Just arrived — Argon is weaving it into the village...",
+        activity: "arriving on GeminIsland",
+        statusLine: "Just arrived — Argon is weaving it into GeminIsland...",
       },
       integratedLevel: 0,
       createdAt: now,
@@ -986,7 +1561,7 @@ export class WorldDO extends DurableObject<Env> {
       this.incrementWindowBucket(`placed_ip:${input.ipHash}`, 24 * 60 * 60 * 1000, now);
     }
 
-    // Apply instant 0ms deterministic behavior so it immediately animates upon placement!
+    // Apply instant 0ms deterministic behavior, contextual trail, and biome patch so it immediately animates!
     const worldWithNew = this.readBaseWorld();
     const initialPatch = buildInitialIntegration(worldWithNew, creation);
     this.applyWorldPatch(initialPatch);
@@ -1021,13 +1596,54 @@ export class WorldDO extends DurableObject<Env> {
     };
   }
 
+  public getLastOgCaptureAt(): number {
+    return Number(this.getMeta("lastOgCaptureAt", "0")) || 0;
+  }
+
+  public getOgSnapshot(
+    variant: "vertical" | "square" | "landscape",
+  ): { b64: string; capturedAt: number } | null {
+    const rows = this.ctx.storage.sql
+      .exec(`SELECT b64, captured_at FROM og_snapshots WHERE variant = ? LIMIT 1`, variant)
+      .toArray();
+    if (rows.length === 0) return null;
+    return {
+      b64: String(rows[0].b64),
+      capturedAt: Number(rows[0].captured_at) || Date.now(),
+    };
+  }
+
+  public saveOgSnapshots(payload: {
+    vertical?: string;
+    square?: string;
+    landscape?: string;
+    capturedAt: number;
+  }): void {
+    const sql = this.ctx.storage.sql;
+    const ts = payload.capturedAt || Date.now();
+    for (const variant of ["vertical", "square", "landscape"] as const) {
+      const b64 = payload[variant];
+      if (typeof b64 === "string" && b64.length > 100) {
+        sql.exec(
+          `INSERT OR REPLACE INTO og_snapshots (variant, b64, captured_at) VALUES (?, ?, ?)`,
+          variant,
+          b64,
+          ts,
+        );
+      }
+    }
+    this.setMeta("lastOgCaptureAt", String(ts));
+  }
+
   override async alarm(): Promise<void> {
+    // 1. Keep the build queue moving if any jobs are queued
+    await this.pumpBuildQueue();
+
+    // 2. Process background Argon Director world-weaving integrations
     const sql = this.ctx.storage.sql;
     const rows = sql
       .exec(`SELECT creation_id FROM integration_queue ORDER BY queued_at ASC LIMIT 2`)
       .toArray();
-
-    if (rows.length === 0) return;
 
     for (const row of rows) {
       const creationId = String(row.creation_id);
@@ -1057,14 +1673,20 @@ export class WorldDO extends DurableObject<Env> {
       }
     }
 
-    const remaining = sql.exec(`SELECT COUNT(*) AS c FROM integration_queue`).toArray();
-    if (Number(remaining[0]?.c ?? 0) > 0) {
-      await this.ctx.storage.setAlarm(Date.now() + 500);
+    const remainingIntegrations = Number(
+      sql.exec(`SELECT COUNT(*) AS c FROM integration_queue`).toArray()[0]?.c ?? 0,
+    );
+    const remainingQueued = Number(
+      sql.exec(`SELECT COUNT(*) AS c FROM build_jobs WHERE status = 'queued'`).toArray()[0]?.c ?? 0,
+    );
+    if (remainingIntegrations > 0 || remainingQueued > 0 || this.activeJobPromises.size > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + 800);
     }
   }
 
   public async runCronWeaver(): Promise<{ ok: boolean; note: string }> {
-    // Always run deterministic voxel & spatial overlap check + auto-repair on every orchestrator tick
+    void this.pumpBuildQueue();
+
     const auditRes = this.auditAndRepairWorld();
     if (auditRes.repairedCount > 0) {
       const healedWorld = this.readBaseWorld();
@@ -1084,7 +1706,6 @@ export class WorldDO extends DurableObject<Env> {
     const lastWeaveCount = Number(this.getMeta("lastWeaveCount", "0")) || 0;
     const hasNewCreations = world.creations.length > lastWeaveCount;
 
-    // Only run background Cron World-Weaver LLM call when unintegrated, newly added, or stuck mobile creations exist!
     if (!hasUnintegrated && !hasStuckMobile && !hasNewCreations) {
       return {
         ok: true,

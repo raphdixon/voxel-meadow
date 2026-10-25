@@ -3,6 +3,7 @@ import type {
   WorldPath,
   WorldProp,
   WorldStateSnapshot,
+  WorldTerrainZone,
   WorldVillager,
 } from "./types";
 import { normalizeAndGroundBlueprint } from "./voxel_dsl";
@@ -593,7 +594,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
     },
     {
       id: "path-clocktower-spur",
-      kind: "footpath",
+      kind: "cobblestone",
       points: [
         [0, -28],
         [0, -21.5],
@@ -601,7 +602,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
     },
     {
       id: "path-bakery-spur",
-      kind: "footpath",
+      kind: "dirt_trail",
       points: [
         [-31, -3],
         [-26.5, -1],
@@ -617,7 +618,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
     },
     {
       id: "path-green-walk",
-      kind: "footpath",
+      kind: "dirt_trail",
       points: [
         [0, -16.5],
         [1, -4],
@@ -799,11 +800,39 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
     },
   ];
 
+  const terrainZones: WorldTerrainZone[] = [
+    {
+      id: "zone-clover-pond-moss",
+      biome: "misty_moss",
+      x: -7,
+      z: 3,
+      radius: 12.5,
+      intensity: 0.9,
+    },
+    {
+      id: "zone-clocktower-plaza",
+      biome: "stone_plaza",
+      x: 0,
+      z: -31.5,
+      radius: 9.2,
+      intensity: 0.85,
+    },
+    {
+      id: "zone-bakery-autumn",
+      biome: "autumn_grove",
+      x: -36,
+      z: -4,
+      radius: 10.5,
+      intensity: 0.8,
+    },
+  ];
+
   return {
     version: 1,
     creations,
     paths,
     props,
+    terrainZones,
     villagers,
     contributorCount: 0,
     lastWeaveNote: "Sunnyvale School Bus is running the Meadow Loop between Clocktower Station, Bookshop Corner, and Windmill Bakery.",

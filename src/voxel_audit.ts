@@ -7,7 +7,7 @@ import type {
   WorldPath,
   WorldProp,
 } from "./types";
-import { applySimOps, SimVox, translateOp } from "./voxel_dsl";
+import { applySimOps, getCreationFootprintRadius, SimVox, translateOp } from "./voxel_dsl";
 
 export interface PartOverlapReport {
   partIndex: number;
@@ -816,14 +816,15 @@ export function auditAndRepairWorldSpatial(
     (c) => c.category === "building" || c.behavior?.type === "landmark",
   );
 
-  const plinthRadiusOf = (c: WorldCreation): number => {
-    const scale = c.scaleClass === "large" ? 0.34 : c.scaleClass === "medium" ? 0.24 : 0.18;
-    const halfFoot = Math.max(c.blueprint?.stats?.footprintX ?? 14, c.blueprint?.stats?.footprintZ ?? 14) * 0.5 * scale;
-    return Math.max(2.8, Math.min(5.2, halfFoot + 0.35));
-  };
+  const plinthRadiusOf = (c: WorldCreation): number =>
+    getCreationFootprintRadius(
+      c.scaleClass,
+      c.blueprint?.stats?.footprintX ?? 14,
+      c.blueprint?.stats?.footprintZ ?? 14,
+    );
 
   const repairedPaths: WorldPath[] = paths.map((p) => {
-    if (p.kind !== "footpath" || p.closed || p.points.length < 2) return p;
+    if (p.kind === "road" || p.closed || p.points.length < 2) return p;
     let changed = false;
     const pts: [number, number][] = p.points.map(([x, z]) => [x, z]);
 

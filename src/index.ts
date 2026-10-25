@@ -1,5 +1,5 @@
-import { sculptWithArgon } from "./argon_sculptor";
 import { resolveWorldLiveFeeds } from "./live_feeds";
+import { refreshDailyOgScreenshotsIfDue } from "./og_renderer";
 import {
   buildSecurityHeaders,
   isLocalDevRequest,
@@ -42,9 +42,25 @@ function getWorldStub(env: Env): DurableObjectStub<WorldDO> {
   return env.WORLD_DO.get(id);
 }
 
+function base64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    out[i] = bin.charCodeAt(i);
+  }
+  return out;
+}
+
+const OG_ROUTE_VARIANTS: Record<string, "vertical" | "square" | "landscape"> = {
+  "/og-vertical.jpg": "vertical",
+  "/og-square.jpg": "square",
+  "/og-image.jpg": "landscape",
+};
+
 export default {
   async fetch(request: Request, env: AppEnv): Promise<Response> {
     const url = new URL(request.url);
+    const isHttps = url.protocol === "https:";
 
     try {
       // Real-time WebSocket stream to shared living world DO (origin-verified)
@@ -60,7 +76,71 @@ export default {
         return stub.fetch(request);
       }
 
-      // Read full shared world state + whether this individual browser has placed today's creation
+      // Dynamic 24-hour live island social media pull-through images (GET + HEAD for unfurl crawlers)
+      const ogVariant = OG_ROUTE_VARIANTS[url.pathname];
+      if (ogVariant && (request.method === "GET" || request.method === "HEAD")) {
+        const stub = getWorldStub(env);
+        const snap = await stub.getOgSnapshot(ogVariant).catch(() => null);
+        if (snap && snap.b64) {
+          const bytes = base64ToBytes(snap.b64);
+          return new Response(request.method === "HEAD" ? null : bytes, {
+            status: 200,
+            headers: {
+              ...buildSecurityHeaders(isHttps),
+              "content-type": "image/jpeg",
+              "content-length": String(bytes.byteLength),
+              "cache-control": "public, max-age=3600, s-maxage=86400",
+              "cross-origin-resource-policy": "cross-origin",
+            },
+          });
+        }
+        // Fallback to bundled baseline public/og-*.jpg if DO snapshot hasn't run yet
+        const assetRes = await env.ASSETS.fetch(request);
+        const headers = new Headers(assetRes.headers);
+        for (const [k, v] of Object.entries(buildSecurityHeaders(isHttps))) {
+          if (!headers.has(k)) headers.set(k, v);
+        }
+        headers.set("cross-origin-resource-policy", "cross-origin");
+        headers.set("cache-control", "public, max-age=3600, s-maxage=86400");
+        return new Response(request.method === "HEAD" ? null : assetRes.body, {
+          status: assetRes.status,
+          headers,
+        });
+      }
+
+      // Serve / and /index.html with daily cache-busted OG image URLs so social crawlers refresh every 24h
+      if (
+        (url.pathname === "/" || url.pathname === "/index.html") &&
+        (request.method === "GET" || request.method === "HEAD")
+      ) {
+        const assetUrl = new URL("/index.html", request.url);
+        const assetRes = await env.ASSETS.fetch(new Request(assetUrl.toString(), { method: "GET" }));
+        const stub = getWorldStub(env);
+        const lastOgAt = await stub.getLastOgCaptureAt().catch(() => 0);
+        const versionTag =
+          lastOgAt > 0
+            ? String(Math.floor(lastOgAt / 1000))
+            : String(Math.floor(Date.now() / (24 * 60 * 60 * 1000)));
+
+        const htmlRaw = await assetRes.text();
+        const html = htmlRaw
+          .replace(/\/og-vertical\.jpg(?!\?)/g, `/og-vertical.jpg?v=${versionTag}`)
+          .replace(/\/og-square\.jpg(?!\?)/g, `/og-square.jpg?v=${versionTag}`)
+          .replace(/\/og-image\.jpg(?!\?)/g, `/og-image.jpg?v=${versionTag}`);
+
+        const headers = new Headers(assetRes.headers);
+        headers.set("content-type", "text/html; charset=utf-8");
+        headers.set("cache-control", "public, max-age=300");
+        for (const [k, v] of Object.entries(buildSecurityHeaders(isHttps))) {
+          headers.set(k, v);
+        }
+        return new Response(request.method === "HEAD" ? null : html, {
+          status: 200,
+          headers,
+        });
+      }
+
+      // Read full shared world state + today's creation + active queue job if building
       if (url.pathname === "/api/world") {
         if (request.method !== "GET") {
           return jsonResponse(request, { ok: false, error: "Method not allowed." }, 405);
@@ -71,6 +151,31 @@ export default {
         return jsonResponse(
           request,
           snapshot,
+          200,
+          id.setCookieHeader ? { "Set-Cookie": id.setCookieHeader } : undefined,
+        );
+      }
+
+      // Live build queue status + ETA polling endpoint for waiting/sculpting visitors
+      if (url.pathname === "/api/job") {
+        if (request.method !== "GET") {
+          return jsonResponse(request, { ok: false, error: "Method not allowed." }, 405);
+        }
+        const id = await resolveVisitorIdentity(request, env);
+        const jobId = sanitizePlainText(url.searchParams.get("id") ?? "", 64, true);
+        const stub = getWorldStub(env);
+        const statusRes = await stub.getBuildJobStatus(jobId || null, id.cookieId, id.dayKey);
+        const feeds = statusRes.world
+          ? await resolveWorldLiveFeeds(statusRes.world.creations)
+          : undefined;
+        return jsonResponse(
+          request,
+          {
+            ok: true,
+            job: statusRes.job,
+            ...(statusRes.world ? { world: statusRes.world } : {}),
+            ...(feeds ? { feeds } : {}),
+          },
           200,
           id.setCookieHeader ? { "Set-Cookie": id.setCookieHeader } : undefined,
         );
@@ -101,7 +206,7 @@ export default {
         });
       }
 
-      // Atomic background build + permanent placement at visitor's chosen grass spot
+      // Enqueue build into the multi-user FIFO workshop queue (handles 10-40+ simultaneous builders cleanly)
       if (url.pathname === "/api/build") {
         if (request.method !== "POST") {
           return jsonResponse(request, { ok: false, error: "Method not allowed." }, 405);
@@ -120,7 +225,6 @@ export default {
           );
         }
 
-        // Validate body size, UTF-8 JSON, prompt, and image magic bytes BEFORE acquiring quota/lock
         const parsedBody = await readBoundedJsonBody(request, 5_000_000);
         if (!parsedBody.ok) {
           return jsonResponse(request, { ok: false, error: parsedBody.error }, parsedBody.status);
@@ -144,70 +248,47 @@ export default {
         const stub = getWorldStub(env);
         const cookieHeaders = id.setCookieHeader ? { "Set-Cookie": id.setCookieHeader } : undefined;
 
-        const slot = await stub.acquireBuildSlot(id.ipHash, id.cookieId, id.dayKey);
-        if (!slot.ok) {
+        const enqueued = await stub.enqueueBuildJob({
+          ipHash: id.ipHash,
+          cookieId: id.cookieId,
+          dayKey: id.dayKey,
+          prompt,
+          imageBase64: imgCheck.base64,
+          imageMimeType: imgCheck.mimeType,
+          x: typeof body.x === "number" && Number.isFinite(body.x) ? body.x : null,
+          z: typeof body.z === "number" && Number.isFinite(body.z) ? body.z : null,
+          yaw: typeof body.yaw === "number" && Number.isFinite(body.yaw) ? body.yaw : null,
+        });
+
+        if (!enqueued.ok) {
           const extra = {
             ...(cookieHeaders ?? {}),
-            ...(slot.retryAfterSec ? { "Retry-After": String(slot.retryAfterSec) } : {}),
+            ...(enqueued.retryAfterSec ? { "Retry-After": String(enqueued.retryAfterSec) } : {}),
           };
           return jsonResponse(
             request,
             {
               ok: false,
-              ...(slot.alreadyPlaced ? { alreadyPlaced: true, myCreationId: slot.myCreationId } : {}),
-              error: slot.error,
+              ...(enqueued.alreadyPlaced
+                ? { alreadyPlaced: true, myCreationId: enqueued.myCreationId }
+                : {}),
+              error: enqueued.error,
             },
-            slot.status,
+            enqueued.status,
             extra,
           );
         }
 
-        try {
-          const sculpted = await sculptWithArgon(
-            {
-              prompt,
-              imageBase64: imgCheck.base64,
-              imageMimeType: imgCheck.mimeType,
-            },
-            env.GEMINI_API_KEY,
-            env.ARGON_MODEL,
-            env.FALLBACK_MODEL,
-          );
-
-          if (!sculpted.ok) {
-            const status = sculpted.unsafe ? 422 : 400;
-            return jsonResponse(request, sculpted, status, cookieHeaders);
-          }
-
-          const placed = await stub.placeCreation({
-            ipHash: id.ipHash,
-            cookieId: id.cookieId,
-            dayKey: id.dayKey,
-            creatorPrompt: prompt,
-            blueprintRaw: sculpted.blueprint as unknown as Record<string, unknown>,
-            x: typeof body.x === "number" && Number.isFinite(body.x) ? body.x : null,
-            z: typeof body.z === "number" && Number.isFinite(body.z) ? body.z : null,
-            yaw: typeof body.yaw === "number" && Number.isFinite(body.yaw) ? body.yaw : null,
-          });
-
-          if (!placed.ok) {
-            const status = placed.alreadyPlaced ? 409 : 400;
-            return jsonResponse(request, placed, status, cookieHeaders);
-          }
-
-          const feeds = await resolveWorldLiveFeeds(placed.world.creations);
-          return jsonResponse(request, { ...placed, feeds }, 200, cookieHeaders);
-        } catch (err) {
-          safeLogError("api_build", err, [env.GEMINI_API_KEY, env.CREATOR_HMAC_SECRET]);
-          return jsonResponse(
-            request,
-            { ok: false, error: "Argon took a moment too long building that — please try once more." },
-            502,
-            cookieHeaders,
-          );
-        } finally {
-          await stub.releaseBuildSlot(slot.lockToken).catch(() => {});
-        }
+        return jsonResponse(
+          request,
+          {
+            ok: true,
+            queued: true,
+            job: enqueued.job,
+          },
+          200,
+          cookieHeaders,
+        );
       }
 
       // Local-only test endpoints: strictly disabled in production AND unless ENABLE_DEV_ENDPOINTS="1"
@@ -261,6 +342,45 @@ export default {
           });
           return jsonResponse(request, placed, placed.ok ? 200 : 400);
         }
+        if (url.pathname === "/api/dev/enqueue-batch" && request.method === "POST") {
+          const parsed = await readBoundedJsonBody(request, 512_000);
+          if (!parsed.ok) return jsonResponse(request, { ok: false, error: parsed.error }, 400);
+          const id = await resolveVisitorIdentity(request, env);
+          const itemsRaw = Array.isArray(parsed.data.items) ? parsed.data.items.slice(0, 25) : [];
+          const items = itemsRaw.map((rawItem, idx) => {
+            const rec = rawItem && typeof rawItem === "object" ? (rawItem as Record<string, unknown>) : {};
+            return {
+              cookieId:
+                typeof rec.cookieId === "string" && rec.cookieId
+                  ? rec.cookieId
+                  : idx === 0
+                    ? id.cookieId
+                    : `sim-visitor-${idx}-${Date.now()}`,
+              prompt: typeof rec.prompt === "string" ? rec.prompt : `Simulated Creation #${idx + 1}`,
+              delayMs: typeof rec.delayMs === "number" ? rec.delayMs : 4500,
+              placeBlueprint:
+                rec.placeBlueprint && typeof rec.placeBlueprint === "object"
+                  ? (rec.placeBlueprint as Record<string, unknown>)
+                  : null,
+            };
+          });
+          const stub = getWorldStub(env);
+          const jobs = await stub.enqueueDevSimulatedBatch(items, id.dayKey);
+          return jsonResponse(
+            request,
+            { ok: true, jobs },
+            200,
+            id.setCookieHeader ? { "Set-Cookie": id.setCookieHeader } : undefined,
+          );
+        }
+        if (url.pathname === "/api/dev/refresh-og" && request.method === "POST") {
+          const stub = getWorldStub(env);
+          const res = await refreshDailyOgScreenshotsIfDue(env, stub, {
+            force: true,
+            siteOrigin: url.origin,
+          });
+          return jsonResponse(request, { ok: true, ...res }, 200);
+        }
       }
 
       // Reject any unknown /api/* route cleanly (never fall through to static assets)
@@ -270,7 +390,6 @@ export default {
 
       // Serve static assets with hardened security headers attached as belt-and-suspenders alongside _headers
       const assetRes = await env.ASSETS.fetch(request);
-      const isHttps = url.protocol === "https:";
       const headers = new Headers(assetRes.headers);
       for (const [k, v] of Object.entries(buildSecurityHeaders(isHttps))) {
         if (!headers.has(k)) {
@@ -291,7 +410,12 @@ export default {
   async scheduled(_controller: ScheduledController, env: AppEnv, ctx: ExecutionContext): Promise<void> {
     const stub = getWorldStub(env);
     ctx.waitUntil(
-      stub.runCronWeaver().catch((err) => {
+      Promise.allSettled([
+        stub.runCronWeaver(),
+        refreshDailyOgScreenshotsIfDue(env, stub, {
+          siteOrigin: "https://geminisland.raph.plus",
+        }),
+      ]).catch((err) => {
         safeLogError("scheduled_cron", err, [env.GEMINI_API_KEY, env.CREATOR_HMAC_SECRET]);
       }),
     );

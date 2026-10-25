@@ -393,3 +393,9 @@ body {
   max-width: min(90vw, 520px);
   text-align: center;
 }
+
+body[data-og-capture="1"] .bottom-dock,
+body[data-og-capture="1"] .hover-card,
+body[data-og-capture="1"] .weave-toast {
+  display: none !important;
+}

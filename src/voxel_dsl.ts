@@ -85,7 +85,49 @@ export const VOX_PALETTE: Record<string, string> = {
   screenCyan: "#64f5df",
   screenGreen: "#5ef28c",
   fire: "#ff7426",
+  lava: "#ff5a1f",
+  basalt: "#363840",
+  ash: "#6c6e75",
+  sand: "#ead39c",
+  moss: "#4b9645",
+  snow: "#f3f7fc",
 };
+
+export const VOXEL_UNIT = 0.25;
+export const SCALE_FACTORS: Record<ScaleClass, number> = {
+  tiny: 0.4,
+  small: 0.56,
+  medium: 0.92,
+  large: 1.14,
+  colossal: 1.72,
+};
+
+export function getWorldVoxelSize(scaleClass: ScaleClass | string | undefined): number {
+  const f = SCALE_FACTORS[scaleClass as ScaleClass] ?? SCALE_FACTORS.medium;
+  return VOXEL_UNIT * f;
+}
+
+export function getCreationFootprintRadius(
+  scaleClass: ScaleClass | string | undefined,
+  footprintX = 14,
+  footprintZ = 14,
+): number {
+  const voxSize = getWorldVoxelSize(scaleClass);
+  const maxSpan = Math.max(4, footprintX, footprintZ);
+  const minSpan = Math.max(4, Math.min(footprintX, footprintZ));
+  const effectiveHalfSpan = (maxSpan * 0.72 + minSpan * 0.28) * 0.5 * voxSize;
+  const minR =
+    scaleClass === "colossal"
+      ? 7.2
+      : scaleClass === "large"
+        ? 3.8
+        : scaleClass === "medium"
+          ? 2.6
+          : scaleClass === "small"
+            ? 1.7
+            : 1.05;
+  return Number(Math.max(minR, Math.min(14.5, effectiveHalfSpan + 0.35)).toFixed(2));
+}
 
 const HEX_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 
@@ -110,9 +152,11 @@ const CATEGORIES: Record<CreationCategory, true> = {
 };
 
 const SCALES: Record<ScaleClass, true> = {
+  tiny: true,
   small: true,
   medium: true,
   large: true,
+  colossal: true,
 };
 
 const num = (v: unknown, def = 0): number => {
@@ -622,23 +666,23 @@ export function translateOp(op: VoxelOp, dx: number, dy: number, dz: number): Vo
   }
 }
 
-const B = 20;
-const MAX_Y = 44;
+const B = 28;
+const MAX_Y = 64;
 
 export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string, string>, isPart = false): VoxelOp | null {
   const kind = typeof raw.op === "string" ? raw.op.trim() : "";
   const emitVal = num(raw.emit, 0) > 0 ? clamp(Number(num(raw.emit, 0).toFixed(2)), 0, 2.2) : undefined;
   const mirrorX = Boolean(raw.mirrorX);
-  const loY = isPart ? -20 : -8;
+  const loY = isPart ? -24 : -8;
 
   switch (kind) {
     case "plinth":
       if (isPart) return null;
       return {
         op: "plinth",
-        sizeX: clamp(Math.round(num(raw.sizeX, 16)), 6, 30),
-        heightY: clamp(Math.round(num(raw.heightY, 2)), 1, 5),
-        sizeZ: clamp(Math.round(num(raw.sizeZ, 16)), 6, 30),
+        sizeX: clamp(Math.round(num(raw.sizeX, 16)), 4, 48),
+        heightY: clamp(Math.round(num(raw.heightY, 2)), 1, 6),
+        sizeZ: clamp(Math.round(num(raw.sizeZ, 16)), 4, 48),
         base: normalizeColorToken(raw.base, palette, "concrete2"),
         top: normalizeColorToken(raw.top, palette, "limestone"),
         corner: normalizeColorToken(raw.corner, palette, "brass"),
@@ -727,7 +771,7 @@ export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string,
     }
     case "cylinder": {
       const axis: "x" | "y" | "z" = raw.axis === "x" || raw.axis === "z" ? raw.axis : "y";
-      const radius = clamp(num(raw.radius, 2.5), 0.5, 10);
+      const radius = clamp(num(raw.radius, 2.5), 0.5, 24);
       if (axis === "x") {
         const [x0, x1] = orderedSpan(raw.x0, raw.x1, -1, 1);
         return {
@@ -774,7 +818,7 @@ export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string,
     }
     case "ring": {
       const axis: "x" | "y" | "z" = raw.axis === "x" || raw.axis === "z" ? raw.axis : "y";
-      const outerR = clamp(num(raw.outerR, 3.0), 1.0, 10);
+      const outerR = clamp(num(raw.outerR, 3.0), 1.0, 24);
       const innerR = clamp(num(raw.innerR, outerR - 1.1), 0.4, Math.max(0.4, outerR - 0.5));
       if (axis === "x") {
         const [x0, x1] = orderedSpan(raw.x0, raw.x1, -1, 1);
@@ -825,7 +869,7 @@ export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string,
     }
     case "cone": {
       const [y0, y1] = orderedSpan(raw.y0, raw.y1, 8, 16);
-      const rBottom = clamp(num(raw.rBottom, 4), 0.6, 10);
+      const rBottom = clamp(num(raw.rBottom, 4), 0.6, 26);
       const rTop = clamp(num(raw.rTop, 0.5), 0.2, rBottom);
       return {
         op: "cone",
@@ -841,9 +885,9 @@ export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string,
       };
     }
     case "sphere": {
-      const rx = clamp(num(raw.rx ?? raw.radius, 2.5), 0.5, 11);
-      const ry = clamp(num(raw.ry ?? rx, rx), 0.5, 11);
-      const rz = clamp(num(raw.rz ?? rx, rx), 0.5, 11);
+      const rx = clamp(num(raw.rx ?? raw.radius, 2.5), 0.5, 24);
+      const ry = clamp(num(raw.ry ?? rx, rx), 0.5, 24);
+      const rz = clamp(num(raw.rz ?? rx, rx), 0.5, 24);
       return {
         op: "sphere",
         cx: clamp(num(raw.cx, 0), -B, B),
@@ -858,7 +902,7 @@ export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string,
       };
     }
     case "dome": {
-      const radius = clamp(num(raw.radius, 4), 0.8, 11);
+      const radius = clamp(num(raw.radius, 4), 0.8, 24);
       return {
         op: "dome",
         cx: clamp(num(raw.cx, 0), -B, B),
@@ -880,7 +924,7 @@ export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string,
         z0: clamp(z0, -B, B - 2),
         x1: clamp(Math.max(x0 + 2, x1), -B + 2, B),
         z1: clamp(Math.max(z0 + 2, z1), -B + 2, B),
-        rise: clamp(Math.round(num(raw.rise, 5)), 2, 12),
+        rise: clamp(Math.round(num(raw.rise, 5)), 2, 18),
         axis: raw.axis === "z" ? "z" : "x",
         color: normalizeColorToken(raw.color, palette, "terracotta"),
         ...(raw.trim ? { trim: normalizeColorToken(raw.trim, palette, "cream") } : {}),
@@ -994,9 +1038,9 @@ export function normalizeAndGroundBlueprint(
     if (!pRaw || typeof pRaw !== "object") continue;
     const rec = pRaw as Record<string, unknown>;
     const piv = Array.isArray(rec.pivot) ? rec.pivot : [0, 4, 0];
-    const px = clamp(num(piv[0], 0), -18, 18);
-    const py = clamp(num(piv[1], 4), 0, 40);
-    const pz = clamp(num(piv[2], 0), -18, 18);
+    const px = clamp(num(piv[0], 0), -28, 28);
+    const py = clamp(num(piv[1], 4), 0, 62);
+    const pz = clamp(num(piv[2], 0), -28, 28);
 
     let pOps: VoxelOp[] = [];
     for (const item of Array.isArray(rec.ops) ? rec.ops.slice(0, 48) : []) {
@@ -1195,9 +1239,9 @@ export function sanitizeBlueprintAmendment(
       if (!pRaw || typeof pRaw !== "object") continue;
       const pr = pRaw as Record<string, unknown>;
       const piv = Array.isArray(pr.pivot) ? pr.pivot : [0, 4, 0];
-      const px = clamp(num(piv[0], 0), -18, 18);
-      const py = clamp(num(piv[1], 4), 0, 40);
-      const pz = clamp(num(piv[2], 0), -18, 18);
+      const px = clamp(num(piv[0], 0), -28, 28);
+      const py = clamp(num(piv[1], 4), 0, 62);
+      const pz = clamp(num(piv[2], 0), -28, 28);
       const pOps: VoxelOp[] = [];
       for (const opRaw of Array.isArray(pr.ops) ? pr.ops.slice(0, 24) : []) {
         if (opRaw && typeof opRaw === "object") {

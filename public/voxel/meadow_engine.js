@@ -1,12 +1,10 @@
-// Endless Sunlit Voxel Turf World Engine.
+// GeminIsland — Endless Sunlit Voxel World Engine.
 // Features:
-//  - Crisp voxel-tiled sunlit meadow ground shader with beveled grass blocks, subtle park-lawn weave & cumulus sun dapple
-//  - Physical 3D City Contributor Signboard in the central village green (live contributor count)
-//  - Simple in-world live API micro-badges (weather, surf, wind, time, moon, ISS)
-//  - Interactive 3D voxel plot stake marker + live voxel construction scaffolding while building
-//  - Camera-tracking texel-snapped 4096^2 PCF golden-hour shadows (zero pan shimmer!)
-//  - GTAO real-time contact occlusion + subtle UnrealBloom + ACESFilmic + SMAA
-//  - Smooth CatmullRom vehicle routes + polite non-overlapping voxel villagers
+//  - Multi-biome voxel turf ground shader (clover meadow, sandy shore, misty moss, volcanic basalt w/ glowing magma cracks, snow frost, stone plaza, autumn grove, desert mesa) — 0 extra draw calls, 0 Z-fighting
+//  - 6 distinct path styles (asphalt road, winding dirt trail, cobblestone lane, timber boardwalk, volcanic ember trail, stepping flagstones)
+//  - Dynamic multi-scale 3D plot stake & construction scaffolding (tiny 1.4m up to colossal 22m+ volcano plots)
+//  - Physical 3D GeminIsland Contributor Signboard + optional live API micro-badges
+//  - Camera-tracking texel-snapped 4096^2 PCF golden-hour shadows + GTAO + UnrealBloom + ACESFilmic + SMAA
 
 import * as THREE from "../vendor/three-bundle.js";
 import {
@@ -18,10 +16,28 @@ import {
   UnrealBloomPass,
 } from "../vendor/three-bundle.js";
 import { VillagerAgent, buildWorldPropMesh } from "./villagers.js";
-import { Vox, buildCreationGroup, buildVoxelMesh } from "./vox.js";
+import {
+  Vox,
+  buildCreationGroup,
+  buildVoxelMesh,
+  getCreationFootprintRadius,
+  getWorldVoxelSize,
+} from "./vox.js";
 
 const CITY_SIGN_POS = [3.8, -10.8];
 const CITY_SIGN_YAW = 0.62;
+const MAX_SHADER_ZONES = 28;
+
+const BIOME_IDS = {
+  meadow_clover: 1,
+  sandy_shore: 2,
+  misty_moss: 3,
+  volcanic_basalt: 4,
+  snow_frost: 5,
+  stone_plaza: 6,
+  autumn_grove: 7,
+  desert_mesa: 8,
+};
 
 function distToSeg2D(px, pz, ax, az, bx, bz) {
   const vx = bx - ax;
@@ -32,6 +48,41 @@ function distToSeg2D(px, pz, ax, az, bx, bz) {
   if (len2 < 0.001) return Math.hypot(px - ax, pz - az);
   const t = Math.max(0, Math.min(1, (wx * vx + wz * vz) / len2));
   return Math.hypot(px - (ax + t * vx), pz - (az + t * vz));
+}
+
+export function estimatePreviewPlotRadius(promptText = "") {
+  const s = String(promptText || "").trim();
+  if (!s) return 3.3;
+  if (
+    /\b(volcano|stratovolcano|caldera|mountain|mt\.|everest|fuji|matterhorn|glacier|canyon|mesa|castle|citadel|fortress|palace|cathedral|stadium|arena|colosseum|amphitheater|amphitheatre|pyramid|ziggurat|launch\s*pad|spaceport|world\s*tree|yggdrasil|colossus|kaiju|godzilla|giant\s+waterfall|niagara|skyscraper|megastructure)\b/i.test(
+      s,
+    )
+  ) {
+    return 9.8;
+  }
+  if (
+    /\b(waterfall|cascade|cliff|clocktower|tower|windmill|lighthouse|datacentre|datacenter|factory|station|barn|bridge|temple|pagoda|museum|library|hotel|ship|galleon|roller\s*coaster)\b/i.test(
+      s,
+    )
+  ) {
+    return 5.4;
+  }
+  if (
+    /\b(tiny|miniature|micro|mailbox|letterbox|postbox|hydrant|mushroom|toadstool|flower\s*pot|bonsai|campfire|bonfire|lantern|birdhouse|gnome|acorn|pebble|teacup|hedgehog|hamster|kitten|bunny|frog)\b/i.test(
+      s,
+    ) &&
+    !/\b(giant|huge|massive|colossal|large|house|castle|tower)\b/i.test(s)
+  ) {
+    return 1.45;
+  }
+  if (
+    /\b(small|little|cart|bike|bicycle|scooter|skateboard|dog|puppy|cat|fox|duck|swan|boat|canoe|statue|fountain|bench|shrine|kiosk|stall|well)\b/i.test(
+      s,
+    )
+  ) {
+    return 2.25;
+  }
+  return 3.3;
 }
 
 function makeMeadowSkyTexture() {
@@ -67,31 +118,26 @@ function createContributorSignboard(maxAniso = 4) {
   const s = 0.21;
   const v = new Vox(905);
 
-  // Stepped limestone & stone-shade base plinth + brass corner studs
   v.box(-14, 0, -4, 14, 1, 4, "concrete2");
   v.box(-13, 1, -3, 13, 2, 3, "limestone");
   for (const [cx, cz] of [[-13, -3], [12, -3], [-13, 2], [12, 2]]) {
     v.put(cx, 2, cz, "brass");
   }
 
-  // Twin dark-oak timber posts
   v.box(-12, 2, -1, -10, 20, 1, "woodDark");
   v.box(10, 2, -1, 12, 20, 1, "woodDark");
   v.box(-12, 20, -1, -10, 21, 1, "brass");
   v.box(10, 20, -1, 12, 21, 1, "brass");
 
-  // Solid oak signboard frame & backing
   v.box(-10, 5, -1, 10, 18, 1, "oak");
   v.box(-11, 4, -1, 11, 5, 1, "woodDark");
   v.box(-11, 18, -1, 11, 19, 1, "woodDark");
 
-  // Pitched terracotta shingle eave canopy + warm glowing crown lantern
   v.box(-14, 19, -3, 14, 20, 3, "terracotta");
   v.box(-13, 20, -2, 13, 21, 2, "brickDark");
   v.box(-1, 21, -1, 1, 23, 1, "iron");
   v.box(-1, 22, 1, 1, 24, 3, "warmGlow", 1.45);
 
-  // Cozy flower cushions tucked beside stone base
   v.sphere(-14, 1.5, 2, 1.8, 1.2, 1.6, "leaf");
   v.sphere(14, 1.5, 2, 1.8, 1.2, 1.6, "leafLight");
   v.clear(-18, -3, -8, 18, 0, 8);
@@ -100,7 +146,6 @@ function createContributorSignboard(maxAniso = 4) {
 
   group.add(buildVoxelMesh(v, { scale: s }));
 
-  // Crisp high-DPI CanvasTexture plaque on front & back faces
   const canvas = document.createElement("canvas");
   canvas.width = 512;
   canvas.height = 280;
@@ -136,17 +181,14 @@ function createContributorSignboard(maxAniso = 4) {
 
     ctx.clearRect(0, 0, 512, 280);
 
-    // Timber outer border
     roundRectPath(ctx, 4, 4, 504, 272, 22);
     ctx.fillStyle = "#5c3b20";
     ctx.fill();
 
-    // Warm cream enamel sign face
     roundRectPath(ctx, 18, 18, 476, 244, 14);
     ctx.fillStyle = "#fcf7ea";
     ctx.fill();
 
-    // Subtle brass pin-stripe + 4 corner rivets
     roundRectPath(ctx, 28, 28, 456, 224, 10);
     ctx.strokeStyle = "#d3a14a";
     ctx.lineWidth = 3.5;
@@ -159,19 +201,16 @@ function createContributorSignboard(maxAniso = 4) {
       ctx.fill();
     }
 
-    // Header
     ctx.fillStyle = "#6b4f35";
-    ctx.font = "800 28px -apple-system, BlinkMacSystemFont, 'Inter', sans-serif";
+    ctx.font = "800 30px -apple-system, BlinkMacSystemFont, 'Inter', sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText("VOXEL MEADOW", 256, 66);
+    ctx.fillText("GEMINISLAND", 256, 66);
 
-    // Big contributor count numeral
     ctx.fillStyle = "#18211b";
     ctx.font = "800 104px -apple-system, BlinkMacSystemFont, 'Inter', sans-serif";
     ctx.fillText(String(n), 256, 148);
 
-    // Concise bottom line
     ctx.fillStyle = "#267043";
     ctx.font = "800 32px -apple-system, BlinkMacSystemFont, 'Inter', sans-serif";
     ctx.fillText(n === 1 ? "CONTRIBUTOR" : "CONTRIBUTORS", 256, 220);
@@ -181,6 +220,7 @@ function createContributorSignboard(maxAniso = 4) {
 
   updateCount(0);
   group.position.set(CITY_SIGN_POS[0], 0, CITY_SIGN_POS[1]);
+  group.position.y = 0;
   group.rotation.y = CITY_SIGN_YAW;
 
   return { group, updateCount };
@@ -189,8 +229,8 @@ function createContributorSignboard(maxAniso = 4) {
 function buildPlotMarkerGroup() {
   const group = new THREE.Group();
 
-  // Crisp glowing ground plot ring
-  const ringGeo = new THREE.RingGeometry(2.35, 2.78, 48);
+  // Unit-radius ring (0.90..1.04) scaled dynamically by plot radius (1.45m tiny -> 9.8m colossal!)
+  const ringGeo = new THREE.RingGeometry(0.9, 1.04, 64);
   ringGeo.rotateX(-Math.PI / 2);
   const ringMat = new THREE.MeshBasicMaterial({
     color: 0xffffff,
@@ -205,31 +245,33 @@ function buildPlotMarkerGroup() {
   ring.position.y = 0.122;
   group.add(ring);
 
-  // 4 chunky voxel corner stakes (oak + brass cap)
-  const stakeVox = new Vox(931);
-  for (const [sx, sz] of [[-8, -8], [7, -8], [-8, 7], [7, 7]]) {
-    stakeVox.box(sx, 0, sz, sx + 2, 5, sz + 2, "woodDark");
-    stakeVox.box(sx, 5, sz, sx + 2, 6, sz + 2, "gold", 0.45);
+  // 4 independent corner stakes repositioned dynamically to match plot footprint
+  const singleStakeVox = new Vox(931);
+  singleStakeVox.box(-1, 0, -1, 1, 5, 1, "woodDark");
+  singleStakeVox.box(-1, 5, -1, 1, 6, 1, "gold", 0.45);
+  const stakeProto = buildVoxelMesh(singleStakeVox, { scale: 0.24 });
+  const stakeCorners = [];
+  for (let i = 0; i < 4; i++) {
+    const st = stakeProto.clone();
+    group.add(st);
+    stakeCorners.push(st);
   }
-  const stakesMesh = buildVoxelMesh(stakeVox, { scale: 0.22 });
-  group.add(stakesMesh);
 
-  // Construction scaffolding sub-group (shown while Argon builds in the background)
+  // Construction scaffolding sub-group (scales with plot radius while queued/sculpting)
   const scaffoldGroup = new THREE.Group();
   const scafVox = new Vox(947);
   for (const [sx, sz] of [[-9, -9], [8, -9], [-9, 8], [8, 8]]) {
     scafVox.box(sx, 0, sz, sx + 2, 16, sz + 2, "wood");
   }
-  // Crossbars
   scafVox.box(-9, 8, -9, 10, 9, -8, "hazard");
   scafVox.box(-9, 8, 9, 10, 9, 10, "hazard");
   scafVox.box(-9, 8, -9, -8, 9, 10, "hazard");
   scafVox.box(9, 8, -9, 10, 9, 10, "hazard");
   scafVox.box(-9, 15, -9, 10, 16, -8, "woodLight");
   scafVox.box(-9, 15, 9, 10, 16, 10, "woodLight");
-  scaffoldGroup.add(buildVoxelMesh(scafVox, { scale: 0.22 }));
+  const scafFrame = buildVoxelMesh(scafVox, { scale: 0.22 });
+  scaffoldGroup.add(scafFrame);
 
-  // Animated floating voxel blocks inside the worksite
   const floatingCubes = [];
   const cubeCols = ["busYellow", "teal", "terracotta"];
   for (let i = 0; i < 3; i++) {
@@ -243,7 +285,36 @@ function buildPlotMarkerGroup() {
   group.add(scaffoldGroup);
   group.visible = false;
 
-  return { group, ring, ringMat, scaffoldGroup, floatingCubes };
+  let baseRadius = 3.3;
+  function setPlotRadius(r) {
+    baseRadius = Math.max(1.3, Math.min(12.5, Number(r) || 3.3));
+    const corner = baseRadius * 0.7;
+    const signs = [
+      [-1, -1],
+      [1, -1],
+      [-1, 1],
+      [1, 1],
+    ];
+    for (let i = 0; i < 4; i++) {
+      stakeCorners[i].position.set(signs[i][0] * corner, 0, signs[i][1] * corner);
+      const stakeScale = Math.max(0.82, Math.min(1.55, 0.78 + baseRadius * 0.08));
+      stakeCorners[i].scale.setScalar(stakeScale);
+    }
+    const scafScaleXZ = Math.max(0.55, Math.min(2.85, baseRadius / 2.75));
+    const scafScaleY = Math.max(0.68, Math.min(2.1, 0.7 + baseRadius * 0.14));
+    scafFrame.scale.set(scafScaleXZ, scafScaleY, scafScaleXZ);
+  }
+  setPlotRadius(3.3);
+
+  return {
+    group,
+    ring,
+    ringMat,
+    scaffoldGroup,
+    floatingCubes,
+    setPlotRadius,
+    getPlotRadius: () => baseRadius,
+  };
 }
 
 const FEED_DOT_COLORS = {
@@ -294,6 +365,8 @@ function buildEndlessGrassMaterial(uniforms) {
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.uTime = uniforms.uTime;
     shader.uniforms.uFocusXZ = uniforms.uFocusXZ;
+    shader.uniforms.uZones = uniforms.uZones;
+    shader.uniforms.uZoneCount = uniforms.uZoneCount;
     shader.vertexShader = shader.vertexShader
       .replace(
         "#include <common>",
@@ -311,6 +384,8 @@ function buildEndlessGrassMaterial(uniforms) {
         `#include <common>
         uniform float uTime;
         uniform vec2 uFocusXZ;
+        uniform vec4 uZones[${MAX_SHADER_ZONES}];
+        uniform int uZoneCount;
         varying vec3 vWorldPos;
 
         vec3 srgb2lin(float r, float g, float b) {
@@ -340,6 +415,7 @@ function buildEndlessGrassMaterial(uniforms) {
         vec2 tileCoord = wp / TILE;
         vec2 cell = floor(tileCoord);
         vec2 cellUv = fract(tileCoord);
+        vec2 cellCenter = (cell + 0.5) * TILE;
 
         float tilePx = max(fwidth(tileCoord.x), fwidth(tileCoord.y));
         float tileDetail = 1.0 - smoothstep(0.06, 0.20, tilePx);
@@ -352,12 +428,68 @@ function buildEndlessGrassMaterial(uniforms) {
         float meadowZone = mNoise(wp * 0.028);
         float subZone = mNoise(wp * 0.085 + vec2(19.4, -11.2));
         float cellH = mHash(cell);
+        float cellH2 = mHash(cell + vec2(37.2, -91.7));
         vec2 terraceBlock = floor(cell * 0.25);
         float lawnCheck = mod(terraceBlock.x + terraceBlock.y, 2.0);
 
         vec3 grassCol = mix(turfDeep, turfBase, smoothstep(0.20, 0.68, meadowZone));
         grassCol = mix(grassCol, turfMid, smoothstep(0.42, 0.85, subZone) * 0.72);
         grassCol = mix(grassCol, turfSun, smoothstep(0.68, 0.96, meadowZone * 0.6 + subZone * 0.4) * 0.45);
+
+        // Organic voxel-stepped ground biome zones (stepped per voxel cell so borders look crisp & blocky!)
+        float borderWarp = (mNoise(cellCenter * 0.15) - 0.5) * 4.2 + (mNoise(cellCenter * 0.37 + 11.3) - 0.5) * 1.8;
+        float volcanicGlowMask = 0.0;
+
+        for (int i = 0; i < ${MAX_SHADER_ZONES}; i++) {
+          if (i >= uZoneCount) break;
+          vec4 zn = uZones[i];
+          float d = length(cellCenter - zn.xy) + borderWarp;
+          float w = 1.0 - smoothstep(zn.z * 0.62, zn.z * 1.06, d);
+          if (w > 0.01) {
+            int bId = int(zn.w + 0.5);
+            vec3 bCol = grassCol;
+            if (bId == 1) {
+              // 1: meadow_clover — lush emerald clover + wildflower pixels
+              bCol = mix(srgb2lin(86.0, 168.0, 68.0), srgb2lin(118.0, 196.0, 82.0), subZone);
+              if (cellH2 > 0.91) {
+                bCol = cellH > 0.5 ? srgb2lin(249.0, 214.0, 92.0) : srgb2lin(242.0, 148.0, 184.0);
+              }
+            } else if (bId == 2) {
+              // 2: sandy_shore — sunlit coastal golden sand & shell flecks
+              bCol = mix(srgb2lin(224.0, 194.0, 134.0), srgb2lin(242.0, 221.0, 168.0), subZone);
+              if (cellH2 > 0.93) bCol = srgb2lin(250.0, 243.0, 224.0);
+            } else if (bId == 3) {
+              // 3: misty_moss — deep damp forest moss, fern turf & river stones
+              bCol = mix(srgb2lin(68.0, 126.0, 69.0), srgb2lin(92.0, 152.0, 82.0), subZone);
+              if (cellH2 > 0.86) bCol = srgb2lin(116.0, 125.0, 122.0);
+            } else if (bId == 4) {
+              // 4: volcanic_basalt — scorched obsidian rock, ash & glowing magma fissures
+              bCol = mix(srgb2lin(42.0, 44.0, 52.0), srgb2lin(66.0, 64.0, 72.0), subZone);
+              float crackField = abs(mNoise(cellCenter * 0.28 + vec2(4.2, -8.1)) - 0.5);
+              if (crackField < 0.055 && d < zn.z * 0.85) {
+                float pulse = 0.72 + 0.28 * sin(uTime * 2.6 + cellH * 6.28);
+                bCol = mix(srgb2lin(235.0, 78.0, 28.0), srgb2lin(255.0, 174.0, 48.0), pulse);
+                volcanicGlowMask = max(volcanicGlowMask, w * pulse);
+              }
+            } else if (bId == 5) {
+              // 5: snow_frost — crisp alpine snow & pale glacier blue
+              bCol = mix(srgb2lin(222.0, 236.0, 248.0), srgb2lin(247.0, 251.0, 255.0), subZone);
+            } else if (bId == 6) {
+              // 6: stone_plaza — warm sandstone & limestone courtyard pavers
+              float checker = mod(cell.x + cell.y, 2.0);
+              bCol = mix(srgb2lin(202.0, 190.0, 168.0), srgb2lin(224.0, 214.0, 194.0), checker * 0.65 + subZone * 0.35);
+            } else if (bId == 7) {
+              // 7: autumn_grove — golden-amber & russet fallen leaf carpet
+              bCol = mix(srgb2lin(182.0, 124.0, 56.0), srgb2lin(218.0, 158.0, 68.0), subZone);
+              if (cellH2 > 0.82) bCol = srgb2lin(174.0, 78.0, 52.0);
+              else if (cellH2 < 0.22) bCol = srgb2lin(116.0, 162.0, 72.0);
+            } else if (bId == 8) {
+              // 8: desert_mesa — red-ochre canyon earth & terracotta sand
+              bCol = mix(srgb2lin(198.0, 114.0, 68.0), srgb2lin(224.0, 152.0, 96.0), subZone);
+            }
+            grassCol = mix(grassCol, bCol, w);
+          }
+        }
 
         float blockTone = (floor(cellH * 4.0) / 3.0 - 0.5) * 0.075 + (lawnCheck - 0.5) * 0.028;
         grassCol *= 1.0 + blockTone * tileDetail;
@@ -366,7 +498,7 @@ function buildEndlessGrassMaterial(uniforms) {
         float minEdge = min(edgeDist.x, edgeDist.y);
         float seamW = max(0.042, tilePx * 1.35);
         float seam = smoothstep(0.0, seamW, minEdge);
-        grassCol *= mix(1.0 - 0.08 * tileDetail, 1.0, seam);
+        grassCol *= mix(1.0 - 0.085 * tileDetail, 1.0, seam);
 
         float topLip = (1.0 - smoothstep(0.0, 0.14, cellUv.y)) * seam;
         grassCol += grassCol * topLip * 0.045 * tileDetail;
@@ -380,9 +512,16 @@ function buildEndlessGrassMaterial(uniforms) {
         grassCol = mix(grassCol, horizonMist, smoothstep(185.0, 480.0, distFocus) * 0.58);
 
         diffuseColor.rgb = grassCol;`,
+      )
+      .replace(
+        "#include <emissivemap_fragment>",
+        `#include <emissivemap_fragment>
+        if (volcanicGlowMask > 0.01) {
+          totalEmissiveRadiance += srgb2lin(255.0, 102.0, 28.0) * (volcanicGlowMask * 0.85);
+        }`,
       );
   };
-  mat.customProgramCacheKey = () => "endless-meadow-voxel-turf-v2";
+  mat.customProgramCacheKey = () => "geminisland-voxel-biomes-v3";
   return mat;
 }
 
@@ -477,7 +616,7 @@ function buildRibbonMesh(
 
   const mat = new THREE.MeshStandardMaterial({
     color: colorHex,
-    roughness: 0.86,
+    roughness: 0.88,
     metalness: 0.02,
     polygonOffset: true,
     polygonOffsetFactor: polyOffset,
@@ -547,16 +686,19 @@ class CreationSimEntity {
     this.moveFactor = 0;
     this.spawnScale = creation.isSeed ? 1.0 : 0.05;
 
-    // Height estimate for optional live-feed badge
-    const worldUnit = creation.scaleClass === "large" ? 0.34 : creation.scaleClass === "medium" ? 0.24 : 0.18;
-    this.topY = Math.max(2.2, (creation.blueprint?.stats?.maxY || 14) * worldUnit);
+    const worldUnit = getWorldVoxelSize(creation.scaleClass);
+    this.footprintRadius = getCreationFootprintRadius(
+      creation.scaleClass,
+      creation.blueprint?.stats?.footprintX ?? 14,
+      creation.blueprint?.stats?.footprintZ ?? 14,
+    );
+    this.topY = Math.max(1.8, (creation.blueprint?.stats?.maxY || 14) * worldUnit);
     this.feedReading = null;
     this.feedBadgeText = "";
     this.feedCanvas = null;
     this.feedTex = null;
     this.feedMesh = null;
 
-    // Transit / Vehicle curve state
     this.routeCurve = null;
     this.routeLength = 1;
     this.routeDist = (index * 13.7) % 40;
@@ -567,18 +709,15 @@ class CreationSimEntity {
     this.doorX = this.x;
     this.doorZ = this.z;
 
-    // 3D Flight spline state
     this.flightCurve = null;
     this.flightLength = 1;
     this.flightDist = (index * 19.3) % 60;
     this.bankRoll = 0;
 
-    // Wander state
     this.wanderIdx = 0;
     this.wanderPause = (index * 1.3) % 2.5;
     this.hopPhase = 0;
 
-    // Orbit / Float phase
     this.orbitAngle = (index * 1.9) % (Math.PI * 2);
 
     this.rebuildBehavior(creation);
@@ -621,10 +760,19 @@ class CreationSimEntity {
   }
 
   rebuildBehavior(creation, creationsGroup = null) {
+    const wasStationary = this.data?.behavior?.type === "landmark";
     this.data = creation;
+    this.footprintRadius = getCreationFootprintRadius(
+      creation.scaleClass,
+      creation.blueprint?.stats?.footprintX ?? 14,
+      creation.blueprint?.stats?.footprintZ ?? 14,
+    );
+    if (wasStationary && creation.behavior?.type === "landmark") {
+      this.x = creation.x;
+      this.z = creation.z;
+    }
     const nextSig = computeBlueprintSignature(creation.blueprint);
     if (creationsGroup && nextSig && nextSig !== this.blueprintSig) {
-      // Live hot-swap when the orchestrator auto-repairs a creation's blueprint!
       this.blueprintSig = nextSig;
       if (this.feedMesh) {
         this.group.remove(this.feedMesh);
@@ -636,8 +784,8 @@ class CreationSimEntity {
         useWorldScale: true,
       });
       this.group.rotation.order = "YXZ";
-      const worldUnit = creation.scaleClass === "large" ? 0.34 : creation.scaleClass === "medium" ? 0.24 : 0.18;
-      this.topY = Math.max(2.2, (creation.blueprint?.stats?.maxY || 14) * worldUnit);
+      const worldUnit = getWorldVoxelSize(creation.scaleClass);
+      this.topY = Math.max(1.8, (creation.blueprint?.stats?.maxY || 14) * worldUnit);
       if (this.feedMesh) {
         this.feedMesh.position.set(0, this.topY + 1.15, 0);
         this.group.add(this.feedMesh);
@@ -806,11 +954,10 @@ class CreationSimEntity {
               }
             }
           }
-          // Steer cleanly around stationary landmark buildings so roaming creatures never walk through walls
           for (const other of allEntities) {
             if (other === this) continue;
             if (other.data.category !== "building" && other.data.behavior?.type !== "landmark") continue;
-            const br = other.data.scaleClass === "large" ? 5.6 : 4.2;
+            const br = (other.footprintRadius || 4.0) + 1.1;
             const bdx = this.x - other.x;
             const bdz = this.z - other.z;
             const bd = Math.hypot(bdx, bdz);
@@ -947,7 +1094,8 @@ class CreationSimEntity {
   }
 }
 
-export function createMeadowWorldEngine(canvas, callbacks = {}) {
+export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
+  const ogMode = Boolean(options.ogMode);
   const scene = new THREE.Scene();
   scene.background = makeMeadowSkyTexture();
 
@@ -958,6 +1106,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     canvas,
     antialias: true,
     powerPreference: "high-performance",
+    preserveDrawingBuffer: ogMode,
   });
   const gl = renderer.getContext();
   const dbg = gl.getExtension("WEBGL_debug_renderer_info");
@@ -980,7 +1129,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     BASE_FRUSTUM,
     -BASE_FRUSTUM,
     18,
-    520,
+    560,
   );
 
   const composer = isSoftwareGpu ? null : new EffectComposer(renderer);
@@ -1010,7 +1159,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
 
   // Sunlit Golden-Hour Directional Key Light with Camera-Tracking Texel-Snapped Shadows
   const SUN_OFFSET = new THREE.Vector3(64, 118, 76);
-  const SHADOW_HALF = 68;
+  const SHADOW_HALF = 86;
   const SHADOW_RES = isSoftwareGpu ? 1024 : 4096;
   const sun = new THREE.DirectionalLight(0xfff3db, 2.25);
   sun.position.copy(SUN_OFFSET);
@@ -1021,7 +1170,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
   sun.shadow.camera.top = SHADOW_HALF;
   sun.shadow.camera.bottom = -SHADOW_HALF;
   sun.shadow.camera.near = 10;
-  sun.shadow.camera.far = 320;
+  sun.shadow.camera.far = 360;
   sun.shadow.bias = -0.00035;
   sun.shadow.normalBias = 0.028;
   sun.shadow.radius = 2.0;
@@ -1035,10 +1184,12 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
   rim.position.set(-85, 70, -90);
   scene.add(rim);
 
-  // Endless Voxel Turf Ground Plane
+  // Endless Voxel Turf + Multi-Biome Ground Plane
   const grassUniforms = {
     uTime: { value: 0 },
     uFocusXZ: { value: new THREE.Vector2(0, 0) },
+    uZones: { value: Array.from({ length: MAX_SHADER_ZONES }, () => new THREE.Vector4(0, 0, 0, 0)) },
+    uZoneCount: { value: 0 },
   };
   const groundGeo = new THREE.PlaneGeometry(3600, 3600, 1, 1);
   groundGeo.rotateX(-Math.PI / 2);
@@ -1046,15 +1197,15 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
   groundMesh.receiveShadow = true;
   scene.add(groundMesh);
 
-  // Physical 3D City Contributor Signboard on the central village green
   const citySignboard = createContributorSignboard(maxAniso);
   scene.add(citySignboard.group);
 
-  // Scattered scenic perimeter Meadow Groves
+  // Scattered scenic perimeter Meadow Groves (auto-hidden when a new creation claims that clearing!)
   const perimeterTreesGroup = new THREE.Group();
   scene.add(perimeterTreesGroup);
   const treeProtos = [buildMeadowTreeMesh(0), buildMeadowTreeMesh(1), buildMeadowTreeMesh(2)];
   const bushProtos = [buildMeadowBushMesh(0), buildMeadowBushMesh(1), buildMeadowBushMesh(2)];
+  const perimeterScenery = [];
   for (let i = 0; i < 46; i++) {
     const r = 44 + ((i * 19) % 92);
     const ang = i * 2.399963 + 0.4;
@@ -1066,16 +1217,21 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     const sc = 0.85 + (i % 4) * 0.14;
     tree.scale.setScalar(sc);
     perimeterTreesGroup.add(tree);
+    perimeterScenery.push({ mesh: tree, x: tx, z: tz });
 
     if (i % 2 === 0) {
       const bush = bushProtos[i % 3].clone();
       const bAng = ang + 0.05;
-      bush.position.set(tx + Math.cos(bAng * 7) * 2.4, 0, tz + Math.sin(bAng * 5) * 2.4);
+      const bx = tx + Math.cos(bAng * 7) * 2.4;
+      const bz = tz + Math.sin(bAng * 5) * 2.4;
+      bush.position.set(bx, 0, bz);
       bush.rotation.y = (i * 2.3) % (Math.PI * 2);
       perimeterTreesGroup.add(bush);
+      perimeterScenery.push({ mesh: bush, x: bx, z: bz });
     }
   }
 
+  // Shared voxel prototypes for the 6 path styles
   const flagstoneProtos = [0, 1, 2].map((variant) => {
     const fv = new Vox(410 + variant * 17);
     const cMain = variant === 0 ? "limestone" : variant === 1 ? "path" : "cream";
@@ -1086,14 +1242,48 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     return buildVoxelMesh(fv, { scale: 0.24, castShadow: false, depthLayer: 1 });
   });
 
+  const dirtPebbleProtos = [0, 1, 2].map((variant) => {
+    const pv = new Vox(450 + variant * 13);
+    pv.box(-1, 0, -1, 1, 1, 1, variant === 0 ? "stone" : variant === 1 ? "path2" : "moss");
+    if (variant === 0) pv.put(1, 0, 0, "concrete2");
+    return buildVoxelMesh(pv, { scale: 0.2, castShadow: false, depthLayer: 1 });
+  });
+
+  const cobbleProtos = [0, 1, 2].map((variant) => {
+    const cv = new Vox(490 + variant * 19);
+    const cA = variant === 0 ? "concrete" : variant === 1 ? "limestone" : "path";
+    const cB = variant === 0 ? "concrete2" : variant === 1 ? "stone" : "path2";
+    cv.box(-3, 0, -2, 0, 1, 1, cA);
+    cv.box(1, 0, -2, 3, 1, 2, cB);
+    cv.box(-2, 0, 1, 1, 1, 2, cB);
+    return buildVoxelMesh(cv, { scale: 0.23, castShadow: false, depthLayer: 2 });
+  });
+
+  const boardwalkPlankProtos = [0, 1].map((variant) => {
+    const bv = new Vox(530 + variant * 11);
+    const plankCol = variant === 0 ? "oak" : "woodLight";
+    bv.box(-5, 1, -1, 5, 2, 2, plankCol);
+    bv.box(-5, 0, -1, -4, 1, 2, "woodDark");
+    bv.box(4, 0, -1, 5, 1, 2, "woodDark");
+    return buildVoxelMesh(bv, { scale: 0.22, castShadow: true, depthLayer: 2 });
+  });
+
+  const volcanicStepProtos = [0, 1].map((variant) => {
+    const vv = new Vox(570 + variant * 17);
+    vv.box(-2, 0, -2, 2, 1, 2, "basalt");
+    vv.put(variant === 0 ? -2 : 1, 0, 0, "ash");
+    vv.put(0, 0, variant === 0 ? 1 : -1, "lava", 1.15);
+    return buildVoxelMesh(vv, { scale: 0.24, castShadow: false, depthLayer: 2 });
+  });
+
   const pathsGroup = new THREE.Group();
   const propsGroup = new THREE.Group();
   const creationsGroup = new THREE.Group();
   const villagersGroup = new THREE.Group();
   scene.add(pathsGroup, propsGroup, creationsGroup, villagersGroup);
 
-  // Highlight Halo for "My Creation" or Selected Creation
-  const haloGeo = new THREE.RingGeometry(2.7, 3.15, 48);
+  // Unit-radius Highlight Halo (scaled dynamically to match tiny vs colossal creation footprints!)
+  const haloGeo = new THREE.RingGeometry(0.92, 1.06, 64);
   haloGeo.rotateX(-Math.PI / 2);
   const haloMat = new THREE.MeshBasicMaterial({
     color: 0xfff7c2,
@@ -1109,17 +1299,18 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
   selectionHalo.visible = false;
   scene.add(selectionHalo);
 
-  // 3D Plot Marker + Live Construction Worksite
   const plotMarker = buildPlotMarkerGroup();
   scene.add(plotMarker.group);
 
   let spotState = { mode: "hidden", x: 16, z: 10 };
+  let previewPlotRadius = 3.3;
   let liveFeedsById = {};
 
   const creationEntities = new Map();
   const villagerAgents = new Map();
   let currentWorld = null;
   let highlightedId = null;
+  let ogSettledFrames = 0;
 
   const cam = {
     tx: 0,
@@ -1140,16 +1331,24 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     cam.goalTz = Math.max(-CLAMP_BOUND, Math.min(CLAMP_BOUND, cam.goalTz));
   }
 
-  function isClientSpotClear(x, z) {
-    if (Math.abs(x) > 130 || Math.abs(z) > 130) return false;
-    if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < 5.0) return false;
+  function isClientSpotClear(x, z, candidateRadius = previewPlotRadius) {
+    const rNew = Math.max(1.3, Number(candidateRadius) || 3.3);
+    const bound = Math.max(112, 138 - rNew);
+    if (Math.abs(x) > bound || Math.abs(z) > bound) return false;
+    if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < rNew + 2.8) return false;
     if (!currentWorld) return true;
     for (const c of currentWorld.creations || []) {
-      const sep = c.category === "building" ? 9.5 : 6.2;
-      if (Math.hypot(x - c.x, z - c.z) < sep) return false;
+      if (c.category === "aircraft" || c.behavior?.type === "fly_circle") continue;
+      if (c.category === "watercraft" || c.behavior?.type === "water_float") continue;
+      const otherR = getCreationFootprintRadius(
+        c.scaleClass,
+        c.blueprint?.stats?.footprintX ?? 14,
+        c.blueprint?.stats?.footprintZ ?? 14,
+      );
+      if (Math.hypot(x - c.x, z - c.z) < rNew + otherR + 1.8) return false;
     }
     for (const pr of currentWorld.props || []) {
-      if (pr.kind === "pond" && Math.hypot(x - pr.x, z - pr.z) < (pr.radius || 6.5) + 3.8) {
+      if (pr.kind === "pond" && Math.hypot(x - pr.x, z - pr.z) < (pr.radius || 6.5) + rNew + 1.4) {
         return false;
       }
     }
@@ -1159,29 +1358,45 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
         const a = p.points[i];
         const b = p.points[(i + 1) % p.points.length];
         if (!p.closed && i === p.points.length - 1) break;
-        if (distToSeg2D(x, z, a[0], a[1], b[0], b[1]) < 5.2) return false;
+        if (distToSeg2D(x, z, a[0], a[1], b[0], b[1]) < rNew + 2.5) return false;
       }
     }
     return true;
   }
 
-  function snapToClearMeadowSpot(rawX, rawZ) {
-    const cx = Math.max(-128, Math.min(128, rawX));
-    const cz = Math.max(-128, Math.min(128, rawZ));
-    if (isClientSpotClear(cx, cz)) {
+  function snapToClearMeadowSpot(rawX, rawZ, candidateRadius = previewPlotRadius) {
+    const cx = Math.max(-132, Math.min(132, rawX));
+    const cz = Math.max(-132, Math.min(132, rawZ));
+    if (isClientSpotClear(cx, cz, candidateRadius)) {
       return [Number(cx.toFixed(1)), Number(cz.toFixed(1))];
     }
-    for (let r = 2.5; r <= 38; r += 2.2) {
-      for (let k = 0; k < 16; k++) {
-        const ang = (k / 16) * Math.PI * 2;
+    const baseAng = Math.atan2(cz, cx);
+    for (let r = 2.5; r <= 78; r += 2.6) {
+      for (let k = 0; k < 20; k++) {
+        const ang = baseAng + (k / 20) * Math.PI * 2;
         const tx = cx + Math.cos(ang) * r;
         const tz = cz + Math.sin(ang) * r;
-        if (isClientSpotClear(tx, tz)) {
+        if (isClientSpotClear(tx, tz, candidateRadius)) {
           return [Number(tx.toFixed(1)), Number(tz.toFixed(1))];
         }
       }
     }
     return [Number(cx.toFixed(1)), Number(cz.toFixed(1))];
+  }
+
+  function setPreviewPrompt(promptText) {
+    const nextR = estimatePreviewPlotRadius(promptText);
+    previewPlotRadius = nextR;
+    plotMarker.setPlotRadius(nextR);
+    if (spotState.mode === "staked" || spotState.mode === "picking") {
+      if (!isClientSpotClear(spotState.x, spotState.z, nextR)) {
+        const [sx, sz] = snapToClearMeadowSpot(spotState.x, spotState.z, nextR);
+        spotState.x = sx;
+        spotState.z = sz;
+        plotMarker.group.position.set(sx, 0, sz);
+        callbacks.onAutoNudgeSpot?.(sx, sz);
+      }
+    }
   }
 
   const raycaster = new THREE.Raycaster();
@@ -1208,10 +1423,10 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
       z: CITY_SIGN_POS[1],
       data: {
         id: "__city_sign__",
-        name: "Meadow Town Sign",
-        description: `${n} ${n === 1 ? "person has" : "people have"} contributed (${total} creations in the world)`,
+        name: "GeminIsland Sign",
+        description: `${n} ${n === 1 ? "person has" : "people have"} contributed (${total} creations on the island)`,
         behavior: {
-          statusLine: `${n} ${n === 1 ? "person has" : "people have"} contributed to Voxel Meadow`,
+          statusLine: `${n} ${n === 1 ? "person has" : "people have"} contributed to GeminIsland`,
         },
       },
     };
@@ -1226,15 +1441,57 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     }
 
     let best = null;
-    let bestD = 4.6;
+    let bestScore = Infinity;
     for (const ent of creationEntities.values()) {
+      const hitRadius = Math.max(4.4, (ent.footprintRadius || 3.5) + 1.2);
       const d = Math.hypot(ent.x - g[0], ent.z - g[1]);
-      if (d < bestD) {
-        bestD = d;
+      if (d < hitRadius && d < bestScore) {
+        bestScore = d;
         best = ent;
       }
     }
     return best;
+  }
+
+  function updateBiomeShaderUniforms(zones) {
+    const list = Array.isArray(zones) ? zones.slice(0, MAX_SHADER_ZONES) : [];
+    let count = 0;
+    for (let i = 0; i < MAX_SHADER_ZONES; i++) {
+      const vec = grassUniforms.uZones.value[i];
+      const zItem = list[i];
+      if (zItem && BIOME_IDS[zItem.biome]) {
+        vec.set(
+          Number(zItem.x) || 0,
+          Number(zItem.z) || 0,
+          Math.max(4.0, Number(zItem.radius) || 9.0),
+          BIOME_IDS[zItem.biome],
+        );
+        count++;
+      } else {
+        vec.set(0, 0, 0, 0);
+      }
+    }
+    grassUniforms.uZoneCount.value = count;
+  }
+
+  function updatePerimeterTreeClearance(world) {
+    const creations = world?.creations || [];
+    for (const item of perimeterScenery) {
+      let blocked = false;
+      for (const c of creations) {
+        if (c.category === "aircraft" || c.behavior?.type === "fly_circle") continue;
+        const fr = getCreationFootprintRadius(
+          c.scaleClass,
+          c.blueprint?.stats?.footprintX ?? 14,
+          c.blueprint?.stats?.footprintZ ?? 14,
+        );
+        if (Math.hypot(item.x - c.x, item.z - c.z) < fr + 3.0) {
+          blocked = true;
+          break;
+        }
+      }
+      item.mesh.visible = !blocked;
+    }
   }
 
   function rebuildPathsAndProps(world) {
@@ -1258,9 +1515,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
       const vecs = p.points.map(([x, z]) => new THREE.Vector3(x, 0, z));
       const curve = new THREE.CatmullRomCurve3(vecs, Boolean(p.closed), "centripetal", 0.5);
       const len = Math.max(4, curve.getLength());
+      const samples = Math.min(200, Math.max(28, Math.round(len * 1.4)));
 
       if (p.kind === "road") {
-        const samples = Math.min(200, Math.max(36, Math.round(len * 1.4)));
         pathsGroup.add(buildRibbonMesh(curve, samples, 2.52, 0.052, "#dfd7c5", true, -1));
         pathsGroup.add(buildRibbonMesh(curve, samples, 2.1, 0.088, "#4b505c", true, -2));
 
@@ -1281,7 +1538,68 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
           dash.rotation.y = Math.atan2(tan.x, tan.z);
           pathsGroup.add(dash);
         }
+      } else if (p.kind === "dirt_trail") {
+        // Warm country dirt road / forest trail with soft sandy-loam edge & scattered border pebbles
+        pathsGroup.add(buildRibbonMesh(curve, samples, 1.48, 0.042, "#b58b5e", true, -1));
+        pathsGroup.add(buildRibbonMesh(curve, samples, 1.08, 0.068, "#8e6239", true, -2));
+
+        const pebbleCount = Math.max(3, Math.floor(len / 2.2));
+        for (let i = 0; i <= pebbleCount; i++) {
+          const u = i / pebbleCount;
+          const pt = curve.getPointAt(u);
+          const tan = curve.getTangentAt(u);
+          const side = i % 2 === 0 ? 1 : -1;
+          const nx = -tan.z * side;
+          const nz = tan.x * side;
+          const pebble = dirtPebbleProtos[i % dirtPebbleProtos.length].clone();
+          pebble.userData.sharedProto = true;
+          pebble.position.set(pt.x + nx * 1.25, -0.14, pt.z + nz * 1.25);
+          pebble.rotation.y = (i * 1.9) % (Math.PI * 2);
+          pathsGroup.add(pebble);
+        }
+      } else if (p.kind === "cobblestone") {
+        // Old-world stone cobble lane with warm mortar ribbon + irregular stone clusters
+        pathsGroup.add(buildRibbonMesh(curve, samples, 1.32, 0.045, "#a39a8b", true, -1));
+        const cobbleCount = Math.max(4, Math.floor(len / 1.15));
+        for (let i = 0; i <= cobbleCount; i++) {
+          const u = i / cobbleCount;
+          const pt = curve.getPointAt(u);
+          const tan = curve.getTangentAt(u);
+          const cob = cobbleProtos[i % cobbleProtos.length].clone();
+          cob.userData.sharedProto = true;
+          cob.position.set(pt.x, -0.155, pt.z);
+          cob.rotation.y = Math.atan2(tan.x, tan.z) + (i % 2 === 0 ? 0.05 : -0.05);
+          pathsGroup.add(cob);
+        }
+      } else if (p.kind === "boardwalk") {
+        // Raised timber plank boardwalk for beaches, ponds, lagoons & waterfalls
+        const plankCount = Math.max(4, Math.floor(len / 0.92));
+        for (let i = 0; i <= plankCount; i++) {
+          const u = i / plankCount;
+          const pt = curve.getPointAt(u);
+          const tan = curve.getTangentAt(u);
+          const plank = boardwalkPlankProtos[i % boardwalkPlankProtos.length].clone();
+          plank.userData.sharedProto = true;
+          plank.position.set(pt.x, -0.18, pt.z);
+          plank.rotation.y = Math.atan2(tan.x, tan.z);
+          pathsGroup.add(plank);
+        }
+      } else if (p.kind === "volcanic_trail") {
+        // Charred obsidian basalt path with warm glowing ember stones
+        pathsGroup.add(buildRibbonMesh(curve, samples, 1.38, 0.048, "#2b2d36", true, -1));
+        const stepCount = Math.max(3, Math.floor(len / 1.45));
+        for (let i = 0; i <= stepCount; i++) {
+          const u = i / stepCount;
+          const pt = curve.getPointAt(u);
+          const tan = curve.getTangentAt(u);
+          const st = volcanicStepProtos[i % volcanicStepProtos.length].clone();
+          st.userData.sharedProto = true;
+          st.position.set(pt.x, -0.16, pt.z);
+          st.rotation.y = Math.atan2(tan.x, tan.z) + (((i % 3) - 1) * 0.12);
+          pathsGroup.add(st);
+        }
       } else {
+        // Garden stepping flagstones
         const stoneCount = Math.max(3, Math.floor(len / 1.42));
         for (let i = 0; i <= stoneCount; i++) {
           const u = i / stoneCount;
@@ -1302,6 +1620,33 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     }
   }
 
+  function frameActiveWorldForOg() {
+    if (!currentWorld) return;
+    const creations = currentWorld.creations || [];
+    const userLandmarks = creations.filter((c) => !c.isSeed && c.behavior?.type === "landmark");
+    // Center on a blend of central village green and newest user landmarks so the daily card showcases the active built spot!
+    let cx = 0;
+    let cz = -3;
+    if (userLandmarks.length > 0) {
+      const latest = userLandmarks[userLandmarks.length - 1];
+      cx = latest.x * 0.42;
+      cz = latest.z * 0.42 - 2;
+      cx = Math.max(-28, Math.min(28, cx));
+      cz = Math.max(-28, Math.min(28, cz));
+    }
+    const aspect = Math.max(0.5, window.innerWidth / Math.max(1, window.innerHeight));
+    const zoom = aspect < 0.8 ? 0.92 : aspect < 1.15 ? 0.96 : 0.98;
+    cam.tx = cam.goalTx = cx;
+    cam.tz = cam.goalTz = cz;
+    cam.zoom = cam.goalZoom = zoom;
+    cam.az = cam.goalAz = 0.64;
+    cam.el = cam.goalEl = 0.64;
+    highlightedId = null;
+    for (const ent of creationEntities.values()) {
+      ent.spawnScale = 1.0;
+    }
+  }
+
   function applyLiveFeeds(feedsMap) {
     liveFeedsById = feedsMap || {};
     for (const [id, ent] of creationEntities.entries()) {
@@ -1316,6 +1661,8 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
         ? world.contributorCount
         : (world.creations || []).filter((c) => !c.isSeed).length;
     citySignboard.updateCount(contribCount);
+    updateBiomeShaderUniforms(world.terrainZones || []);
+    updatePerimeterTreeClearance(world);
     rebuildPathsAndProps(world);
 
     const seenIds = new Set();
@@ -1327,6 +1674,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
         existing.setLiveFeedReading(liveFeedsById[c.id] || null, maxAniso);
       } else {
         const ent = new CreationSimEntity(c, idx);
+        if (ogMode) ent.spawnScale = 1.0;
         ent.setLiveFeedReading(liveFeedsById[c.id] || null, maxAniso);
         creationEntities.set(c.id, ent);
         creationsGroup.add(ent.group);
@@ -1360,7 +1708,10 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
       }
     }
 
-    if (world.myCreationId && !highlightedId) {
+    if (ogMode) {
+      frameActiveWorldForOg();
+      ogSettledFrames = 0;
+    } else if (world.myCreationId && !highlightedId) {
       highlightedId = world.myCreationId;
     }
   }
@@ -1370,7 +1721,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     let nx = typeof next?.x === "number" ? next.x : spotState.x;
     let nz = typeof next?.z === "number" ? next.z : spotState.z;
     if (mode === "picking" && typeof next?.x !== "number") {
-      const def = snapToClearMeadowSpot(cam.goalTx + 14, cam.goalTz + 8);
+      const def = snapToClearMeadowSpot(cam.goalTx + 14, cam.goalTz + 8, previewPlotRadius);
       nx = def[0];
       nz = def[1];
     }
@@ -1414,7 +1765,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
   }
 
   function zoomAt(factor, clientX, clientY) {
-    const next = Math.min(3.4, Math.max(0.42, cam.goalZoom * factor));
+    const next = Math.min(3.4, Math.max(0.38, cam.goalZoom * factor));
     const p = screenToGround(clientX, clientY);
     if (p) {
       const k = 1 - cam.goalZoom / next;
@@ -1469,7 +1820,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     if (spotState.mode === "picking" && !pointerGesture) {
       const g = screenToGround(e.clientX, e.clientY);
       if (g) {
-        const snapped = snapToClearMeadowSpot(g[0], g[1]);
+        const snapped = snapToClearMeadowSpot(g[0], g[1], previewPlotRadius);
         spotState.x = snapped[0];
         spotState.z = snapped[1];
         plotMarker.group.position.set(snapped[0], 0, snapped[1]);
@@ -1521,7 +1872,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
         if (!pickedExisting) {
           const g = screenToGround(e.clientX, e.clientY);
           if (g) {
-            const [sx, sz] = snapToClearMeadowSpot(g[0], g[1]);
+            const [sx, sz] = snapToClearMeadowSpot(g[0], g[1], previewPlotRadius);
             spotState.x = sx;
             spotState.z = sz;
             plotMarker.group.position.set(sx, 0, sz);
@@ -1536,7 +1887,10 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
         if (picked.id !== "__city_sign__") {
           highlightedId = picked.id;
         }
-        focusOn(picked.x, picked.z, 1.55);
+        const scaleCls = picked.data?.scaleClass;
+        const targetZoom =
+          scaleCls === "colossal" ? 0.86 : scaleCls === "large" ? 1.28 : scaleCls === "tiny" ? 2.0 : 1.55;
+        focusOn(picked.x, picked.z, targetZoom);
         callbacks.onSelectCreation?.(picked.data, liveFeedsById[picked.id] || null);
       }
     }
@@ -1568,7 +1922,18 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     const altOffset = ent.y > 1 ? ent.y / Math.max(0.35, Math.tan(cam.el)) : 0;
     const projX = ent.x - Math.sin(cam.az) * altOffset;
     const projZ = ent.z - Math.cos(cam.az) * altOffset;
-    focusOn(projX, projZ, ent.y > 4 ? 1.25 : 1.65);
+    const scaleCls = ent.data?.scaleClass;
+    const zoom =
+      ent.y > 4
+        ? 1.22
+        : scaleCls === "colossal"
+          ? 0.86
+          : scaleCls === "large"
+            ? 1.28
+            : scaleCls === "tiny"
+              ? 2.05
+              : 1.62;
+    focusOn(projX, projZ, zoom);
   }
 
   function handleResize() {
@@ -1585,6 +1950,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
       composer.setSize(w, h);
       gtaoPass?.setSize(w, h);
       smaaPass?.setSize(w, h);
+    }
+    if (ogMode && currentWorld) {
+      frameActiveWorldForOg();
     }
   }
   window.addEventListener("resize", handleResize);
@@ -1642,7 +2010,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     grassUniforms.uFocusXZ.value.set(cam.tx, cam.tz);
     updateTexelSnappedSun(cam.tx, cam.tz);
 
-    // Step all creations & collect active transit vehicles + stationary obstacles for villager avoidance
     const allEnts = Array.from(creationEntities.values());
     const ponds = (currentWorld?.props || []).filter((p) => p.kind === "pond");
     const activeVehicles = [];
@@ -1656,23 +2023,23 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
         obstacles.push({
           x: ent.x,
           z: ent.z,
-          r: ent.data.scaleClass === "large" ? 5.2 : 3.8,
+          r: (ent.footprintRadius || 3.8) + 0.8,
         });
       }
     }
 
-    // Step all villagers with full personal-space & building avoidance
     const allVillagers = Array.from(villagerAgents.values());
     for (const ag of allVillagers) {
       ag.step(dt, t, activeVehicles, ponds, allVillagers, obstacles);
     }
 
-    if (highlightedId && creationEntities.has(highlightedId)) {
+    if (!ogMode && highlightedId && creationEntities.has(highlightedId)) {
       const myEnt = creationEntities.get(highlightedId);
       if (myEnt.y <= 2.5) {
         selectionHalo.visible = true;
         selectionHalo.position.set(myEnt.x, 0.122, myEnt.z);
-        selectionHalo.scale.setScalar(1 + Math.sin(t * 2.5) * 0.05);
+        const haloBase = Math.max(1.8, (myEnt.footprintRadius || 2.8) + 0.6);
+        selectionHalo.scale.setScalar(haloBase * (1 + Math.sin(t * 2.5) * 0.035));
       } else {
         selectionHalo.visible = false;
       }
@@ -1680,16 +2047,18 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
       selectionHalo.visible = false;
     }
 
-    // Animate 3D plot ring + live construction scaffolding
     if (plotMarker.group.visible) {
-      plotMarker.ring.scale.setScalar(1 + Math.sin(t * 3.2) * 0.045);
+      const baseR = plotMarker.getPlotRadius();
+      plotMarker.ring.scale.setScalar(baseR * (1 + Math.sin(t * 3.2) * 0.035));
       if (plotMarker.scaffoldGroup.visible) {
+        const orbitR = Math.max(0.75, Math.min(3.4, baseR * 0.36));
+        const orbitY = Math.max(1.0, Math.min(3.6, 0.9 + baseR * 0.22));
         plotMarker.floatingCubes.forEach((cube, idx) => {
           const ang = t * 2.2 + (idx * Math.PI * 2) / 3;
           cube.position.set(
-            Math.cos(ang) * 0.95,
-            1.15 + Math.sin(t * 3.8 + idx * 1.4) * 0.38,
-            Math.sin(ang) * 0.95,
+            Math.cos(ang) * orbitR,
+            orbitY + Math.sin(t * 3.8 + idx * 1.4) * 0.38,
+            Math.sin(ang) * orbitR,
           );
           cube.rotation.y = t * 1.8 + idx;
           cube.rotation.x = Math.sin(t * 2.1 + idx) * 0.35;
@@ -1699,6 +2068,13 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
 
     if (composer) composer.render();
     else renderer.render(scene, camera);
+
+    if (ogMode && currentWorld) {
+      ogSettledFrames++;
+      if (ogSettledFrames >= 6 && !window.__geminIslandOgReady) {
+        window.__geminIslandOgReady = true;
+      }
+    }
   }
   requestAnimationFrame(animate);
 
@@ -1706,9 +2082,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}) {
     applyWorldSnapshot,
     applyLiveFeeds,
     setSpotPickerState,
+    setPreviewPrompt,
     focusCreationById,
     focusOn,
     getCameraTarget: () => ({ x: cam.tx, z: cam.tz, zoom: cam.zoom }),
+    getPlotRadius: () => plotMarker.getPlotRadius(),
     isPointerActive: () => Boolean(pointerGesture),
     getCreationEntity: (id) => creationEntities.get(id) || null,
   };

@@ -65,11 +65,35 @@ function showToast(text, durationMs = 4200) {
 }
 
 function formatEta(seconds) {
-  const s = Math.max(2, Math.round(Number(seconds) || 15));
+  const s = Math.max(4, Math.round(Number(seconds) || 30));
   if (s < 60) return `~${s}s`;
   const m = Math.floor(s / 60);
   const rem = s % 60;
   return rem > 0 ? `~${m}m ${rem}s` : `~${m}m`;
+}
+
+function stepActiveJobEta() {
+  if (!activeJob) return;
+  const now = Date.now();
+  const dt = Math.min(2.5, Math.max(0, (now - (activeJob.lastFrameMs || now)) / 1000));
+  activeJob.lastFrameMs = now;
+  if (dt <= 0) return;
+
+  const pollAgeSec = Math.max(0, (now - (activeJob.syncedAtMs || now)) / 1000);
+  const serverAnchor = Math.max(4, Number(activeJob.etaSeconds) || 30);
+  const serverProjected =
+    serverAnchor > 16
+      ? Math.max(8, serverAnchor - pollAgeSec * 0.92)
+      : Math.max(4.5, serverAnchor - pollAgeSec * 0.35);
+
+  const disp = Number(activeJob.displayEtaSec) || serverAnchor;
+  if (disp > serverProjected + 0.6) {
+    const rate = Math.min(1.65, 0.9 + (disp - serverProjected) * 0.16);
+    activeJob.displayEtaSec = Math.max(serverProjected * 0.92, disp - rate * dt);
+  } else {
+    const tailRate = disp > 12 ? 0.52 : 0.2;
+    activeJob.displayEtaSec = Math.max(4.2, Math.max(serverProjected - 1.2, disp - tailRate * dt));
+  }
 }
 
 function renderActiveJobLabel() {
@@ -77,12 +101,13 @@ function renderActiveJobLabel() {
     buildingPillLabel.textContent = "Queueing…";
     return;
   }
-  const elapsedSec = Math.max(0, Math.floor((Date.now() - activeJob.syncedAtMs) / 1000));
-  const remSec = Math.max(3, (activeJob.etaSeconds || 18) - elapsedSec);
+  const remSec = Math.round(Number(activeJob.displayEtaSec ?? activeJob.etaSeconds) || 30);
   if (activeJob.status === "queued" && activeJob.position >= 1) {
     buildingPillLabel.textContent = `Queue #${activeJob.position} · ${formatEta(remSec)}`;
+  } else if (activeJob.phase === "refining") {
+    buildingPillLabel.textContent = remSec <= 5 ? "Polishing…" : `Polishing · ${formatEta(remSec)}`;
   } else {
-    buildingPillLabel.textContent = `Sculpting · ${formatEta(remSec)}`;
+    buildingPillLabel.textContent = remSec <= 5 ? "Finishing up…" : `Sculpting · ${formatEta(remSec)}`;
   }
 }
 
@@ -246,9 +271,27 @@ async function pollActiveJob() {
       return;
     }
 
+    const prevPhase = activeJob.phase || activeJob.status;
+    const nextPhase = job.phase || job.status;
+    const prevDisp = Number(activeJob.displayEtaSec) || Number(job.etaSeconds) || 30;
+    const serverEta = Math.max(4, Number(job.etaSeconds) || 30);
+
+    let nextDisp = prevDisp;
+    if (prevPhase !== "refining" && nextPhase === "refining") {
+      // Argon triggered a Round-2 refinement pass: show honest Round-2 estimate alongside "Polishing"
+      nextDisp = Math.max(prevDisp, serverEta);
+    } else if (job.status === "queued" && (job.position || 0) < (activeJob.position || 0)) {
+      nextDisp = Math.min(prevDisp, serverEta);
+    } else if (serverEta > prevDisp + 12) {
+      nextDisp = prevDisp + (serverEta - prevDisp) * 0.35;
+    }
+
+    const now = Date.now();
     activeJob = {
       ...job,
-      syncedAtMs: Date.now(),
+      displayEtaSec: nextDisp,
+      syncedAtMs: now,
+      lastFrameMs: activeJob.lastFrameMs || now,
     };
     renderActiveJobLabel();
   } catch {
@@ -260,18 +303,23 @@ async function pollActiveJob() {
 
 function startTrackingJob(jobInfo) {
   stopJobTracking();
+  const now = Date.now();
+  const initSec = Math.max(4, Number(jobInfo.etaSeconds) || 48);
   activeJob = {
     ...jobInfo,
-    syncedAtMs: Date.now(),
+    displayEtaSec: initSec,
+    syncedAtMs: now,
+    lastFrameMs: now,
   };
   uiState = "building";
   syncDockUI();
 
   jobTickInterval = setInterval(() => {
     if (uiState === "building" && activeJob) {
+      stepActiveJobEta();
       renderActiveJobLabel();
     }
-  }, 1000);
+  }, 500);
 
   jobPollInterval = setInterval(() => {
     if (uiState === "building" && activeJob) {
@@ -615,14 +663,21 @@ function connectLiveWebSocket() {
       const msg = JSON.parse(String(ev.data));
       if (msg.type === "queue_tick" && activeJob && uiState === "building") {
         const qIdx = Array.isArray(msg.queuedIds) ? msg.queuedIds.indexOf(activeJob.jobId) : -1;
-        const isSculpting =
-          Array.isArray(msg.sculpting) && msg.sculpting.some((s) => s.jobId === activeJob.jobId);
+        const activeEntry = Array.isArray(msg.sculpting)
+          ? msg.sculpting.find((s) => s.jobId === activeJob.jobId)
+          : null;
         if (qIdx >= 0) {
           activeJob.status = "queued";
+          activeJob.phase = "queued";
           activeJob.position = qIdx + 1;
           renderActiveJobLabel();
-        } else if (isSculpting) {
+        } else if (activeEntry) {
           activeJob.status = "sculpting";
+          if (activeEntry.phase === "refining") {
+            activeJob.phase = "refining";
+          } else if (activeJob.phase === "queued") {
+            activeJob.phase = "sculpting";
+          }
           activeJob.position = 0;
           renderActiveJobLabel();
         }

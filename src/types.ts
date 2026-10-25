@@ -247,11 +247,13 @@ export interface WorldVillager {
 export interface BuildQueueJobInfo {
   jobId: string;
   status: "queued" | "sculpting" | "done" | "failed";
+  phase?: "queued" | "sculpting" | "refining";
   /** 0 when actively sculpting right now; >= 1 for your spot in the waiting queue */
   position: number;
   activeCount: number;
   queuedCount: number;
   etaSeconds: number;
+  basedOnBuilds?: number;
   creationId?: string | null;
   creation?: WorldCreation | null;
   error?: string | null;

@@ -206,6 +206,21 @@ export default {
         });
       }
 
+      // Live adaptive build telemetry & ETA calibration summary (read-only aggregated stats)
+      if (url.pathname === "/api/eta") {
+        if (request.method !== "GET") {
+          return jsonResponse(request, { ok: false, error: "Method not allowed." }, 405);
+        }
+        const stub = getWorldStub(env);
+        const telemetry = await stub.getBuildEtaTelemetry();
+        return jsonResponse(
+          request,
+          { ok: true, telemetry },
+          200,
+          { "cache-control": "public, max-age=5" },
+        );
+      }
+
       // Enqueue build into the multi-user FIFO workshop queue (handles 10-40+ simultaneous builders cleanly)
       if (url.pathname === "/api/build") {
         if (request.method !== "POST") {
@@ -351,13 +366,16 @@ export default {
             const rec = rawItem && typeof rawItem === "object" ? (rawItem as Record<string, unknown>) : {};
             return {
               cookieId:
-                typeof rec.cookieId === "string" && rec.cookieId
-                  ? rec.cookieId
-                  : idx === 0
-                    ? id.cookieId
-                    : `sim-visitor-${idx}-${Date.now()}`,
+                rec.cookieId === "SELF"
+                  ? id.cookieId
+                  : typeof rec.cookieId === "string" && rec.cookieId
+                    ? rec.cookieId
+                    : idx === 0
+                      ? id.cookieId
+                      : `sim-visitor-${idx}-${Date.now()}`,
               prompt: typeof rec.prompt === "string" ? rec.prompt : `Simulated Creation #${idx + 1}`,
               delayMs: typeof rec.delayMs === "number" ? rec.delayMs : 4500,
+              refineAfterMs: typeof rec.refineAfterMs === "number" ? rec.refineAfterMs : undefined,
               placeBlueprint:
                 rec.placeBlueprint && typeof rec.placeBlueprint === "object"
                   ? (rec.placeBlueprint as Record<string, unknown>)
@@ -372,6 +390,29 @@ export default {
             200,
             id.setCookieHeader ? { "Set-Cookie": id.setCookieHeader } : undefined,
           );
+        }
+        if (url.pathname === "/api/dev/seed-telemetry" && request.method === "POST") {
+          const parsed = await readBoundedJsonBody(request, 256_000);
+          if (!parsed.ok) return jsonResponse(request, { ok: false, error: parsed.error }, 400);
+          const samples = Array.isArray(parsed.data.samples) ? parsed.data.samples.slice(0, 50) : [];
+          const stub = getWorldStub(env);
+          for (const raw of samples) {
+            if (!raw || typeof raw !== "object") continue;
+            const s = raw as Record<string, unknown>;
+            const comp =
+              s.complexity === "compact" || s.complexity === "complex" ? s.complexity : "standard";
+            await stub.recordBuildTelemetry({
+              durationMs: Number(s.durationMs) || 48_000,
+              round1Ms: Number(s.round1Ms) || Number(s.durationMs) || 48_000,
+              hadRefinementPass: Boolean(s.hadRefinementPass),
+              usedFallback: Boolean(s.usedFallback),
+              hasImage: Boolean(s.hasImage),
+              complexity: comp,
+              scaleClass: typeof s.scaleClass === "string" ? s.scaleClass : null,
+            });
+          }
+          const telemetry = await stub.getBuildEtaTelemetry();
+          return jsonResponse(request, { ok: true, telemetry }, 200);
         }
         if (url.pathname === "/api/dev/refresh-og" && request.method === "POST") {
           const stub = getWorldStub(env);

@@ -11,10 +11,24 @@ export interface SculptRequest {
   prompt?: string;
   imageBase64?: string;
   imageMimeType?: string;
+  onPhase?: (phase: "refining", round1Ms: number) => void;
+}
+
+export interface SculptTelemetry {
+  round1Ms: number;
+  totalMs: number;
+  hadRefinementPass: boolean;
+  usedFallback: boolean;
 }
 
 export type SculptResult =
-  | { ok: true; blueprint: VoxelBlueprint; extractedSubject: string; modelUsed: string }
+  | {
+      ok: true;
+      blueprint: VoxelBlueprint;
+      extractedSubject: string;
+      modelUsed: string;
+      telemetry: SculptTelemetry;
+    }
   | { ok: false; unsafe?: boolean; error: string };
 
 const BLOCKED_PATTERNS = [
@@ -265,6 +279,8 @@ export async function sculptWithArgon(
       : `Carefully inspect this uploaded image, isolate the main foreground object/creature/vehicle/building, and sculpt an ultra-detailed, faithful 3D micro-voxel miniature of it with animated parts.`
     : `Sculpt an ultra-detailed, iconic 3D micro-voxel miniature of the subject described below. Include rich surface greebles, harmonious custom palette, emissive details, and lifelike animated parts.\n<untrusted_user_description>\n${promptText}\n</untrusted_user_description>`;
 
+  const tStart = Date.now();
+  const expectedPrimary = primaryModel || "gemini-4-argon";
   const first = await callGeminiArgon({
     apiKey,
     primaryModel,
@@ -277,6 +293,10 @@ export async function sculptWithArgon(
     thinkingBudget: 768,
     maxOutputTokens: 10240,
   });
+
+  const round1Ms = Math.max(1, Date.now() - tStart);
+  let usedFallback = first.modelUsed !== expectedPrimary;
+  let hadRefinementPass = false;
 
   if (first.json.safe === false) {
     const reason =
@@ -297,6 +317,12 @@ export async function sculptWithArgon(
   // If round 1 was sparse (< 160 voxels) OR had a major structural collision (e.g. sails slicing through a roof),
   // run one targeted Argon self-repair pass before final deterministic clearance enforcement.
   if (needsVolumeRefinement || needsStructuralCollisionPass) {
+    hadRefinementPass = true;
+    try {
+      req.onPhase?.("refining", round1Ms);
+    } catch {
+      // ignore phase listener errors
+    }
     const notes: string[] = [];
     if (needsVolumeRefinement) {
       notes.push(
@@ -320,6 +346,9 @@ export async function sculptWithArgon(
       thinkingBudget: 1536,
       maxOutputTokens: 16384,
     });
+    if (second.modelUsed !== expectedPrimary) {
+      usedFallback = true;
+    }
     if (second.json.safe === false) {
       return { ok: false, unsafe: true, error: "Please try creating something family-friendly." };
     }
@@ -339,11 +368,18 @@ export async function sculptWithArgon(
   }
 
   const extractedSubject = sanitizePlainText(first.json.extractedSubject, 100, true) || bp.name;
+  const totalMs = Math.max(round1Ms, Date.now() - tStart);
 
   return {
     ok: true,
     blueprint: bp,
     extractedSubject,
     modelUsed: first.modelUsed,
+    telemetry: {
+      round1Ms,
+      totalMs,
+      hadRefinementPass,
+      usedFallback,
+    },
   };
 }

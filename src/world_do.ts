@@ -9,6 +9,16 @@ import {
   type WorldPatch,
 } from "./argon_director";
 import { sculptWithArgon } from "./argon_sculptor";
+import {
+  type BuildComplexityBucket,
+  type BuildEtaTelemetrySummary,
+  type BuildTelemetrySample,
+  classifyBuildFeatures,
+  estimateInitialBuildMs,
+  estimateMultiSlotQueueEtaMs,
+  estimateRemainingBuildMs,
+  summarizeTelemetryStats,
+} from "./eta_estimator";
 import { buildSeedWorld } from "./seed_world";
 import { formatDayKeyInTz, safeLogError, sanitizePlainText, verifyWebSocketOrigin } from "./security";
 import type {
@@ -33,7 +43,7 @@ import {
 
 const MAX_CONCURRENT_SCULPTS = 3;
 const MAX_QUEUE_DEPTH = 40;
-const DEFAULT_AVG_SCULPT_MS = 26_000;
+const DEFAULT_AVG_SCULPT_MS = 52_000;
 
 export interface WorldCreationAuditEntry {
   id: string;
@@ -101,6 +111,9 @@ interface BuildJobRow {
   ip_hash: string;
   day_key: string;
   status: "queued" | "sculpting" | "done" | "failed";
+  phase: "queued" | "sculpting" | "refining";
+  round1_ms: number | null;
+  has_image: number;
   prompt: string;
   image_base64: string | null;
   image_mime: string | null;
@@ -201,6 +214,9 @@ export class WorldDO extends DurableObject<Env> {
         ip_hash TEXT NOT NULL,
         day_key TEXT NOT NULL,
         status TEXT NOT NULL,
+        phase TEXT NOT NULL DEFAULT 'queued',
+        round1_ms INTEGER,
+        has_image INTEGER NOT NULL DEFAULT 0,
         prompt TEXT NOT NULL,
         image_base64 TEXT,
         image_mime TEXT,
@@ -218,6 +234,19 @@ export class WorldDO extends DurableObject<Env> {
         ON build_jobs (cookie_id, day_key);
       CREATE INDEX IF NOT EXISTS idx_build_jobs_status_created
         ON build_jobs (status, created_at);
+      CREATE TABLE IF NOT EXISTS build_telemetry (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        duration_ms INTEGER NOT NULL,
+        round1_ms INTEGER NOT NULL,
+        had_refinement INTEGER NOT NULL DEFAULT 0,
+        used_fallback INTEGER NOT NULL DEFAULT 0,
+        has_image INTEGER NOT NULL DEFAULT 0,
+        complexity TEXT NOT NULL DEFAULT 'standard',
+        scale_class TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_build_telemetry_created
+        ON build_telemetry (created_at DESC);
       CREATE TABLE IF NOT EXISTS og_snapshots (
         variant TEXT PRIMARY KEY,
         b64 TEXT NOT NULL,
@@ -409,12 +438,66 @@ export class WorldDO extends DurableObject<Env> {
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v8_og_v2', '1')`);
     }
 
+    // Non-destructive v9 upgrade: add phase/round1_ms/has_image columns to existing build_jobs & backfill telemetry
+    const jobCols = new Set(
+      sql
+        .exec(`PRAGMA table_info(build_jobs)`)
+        .toArray()
+        .map((r) => String(r.name)),
+    );
+    if (!jobCols.has("phase")) {
+      sql.exec(`ALTER TABLE build_jobs ADD COLUMN phase TEXT NOT NULL DEFAULT 'queued'`);
+    }
+    if (!jobCols.has("round1_ms")) {
+      sql.exec(`ALTER TABLE build_jobs ADD COLUMN round1_ms INTEGER`);
+    }
+    if (!jobCols.has("has_image")) {
+      sql.exec(`ALTER TABLE build_jobs ADD COLUMN has_image INTEGER NOT NULL DEFAULT 0`);
+    }
+
+    const upgradedV9 = sql.exec(`SELECT value FROM meta WHERE key = 'upgrade_v9_eta_telemetry'`).toArray();
+    if (upgradedV9.length === 0) {
+      const doneJobs = sql
+        .exec(
+          `SELECT prompt, image_mime, started_at, finished_at
+           FROM build_jobs
+           WHERE status = 'done'
+             AND started_at IS NOT NULL
+             AND finished_at IS NOT NULL
+             AND sim_delay_ms IS NULL
+             AND (image_mime IS NULL OR image_mime != '__dev_sim_bp__')
+           ORDER BY finished_at ASC`,
+        )
+        .toArray();
+      for (const r of doneJobs) {
+        const dur = Number(r.finished_at) - Number(r.started_at);
+        if (dur >= 4_000 && dur <= 240_000) {
+          const hasImg = typeof r.image_mime === "string" && r.image_mime.length > 0;
+          const feat = classifyBuildFeatures(String(r.prompt ?? ""), hasImg);
+          sql.exec(
+            `INSERT INTO build_telemetry (
+               duration_ms, round1_ms, had_refinement, used_fallback, has_image, complexity, scale_class, created_at
+             ) VALUES (?, ?, ?, 0, ?, ?, NULL, ?)`,
+            dur,
+            dur > 68_000 ? Math.round(dur * 0.54) : dur,
+            dur > 68_000 ? 1 : 0,
+            hasImg ? 1 : 0,
+            feat.complexity,
+            Number(r.finished_at) || Date.now(),
+          );
+        }
+      }
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v9_eta_telemetry', '1')`);
+    }
+
     // Recover any interrupted sculpting jobs after a cold Worker/DO restart
     const orphaned = sql
       .exec(`SELECT job_id FROM build_jobs WHERE status = 'sculpting'`)
       .toArray();
     if (orphaned.length > 0) {
-      sql.exec(`UPDATE build_jobs SET status = 'queued', started_at = NULL WHERE status = 'sculpting'`);
+      sql.exec(
+        `UPDATE build_jobs SET status = 'queued', phase = 'queued', started_at = NULL, round1_ms = NULL WHERE status = 'sculpting'`,
+      );
     }
 
     // Prune completed/failed build jobs older than 36 hours
@@ -558,17 +641,83 @@ export class WorldDO extends DurableObject<Env> {
     return next;
   }
 
-  private getAvgSculptMs(): number {
-    const raw = Number(this.getMeta("avgSculptMs", String(DEFAULT_AVG_SCULPT_MS)));
-    if (!Number.isFinite(raw)) return DEFAULT_AVG_SCULPT_MS;
-    return Math.max(12_000, Math.min(55_000, raw));
+  private readTelemetryHistory(): BuildTelemetrySample[] {
+    const rows = this.ctx.storage.sql
+      .exec(
+        `SELECT duration_ms, round1_ms, had_refinement, used_fallback, has_image, complexity, created_at
+         FROM build_telemetry
+         ORDER BY created_at DESC, id DESC
+         LIMIT 90`,
+      )
+      .toArray();
+    return rows.map((r) => {
+      const rawComp = String(r.complexity ?? "standard");
+      const complexity: BuildComplexityBucket =
+        rawComp === "compact" || rawComp === "complex" ? rawComp : "standard";
+      return {
+        durationMs: Number(r.duration_ms) || DEFAULT_AVG_SCULPT_MS,
+        round1Ms: Number(r.round1_ms) || Number(r.duration_ms) || DEFAULT_AVG_SCULPT_MS,
+        hadRefinementPass: Number(r.had_refinement) === 1,
+        usedFallback: Number(r.used_fallback) === 1,
+        hasImage: Number(r.has_image) === 1,
+        complexity,
+        createdAt: Number(r.created_at) || Date.now(),
+      };
+    });
   }
 
-  private recordSculptDurationMs(durationMs: number): void {
-    if (!Number.isFinite(durationMs) || durationMs < 2500 || durationMs > 90_000) return;
-    const prev = this.getAvgSculptMs();
-    const blended = Math.round(prev * 0.72 + durationMs * 0.28);
-    this.setMeta("avgSculptMs", String(Math.max(12_000, Math.min(55_000, blended))));
+  public recordBuildTelemetry(sample: {
+    durationMs: number;
+    round1Ms: number;
+    hadRefinementPass: boolean;
+    usedFallback: boolean;
+    hasImage: boolean;
+    complexity: BuildComplexityBucket;
+    scaleClass?: string | null;
+  }): void {
+    if (!Number.isFinite(sample.durationMs) || sample.durationMs < 4_000 || sample.durationMs > 240_000) {
+      return;
+    }
+    const sql = this.ctx.storage.sql;
+    const now = Date.now();
+    const totalMs = Math.round(sample.durationMs);
+    const r1Ms = Math.max(1_000, Math.min(totalMs, Math.round(sample.round1Ms || totalMs)));
+    sql.exec(
+      `INSERT INTO build_telemetry (
+         duration_ms, round1_ms, had_refinement, used_fallback, has_image, complexity, scale_class, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      totalMs,
+      r1Ms,
+      sample.hadRefinementPass ? 1 : 0,
+      sample.usedFallback ? 1 : 0,
+      sample.hasImage ? 1 : 0,
+      sample.complexity,
+      sample.scaleClass ?? null,
+      now,
+    );
+    // Keep table compact (most recent 150 builds)
+    sql.exec(
+      `DELETE FROM build_telemetry
+       WHERE id NOT IN (
+         SELECT id FROM build_telemetry ORDER BY created_at DESC, id DESC LIMIT 150
+       )`,
+    );
+    const updatedStandardMs = estimateInitialBuildMs(
+      { complexity: "standard", hasImage: false },
+      this.readTelemetryHistory(),
+    );
+    this.setMeta("avgSculptMs", String(updatedStandardMs));
+  }
+
+  public getBuildEtaTelemetry(): BuildEtaTelemetrySummary {
+    return summarizeTelemetryStats(this.readTelemetryHistory());
+  }
+
+  private getAvgSculptMs(): number {
+    return estimateInitialBuildMs(
+      { complexity: "standard", hasImage: false },
+      this.readTelemetryHistory(),
+    );
   }
 
   private readBaseWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
@@ -675,12 +824,25 @@ export class WorldDO extends DurableObject<Env> {
   }
 
   private parseJobRow(r: Record<string, unknown>): BuildJobRow {
+    const rawPhase = String(r.phase ?? "queued");
+    const phase: BuildJobRow["phase"] =
+      rawPhase === "refining" || rawPhase === "sculpting" ? rawPhase : "queued";
+    const hasImg =
+      Number(r.has_image) === 1 ||
+      (typeof r.image_base64 === "string" &&
+        r.image_base64.length > 0 &&
+        r.image_mime !== "__dev_sim_bp__")
+        ? 1
+        : 0;
     return {
       job_id: String(r.job_id),
       cookie_id: String(r.cookie_id),
       ip_hash: String(r.ip_hash ?? ""),
       day_key: String(r.day_key),
       status: String(r.status) as BuildJobRow["status"],
+      phase,
+      round1_ms: typeof r.round1_ms === "number" ? r.round1_ms : null,
+      has_image: hasImg,
       prompt: String(r.prompt ?? ""),
       image_base64: typeof r.image_base64 === "string" ? r.image_base64 : null,
       image_mime: typeof r.image_mime === "string" ? r.image_mime : null,
@@ -701,7 +863,7 @@ export class WorldDO extends DurableObject<Env> {
     const now = Date.now();
     const activeRows = sql
       .exec(
-        `SELECT job_id, status, started_at, sim_delay_ms, created_at
+        `SELECT job_id, status, phase, round1_ms, has_image, prompt, started_at, sim_delay_ms, created_at
          FROM build_jobs
          WHERE status IN ('sculpting', 'queued')
          ORDER BY CASE WHEN status = 'sculpting' THEN 0 ELSE 1 END, created_at ASC, rowid ASC`,
@@ -712,7 +874,6 @@ export class WorldDO extends DurableObject<Env> {
     const queuedRows = activeRows.filter((r) => r.status === "queued");
     const activeCount = sculptingRows.length;
     const queuedCount = queuedRows.length;
-    const avgSculptMs = this.getAvgSculptMs();
 
     if (target.status === "done") {
       let creation: WorldCreation | null = null;
@@ -746,63 +907,68 @@ export class WorldDO extends DurableObject<Env> {
       };
     }
 
-    const durationFor = (row: Record<string, unknown> | BuildJobRow): number => {
-      const sim = typeof row.sim_delay_ms === "number" && row.sim_delay_ms > 0 ? row.sim_delay_ms : null;
-      return sim ?? avgSculptMs;
-    };
+    const history = this.readTelemetryHistory();
+    const targetFeatures = classifyBuildFeatures(target.prompt, target.has_image === 1);
 
     if (target.status === "sculpting") {
-      const expectedMs = durationFor(target);
       const elapsed = Math.max(0, now - (target.started_at ?? now));
-      const remainingMs = Math.max(2500, expectedMs - elapsed);
+      const activePhase: "sculpting" | "refining" =
+        target.phase === "refining" ? "refining" : "sculpting";
+      const remainingMs =
+        typeof target.sim_delay_ms === "number" && target.sim_delay_ms > 0
+          ? Math.max(1_500, target.sim_delay_ms - elapsed)
+          : estimateRemainingBuildMs({
+              elapsedMs: elapsed,
+              phase: activePhase,
+              round1Ms: target.round1_ms,
+              features: targetFeatures,
+              history,
+            });
       return {
         jobId: target.job_id,
         status: "sculpting",
+        phase: activePhase,
         position: 0,
         activeCount,
         queuedCount,
         etaSeconds: Math.max(3, Math.ceil(remainingMs / 1000)),
+        basedOnBuilds: history.length,
       };
     }
 
     // Target is waiting in FIFO queue: simulate completion across MAX_CONCURRENT_SCULPTS worker slots
-    const slotRemaining: number[] = [];
-    for (let s = 0; s < MAX_CONCURRENT_SCULPTS; s++) {
-      const active = sculptingRows[s];
-      if (active) {
-        const expected = durationFor(active);
-        const elapsed = Math.max(0, now - (Number(active.started_at) || now));
-        slotRemaining.push(Math.max(2500, expected - elapsed));
-      } else {
-        slotRemaining.push(0);
-      }
-    }
+    const activeSlots = sculptingRows.map((r) => ({
+      elapsedMs: Math.max(0, now - (Number(r.started_at) || now)),
+      phase: String(r.phase ?? "sculpting"),
+      round1Ms: typeof r.round1_ms === "number" ? r.round1_ms : null,
+      simDelayMs: typeof r.sim_delay_ms === "number" && r.sim_delay_ms > 0 ? r.sim_delay_ms : null,
+      features: classifyBuildFeatures(String(r.prompt ?? ""), Number(r.has_image) === 1),
+    }));
 
-    const qIdx = queuedRows.findIndex((r) => String(r.job_id) === target.job_id);
-    const position = qIdx >= 0 ? qIdx + 1 : queuedCount + 1;
-    let totalEtaMs = avgSculptMs;
+    const queuedItems = queuedRows.map((r) => ({
+      jobId: String(r.job_id),
+      simDelayMs: typeof r.sim_delay_ms === "number" && r.sim_delay_ms > 0 ? r.sim_delay_ms : null,
+      features: classifyBuildFeatures(String(r.prompt ?? ""), Number(r.has_image) === 1),
+    }));
 
-    const limit = qIdx >= 0 ? qIdx : queuedRows.length - 1;
-    for (let i = 0; i <= limit; i++) {
-      let minSlot = 0;
-      for (let s = 1; s < slotRemaining.length; s++) {
-        if (slotRemaining[s] < slotRemaining[minSlot]) minSlot = s;
-      }
-      const itemDur = queuedRows[i] ? durationFor(queuedRows[i]) : durationFor(target);
-      if (i === limit) {
-        totalEtaMs = slotRemaining[minSlot] + itemDur;
-      } else {
-        slotRemaining[minSlot] += itemDur;
-      }
-    }
+    const sim = estimateMultiSlotQueueEtaMs({
+      workerConcurrency: MAX_CONCURRENT_SCULPTS,
+      activeSlots,
+      queuedItems,
+      targetJobId: target.job_id,
+      targetFallbackFeatures: targetFeatures,
+      history,
+    });
 
     return {
       jobId: target.job_id,
       status: "queued",
-      position,
+      phase: "queued",
+      position: sim.position,
       activeCount,
       queuedCount,
-      etaSeconds: Math.max(4, Math.ceil(totalEtaMs / 1000)),
+      etaSeconds: Math.max(4, Math.ceil(sim.totalEtaMs / 1000)),
+      basedOnBuilds: history.length,
     };
   }
 
@@ -970,15 +1136,17 @@ export class WorldDO extends DurableObject<Env> {
     this.incrementWindowBucket("global:day", dayWindowMs, now);
 
     const jobId = `job-${now.toString(36)}-${crypto.randomUUID().replace(/-/g, "").slice(0, 6)}`;
+    const hasImgFlag = input.imageBase64 && input.imageMimeType ? 1 : 0;
     sql.exec(
       `INSERT INTO build_jobs (
-        job_id, cookie_id, ip_hash, day_key, status, prompt, image_base64, image_mime,
+        job_id, cookie_id, ip_hash, day_key, status, phase, has_image, prompt, image_base64, image_mime,
         req_x, req_z, req_yaw, sim_delay_ms, created_at
-      ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, NULL, ?)`,
+      ) VALUES (?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
       jobId,
       input.cookieId,
       input.ipHash || "",
       input.dayKey,
+      hasImgFlag,
       input.prompt,
       input.imageBase64 ?? null,
       input.imageMimeType ?? null,
@@ -1001,7 +1169,13 @@ export class WorldDO extends DurableObject<Env> {
    * so we can test 12+ simultaneous visitors in real Chrome without burning 12 LLM calls.
    */
   public async enqueueDevSimulatedBatch(
-    items: { cookieId: string; prompt: string; delayMs: number; placeBlueprint?: Record<string, unknown> | null }[],
+    items: {
+      cookieId: string;
+      prompt: string;
+      delayMs: number;
+      refineAfterMs?: number;
+      placeBlueprint?: Record<string, unknown> | null;
+    }[],
     dayKey: string,
   ): Promise<BuildQueueJobInfo[]> {
     const sql = this.ctx.storage.sql;
@@ -1012,14 +1186,19 @@ export class WorldDO extends DurableObject<Env> {
       const it = items[i];
       const jobId = `simjob-${now.toString(36)}-${i}-${crypto.randomUUID().slice(0, 4)}`;
       const encodedPayload = it.placeBlueprint ? JSON.stringify(it.placeBlueprint) : null;
+      const refineAt =
+        typeof it.refineAfterMs === "number" && it.refineAfterMs > 0
+          ? Math.round(it.refineAfterMs)
+          : null;
       sql.exec(
         `INSERT INTO build_jobs (
-          job_id, cookie_id, ip_hash, day_key, status, prompt, image_base64, image_mime,
+          job_id, cookie_id, ip_hash, day_key, status, phase, round1_ms, has_image, prompt, image_base64, image_mime,
           req_x, req_z, req_yaw, sim_delay_ms, created_at
-        ) VALUES (?, ?, 'sim', ?, 'queued', ?, ?, '__dev_sim_bp__', NULL, NULL, NULL, ?, ?)`,
+        ) VALUES (?, ?, 'sim', ?, 'queued', 'queued', ?, 0, ?, ?, '__dev_sim_bp__', NULL, NULL, NULL, ?, ?)`,
         jobId,
         it.cookieId,
         dayKey,
+        refineAt,
         it.prompt,
         encodedPayload,
         Math.max(800, Math.min(30_000, it.delayMs)),
@@ -1038,9 +1217,11 @@ export class WorldDO extends DurableObject<Env> {
 
   private broadcastQueueTick(): void {
     const sql = this.ctx.storage.sql;
+    const history = this.readTelemetryHistory();
+    const avgMs = estimateInitialBuildMs({ complexity: "standard", hasImage: false }, history);
     const activeRows = sql
       .exec(
-        `SELECT job_id, status, started_at, sim_delay_ms
+        `SELECT job_id, status, phase, has_image, prompt, started_at, sim_delay_ms
          FROM build_jobs
          WHERE status IN ('sculpting', 'queued')
          ORDER BY CASE WHEN status = 'sculpting' THEN 0 ELSE 1 END, created_at ASC, rowid ASC`,
@@ -1050,8 +1231,15 @@ export class WorldDO extends DurableObject<Env> {
       .filter((r) => r.status === "sculpting")
       .map((r) => ({
         jobId: String(r.job_id),
+        phase: String(r.phase ?? "sculpting"),
         startedAt: Number(r.started_at) || Date.now(),
-        expectedMs: typeof r.sim_delay_ms === "number" && r.sim_delay_ms > 0 ? r.sim_delay_ms : this.getAvgSculptMs(),
+        expectedMs:
+          typeof r.sim_delay_ms === "number" && r.sim_delay_ms > 0
+            ? r.sim_delay_ms
+            : estimateInitialBuildMs(
+                classifyBuildFeatures(String(r.prompt ?? ""), Number(r.has_image) === 1),
+                history,
+              ),
       }));
     const queuedIds = activeRows.filter((r) => r.status === "queued").map((r) => String(r.job_id));
 
@@ -1060,7 +1248,7 @@ export class WorldDO extends DurableObject<Env> {
       activeCount: sculpting.length,
       sculpting,
       queuedIds,
-      avgSculptMs: this.getAvgSculptMs(),
+      avgSculptMs: avgMs,
     });
   }
 
@@ -1084,11 +1272,12 @@ export class WorldDO extends DurableObject<Env> {
 
       const startedAt = Date.now();
       sql.exec(
-        `UPDATE build_jobs SET status = 'sculpting', started_at = ? WHERE job_id = ?`,
+        `UPDATE build_jobs SET status = 'sculpting', phase = 'sculpting', started_at = ? WHERE job_id = ?`,
         startedAt,
         row.job_id,
       );
       row.status = "sculpting";
+      row.phase = "sculpting";
       row.started_at = startedAt;
       promoted = true;
 
@@ -1121,7 +1310,14 @@ export class WorldDO extends DurableObject<Env> {
     try {
       // Dev-only simulated queue worker path (never reachable from public routes)
       if (job.image_mime === "__dev_sim_bp__" && job.sim_delay_ms) {
-        await new Promise((resolve) => setTimeout(resolve, job.sim_delay_ms!));
+        if (typeof job.round1_ms === "number" && job.round1_ms > 0 && job.round1_ms < job.sim_delay_ms) {
+          await new Promise((resolve) => setTimeout(resolve, job.round1_ms!));
+          sql.exec(`UPDATE build_jobs SET phase = 'refining' WHERE job_id = ?`, job.job_id);
+          this.broadcastQueueTick();
+          await new Promise((resolve) => setTimeout(resolve, job.sim_delay_ms! - job.round1_ms!));
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, job.sim_delay_ms!));
+        }
         let creationId: string | null = null;
         if (job.image_base64) {
           const bpRaw = JSON.parse(job.image_base64) as Record<string, unknown>;
@@ -1164,11 +1360,23 @@ export class WorldDO extends DurableObject<Env> {
         return;
       }
 
+      const hasImg = Boolean(job.has_image || (job.image_base64 && job.image_mime));
+      const features = classifyBuildFeatures(job.prompt, hasImg);
+
       const sculpted = await sculptWithArgon(
         {
           prompt: job.prompt,
           imageBase64: job.image_base64 ?? undefined,
           imageMimeType: job.image_mime ?? undefined,
+          onPhase: (phase, r1Ms) => {
+            sql.exec(
+              `UPDATE build_jobs SET phase = ?, round1_ms = ? WHERE job_id = ?`,
+              phase,
+              Math.round(r1Ms),
+              job.job_id,
+            );
+            this.broadcastQueueTick();
+          },
         },
         this.env.GEMINI_API_KEY,
         this.env.ARGON_MODEL,
@@ -1188,8 +1396,6 @@ export class WorldDO extends DurableObject<Env> {
         return;
       }
 
-      this.recordSculptDurationMs(Date.now() - t0);
-
       const placed = await this.placeCreation({
         ipHash: job.ip_hash,
         cookieId: job.cookie_id,
@@ -1201,12 +1407,26 @@ export class WorldDO extends DurableObject<Env> {
         yaw: job.req_yaw,
       });
 
+      const finishedAt = Date.now();
+      const totalBuildMs = finishedAt - t0;
+
+      // Record end-to-end build telemetry (including sculpting + spatial placement) so future ETAs self-calibrate!
+      this.recordBuildTelemetry({
+        durationMs: totalBuildMs,
+        round1Ms: sculpted.telemetry.round1Ms,
+        hadRefinementPass: sculpted.telemetry.hadRefinementPass,
+        usedFallback: sculpted.telemetry.usedFallback,
+        hasImage: hasImg,
+        complexity: features.complexity,
+        scaleClass: placed.ok ? placed.creation.scaleClass : sculpted.blueprint.scaleClass,
+      });
+
       if (!placed.ok) {
         sql.exec(
           `UPDATE build_jobs
            SET status = 'failed', finished_at = ?, error_msg = ?, creation_id = ?, image_base64 = NULL
            WHERE job_id = ?`,
-          Date.now(),
+          finishedAt,
           placed.error,
           placed.myCreationId ?? null,
           job.job_id,
@@ -1219,7 +1439,7 @@ export class WorldDO extends DurableObject<Env> {
         `UPDATE build_jobs
          SET status = 'done', finished_at = ?, creation_id = ?, image_base64 = NULL
          WHERE job_id = ?`,
-        Date.now(),
+        finishedAt,
         placed.creation.id,
         job.job_id,
       );

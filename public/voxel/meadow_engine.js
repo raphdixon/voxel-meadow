@@ -102,6 +102,91 @@ function makeMeadowSkyTexture() {
   return tex;
 }
 
+function buildFirstPersonSkyDome(uTimeUniform) {
+  const geo = new THREE.SphereGeometry(460, 32, 20);
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: uTimeUniform,
+      uSunDir: { value: new THREE.Vector3(64, 118, 76).normalize() },
+    },
+    side: THREE.BackSide,
+    depthWrite: false,
+    depthTest: false,
+    toneMapped: true,
+    vertexShader: `
+      varying vec3 vLocalDir;
+      void main() {
+        vLocalDir = position;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform float uTime;
+      uniform vec3 uSunDir;
+      varying vec3 vLocalDir;
+
+      vec3 srgb2lin(float r, float g, float b) {
+        return pow(vec3(r, g, b) / 255.0, vec3(2.2));
+      }
+      float sHash(vec2 p) {
+        vec2 q = fract(p * vec2(127.1, 311.7));
+        q += dot(q, q + 34.23);
+        return fract(q.x * q.y);
+      }
+      float sNoise(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        vec2 u = f * f * (3.0 - 2.0 * f);
+        return mix(
+          mix(sHash(i), sHash(i + vec2(1.0, 0.0)), u.x),
+          mix(sHash(i + vec2(0.0, 1.0)), sHash(i + vec2(1.0, 1.0)), u.x),
+          u.y
+        );
+      }
+
+      void main() {
+        vec3 dir = normalize(vLocalDir);
+        float h = clamp(dir.y, 0.0, 1.0);
+
+        vec3 cHorizonMist = srgb2lin(203.0, 228.0, 190.0);
+        vec3 cLowHaze     = srgb2lin(223.0, 238.0, 216.0);
+        vec3 cPaleSky     = srgb2lin(192.0, 225.0, 246.0);
+        vec3 cMidSky      = srgb2lin(134.0, 192.0, 240.0);
+        vec3 cZenith      = srgb2lin(96.0, 162.0, 228.0);
+
+        vec3 col = mix(cHorizonMist, cLowHaze, smoothstep(0.002, 0.065, h));
+        col = mix(col, cPaleSky, smoothstep(0.055, 0.21, h));
+        col = mix(col, cMidSky, smoothstep(0.19, 0.54, h));
+        col = mix(col, cZenith, smoothstep(0.50, 0.96, h));
+
+        float sunAmt = max(0.0, dot(dir, uSunDir));
+        col += srgb2lin(255.0, 242.0, 206.0) * (pow(sunAmt, 12.0) * 0.18 + pow(sunAmt, 220.0) * 0.72) * smoothstep(0.0, 0.08, h);
+
+        if (h > 0.055) {
+          vec2 cuv = dir.xz / (h + 0.22) * 1.45 + vec2(uTime * 0.0055, uTime * 0.0028);
+          float c1 = sNoise(cuv);
+          float c2 = sNoise(cuv * 2.15 + vec2(7.3, -4.1));
+          float cloud = smoothstep(0.54, 0.82, c1 * 0.68 + c2 * 0.32);
+          float cloudFade = smoothstep(0.06, 0.24, h) * (1.0 - smoothstep(0.75, 0.99, h) * 0.35);
+          col = mix(col, srgb2lin(250.0, 252.0, 252.0), cloud * cloudFade * 0.46);
+        }
+
+        gl_FragColor = vec4(col, 1.0);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.renderOrder = -100;
+  mesh.frustumCulled = false;
+  mesh.castShadow = false;
+  mesh.receiveShadow = false;
+  mesh.raycast = () => {};
+  mesh.visible = false;
+  return mesh;
+}
+
 function roundRectPath(ctx, x, y, w, h, r) {
   const rr = Math.min(r, w / 2, h / 2);
   ctx.beginPath();
@@ -222,6 +307,7 @@ function createContributorSignboard(maxAniso = 4) {
   group.position.set(CITY_SIGN_POS[0], 0, CITY_SIGN_POS[1]);
   group.position.y = 0;
   group.rotation.y = CITY_SIGN_YAW;
+  group.userData.creationId = "__city_sign__";
 
   return { group, updateCount };
 }
@@ -685,6 +771,7 @@ class CreationSimEntity {
       useWorldScale: true,
     });
     this.group.rotation.order = "YXZ";
+    this.group.userData.creationId = this.id;
 
     this.x = creation.x;
     this.y = 0.004;
@@ -792,6 +879,7 @@ class CreationSimEntity {
         useWorldScale: true,
       });
       this.group.rotation.order = "YXZ";
+      this.group.userData.creationId = this.id;
       const worldUnit = getWorldVoxelSize(creation.scaleClass);
       this.topY = Math.max(1.8, (creation.blueprint?.stats?.maxY || 14) * worldUnit);
       if (this.feedMesh) {
@@ -844,7 +932,7 @@ class CreationSimEntity {
     }
   }
 
-  step(dt, t, allEntities = [], ponds = [], camAz = 0.62) {
+  step(dt, t, allEntities = [], ponds = [], camAz = 0.62, viewerPos = null) {
     if (this.spawnScale < 1.0) {
       this.spawnScale = Math.min(1.0, this.spawnScale + dt * 3.2);
     }
@@ -1083,7 +1171,10 @@ class CreationSimEntity {
 
     if (this.feedMesh && this.feedMesh.visible) {
       this.feedMesh.position.y = this.topY + 1.15 + Math.sin(t * 2.1) * 0.05;
-      this.feedMesh.rotation.y = camAz - this.yaw;
+      const targetAz = viewerPos
+        ? Math.atan2(viewerPos.x - this.x, viewerPos.z - this.z)
+        : camAz;
+      this.feedMesh.rotation.y = targetAz - this.yaw;
     }
 
     this.group.userData.animate?.(t, {
@@ -1139,12 +1230,16 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     18,
     560,
   );
+  const fpCamera = new THREE.PerspectiveCamera(aspect0 < 0.8 ? 72 : 62, aspect0, 0.14, 520);
+  fpCamera.rotation.order = "YXZ";
 
   const composer = isSoftwareGpu ? null : new EffectComposer(renderer);
+  let renderPass = null;
   let gtaoPass = null;
   let smaaPass = null;
   if (composer) {
-    composer.addPass(new RenderPass(scene, camera));
+    renderPass = new RenderPass(scene, camera);
+    composer.addPass(renderPass);
     gtaoPass = new GTAOPass(scene, camera, w0, h0);
     gtaoPass.output = GTAOPass.OUTPUT.Default;
     gtaoPass.blendIntensity = 0.44;
@@ -1163,6 +1258,27 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     composer.addPass(new OutputPass());
     smaaPass = new SMAAPass(w0, h0);
     composer.addPass(smaaPass);
+  }
+
+  function syncComposerCamera(activeCam) {
+    if (renderPass) {
+      renderPass.camera = activeCam;
+    }
+    if (gtaoPass) {
+      gtaoPass.camera = activeCam;
+      const isPersp = activeCam.isPerspectiveCamera ? 1 : 0;
+      if (gtaoPass.gtaoMaterial.defines.PERSPECTIVE_CAMERA !== isPersp) {
+        gtaoPass.gtaoMaterial.defines.PERSPECTIVE_CAMERA = isPersp;
+        gtaoPass.gtaoMaterial.needsUpdate = true;
+      }
+      gtaoPass.gtaoMaterial.uniforms.cameraProjectionMatrix.value.copy(activeCam.projectionMatrix);
+      gtaoPass.gtaoMaterial.uniforms.cameraProjectionMatrixInverse.value.copy(
+        activeCam.projectionMatrixInverse,
+      );
+      gtaoPass.pdMaterial.uniforms.cameraProjectionMatrixInverse.value.copy(
+        activeCam.projectionMatrixInverse,
+      );
+    }
   }
 
   // Sunlit Golden-Hour Directional Key Light with Camera-Tracking Texel-Snapped Shadows
@@ -1206,6 +1322,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   groundMesh.receiveShadow = true;
   scene.add(groundMesh);
 
+  const skyDome = buildFirstPersonSkyDome(grassUniforms.uTime);
+  scene.add(skyDome);
+
   const citySignboard = createContributorSignboard(maxAniso);
   scene.add(citySignboard.group);
 
@@ -1226,7 +1345,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     const sc = 0.85 + (i % 4) * 0.14;
     tree.scale.setScalar(sc);
     perimeterTreesGroup.add(tree);
-    perimeterScenery.push({ mesh: tree, x: tx, z: tz });
+    perimeterScenery.push({ mesh: tree, x: tx, z: tz, isTree: true });
 
     if (i % 2 === 0) {
       const bush = bushProtos[i % 3].clone();
@@ -1236,7 +1355,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       bush.position.set(bx, 0, bz);
       bush.rotation.y = (i * 2.3) % (Math.PI * 2);
       perimeterTreesGroup.add(bush);
-      perimeterScenery.push({ mesh: bush, x: bx, z: bz });
+      perimeterScenery.push({ mesh: bush, x: bx, z: bz, isTree: false });
     }
   }
 
@@ -1468,15 +1587,49 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   const groundPlaneMath = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
   const tmpHit = new THREE.Vector3();
 
+  const FP_EYE_HEIGHT = 1.65;
+  const FP_MIN_PITCH = -1.12;
+  const FP_MAX_PITCH = 1.18;
+  const FP_MAX_RADIUS = 148;
+  const fp = {
+    active: false,
+    x: 0,
+    y: FP_EYE_HEIGHT,
+    z: 8,
+    yaw: HOME_AZ,
+    goalYaw: HOME_AZ,
+    pitch: -0.02,
+    goalPitch: -0.02,
+    vx: 0,
+    vz: 0,
+    jumpY: 0,
+    jumpVy: 0,
+    bobPhase: 0,
+    settleT: 1,
+    walkTarget: null,
+    walkStuckSec: 0,
+  };
+
   function screenToGround(clientX, clientY) {
     const rect = canvas.getBoundingClientRect();
     const ndcX = ((clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1;
     const ndcY = -((clientY - rect.top) / Math.max(1, rect.height)) * 2 + 1;
-    raycaster.setFromCamera({ x: ndcX, y: ndcY }, camera);
+    raycaster.setFromCamera({ x: ndcX, y: ndcY }, fp.active ? fpCamera : camera);
+    if (fp.active && raycaster.ray.direction.y >= -0.015) {
+      return null;
+    }
     if (raycaster.ray.intersectPlane(groundPlaneMath, tmpHit)) {
       return [tmpHit.x, tmpHit.z];
     }
     return null;
+  }
+
+  function screenToGroundWalkTarget(clientX, clientY) {
+    const g = screenToGround(clientX, clientY);
+    if (!g) return null;
+    const d = Math.hypot(g[0] - fp.x, g[1] - fp.z);
+    if (d < 0.65 || d > 68) return null;
+    return { x: g[0], z: g[1] };
   }
 
   function getCitySignHoverItem() {
@@ -1498,6 +1651,28 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   function pickCreationAt(clientX, clientY) {
+    if (fp.active) {
+      const rect = canvas.getBoundingClientRect();
+      const locked = document.pointerLockElement === canvas;
+      const ndcX = locked ? 0 : ((clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1;
+      const ndcY = locked ? 0 : -((clientY - rect.top) / Math.max(1, rect.height)) * 2 + 1;
+      raycaster.setFromCamera({ x: ndcX, y: ndcY }, fpCamera);
+      const prevFar = raycaster.far;
+      raycaster.far = 75;
+      const hits = raycaster.intersectObjects([citySignboard.group, ...creationsGroup.children], true);
+      raycaster.far = prevFar;
+      for (const hit of hits) {
+        let cur = hit.object;
+        while (cur) {
+          const cid = cur.userData?.creationId;
+          if (cid === "__city_sign__") return getCitySignHoverItem();
+          if (cid && creationEntities.has(cid)) return creationEntities.get(cid);
+          cur = cur.parent;
+        }
+      }
+      return null;
+    }
+
     const g = screenToGround(clientX, clientY);
     if (!g) return null;
 
@@ -1885,16 +2060,218 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   let dragMode = "pan";
+  const pressedKeys = new Set();
+  let fpTouchMove = null;
+  let fpTouchLook = null;
 
   function idleCursor() {
+    if (fp.active) return "grab";
     if (spotState.mode === "picking" || spotState.mode === "staked") return "crosshair";
     return "grab";
   }
 
+  function isWalkPointClear(x, z, extraMargin = 0) {
+    if (Math.hypot(x, z) > FP_MAX_RADIUS - extraMargin) return false;
+    if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < 2.35 + extraMargin) return false;
+    for (const pr of currentWorld?.props || []) {
+      if (pr.kind === "pond") {
+        if (Math.hypot(x - pr.x, z - pr.z) < (pr.radius || 6.6) + 0.75 + extraMargin) return false;
+      } else if (pr.kind === "bus_stop" || pr.kind === "bench" || pr.kind === "lamp_post") {
+        if (Math.hypot(x - pr.x, z - pr.z) < 0.72 + extraMargin) return false;
+      }
+    }
+    for (const ent of creationEntities.values()) {
+      if (ent.data.category === "building" || ent.data.behavior?.type === "landmark") {
+        const r = (ent.footprintRadius || 3.4) + 0.6 + extraMargin;
+        if (Math.hypot(x - ent.x, z - ent.z) < r) return false;
+      }
+    }
+    return true;
+  }
+
+  function resolveWalkPosition(rawX, rawZ) {
+    let x = rawX;
+    let z = rawZ;
+
+    const pushOut = (ox, oz, minR) => {
+      const dx = x - ox;
+      const dz = z - oz;
+      const d = Math.hypot(dx, dz);
+      if (d < minR) {
+        if (d > 1e-4) {
+          x = ox + (dx / d) * minR;
+          z = oz + (dz / d) * minR;
+        } else {
+          x = ox + minR;
+        }
+      }
+    };
+
+    for (let pass = 0; pass < 2; pass++) {
+      pushOut(CITY_SIGN_POS[0], CITY_SIGN_POS[1], 2.35);
+      for (const pr of currentWorld?.props || []) {
+        if (pr.kind === "pond") {
+          pushOut(pr.x, pr.z, (pr.radius || 6.6) + 0.75);
+        } else if (pr.kind === "bus_stop" || pr.kind === "bench" || pr.kind === "lamp_post") {
+          pushOut(pr.x, pr.z, 0.7);
+        }
+      }
+      for (const ent of creationEntities.values()) {
+        if (ent.data.category === "building" || ent.data.behavior?.type === "landmark") {
+          pushOut(ent.x, ent.z, (ent.footprintRadius || 3.4) + 0.58);
+        } else if (ent.data.behavior?.type === "vehicle_route") {
+          pushOut(ent.x, ent.z, 2.35);
+        }
+      }
+      for (const sc of perimeterScenery) {
+        if (sc.isTree && sc.mesh.visible) {
+          pushOut(sc.x, sc.z, 0.72);
+        }
+      }
+      const r = Math.hypot(x, z);
+      if (r > FP_MAX_RADIUS) {
+        x = (x / r) * FP_MAX_RADIUS;
+        z = (z / r) * FP_MAX_RADIUS;
+      }
+    }
+    return [x, z];
+  }
+
+  function placeFirstPersonNear(targetX, targetZ, preferredAz = cam.az, standOverride = null, topYHint = null) {
+    let focusX = targetX;
+    let focusZ = targetZ;
+    let standDist = standOverride || 9.5;
+    let initialPitch = -0.02;
+
+    if (!standOverride) {
+      for (const ent of creationEntities.values()) {
+        if (ent.data.category === "building" || ent.data.behavior?.type === "landmark") {
+          const fr = ent.footprintRadius || 3.4;
+          if (Math.hypot(targetX - ent.x, targetZ - ent.z) < fr + 4.2) {
+            focusX = ent.x;
+            focusZ = ent.z;
+            standDist = Math.max(8.5, fr + 5.4);
+            initialPitch = Math.min(
+              0.2,
+              Math.max(0.01, ((ent.topY || 5) * 0.42 - FP_EYE_HEIGHT) / standDist),
+            );
+            break;
+          }
+        }
+      }
+    } else if (typeof topYHint === "number") {
+      initialPitch = Math.min(0.22, Math.max(0.01, (topYHint * 0.42 - FP_EYE_HEIGHT) / standDist));
+    }
+
+    const angleOffsets = [0, 0.3, -0.3, 0.62, -0.62, 0.96, -0.96, 1.35, -1.35, 1.85, -1.85, Math.PI];
+    const distSteps = [standDist, standDist + 3.6, standDist + 7.2];
+    let chosen = null;
+
+    outer: for (const d of distSteps) {
+      for (const off of angleOffsets) {
+        const a = preferredAz + off;
+        const cx = focusX + Math.sin(a) * d;
+        const cz = focusZ + Math.cos(a) * d;
+        if (isWalkPointClear(cx, cz, 0.35)) {
+          chosen = [cx, cz];
+          break outer;
+        }
+      }
+    }
+
+    if (!chosen) {
+      chosen = resolveWalkPosition(
+        focusX + Math.sin(preferredAz) * standDist,
+        focusZ + Math.cos(preferredAz) * standDist,
+      );
+    }
+
+    fp.x = chosen[0];
+    fp.z = chosen[1];
+    const dx = focusX - fp.x;
+    const dz = focusZ - fp.z;
+    const lookYaw = Math.hypot(dx, dz) > 0.2 ? Math.atan2(-dx, -dz) : preferredAz;
+    fp.yaw = fp.goalYaw = lookYaw;
+    fp.pitch = fp.goalPitch = initialPitch;
+    fp.vx = 0;
+    fp.vz = 0;
+    fp.jumpY = 0;
+    fp.jumpVy = 0;
+    fp.walkTarget = null;
+    fp.walkStuckSec = 0;
+    fp.settleT = prefersReducedMotion ? 1 : 0;
+    fp.y = prefersReducedMotion ? FP_EYE_HEIGHT : FP_EYE_HEIGHT + 1.15;
+  }
+
+  function enterFirstPerson() {
+    if (fp.active) return;
+    cancelIntroSweep();
+    pointerGesture = null;
+    activePointers.clear();
+    multiPrev = null;
+    hadMultiTouch = false;
+    fpTouchMove = null;
+    fpTouchLook = null;
+
+    placeFirstPersonNear(cam.tx, cam.tz, cam.az);
+    fp.active = true;
+    skyDome.visible = true;
+    skyDome.position.set(fp.x, 0, fp.z);
+    fpCamera.position.set(fp.x, fp.y, fp.z);
+    fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
+    fpCamera.updateMatrixWorld();
+    syncComposerCamera(fpCamera);
+    canvas.style.cursor = idleCursor();
+  }
+
+  function exitFirstPerson(toHome = false) {
+    if (!fp.active) return;
+    fp.active = false;
+    fp.walkTarget = null;
+    fpTouchMove = null;
+    fpTouchLook = null;
+    pointerGesture = null;
+    activePointers.clear();
+    pressedKeys.clear();
+    if (document.pointerLockElement === canvas) {
+      try {
+        document.exitPointerLock();
+      } catch {
+        // ignore pointer-lock exit errors
+      }
+    }
+    skyDome.visible = false;
+    syncComposerCamera(camera);
+
+    if (!toHome) {
+      const aheadX = Math.max(-CLAMP_BOUND, Math.min(CLAMP_BOUND, fp.x - Math.sin(fp.yaw) * 6.5));
+      const aheadZ = Math.max(-CLAMP_BOUND, Math.min(CLAMP_BOUND, fp.z - Math.cos(fp.yaw) * 6.5));
+      cam.tx = cam.goalTx = aheadX;
+      cam.tz = cam.goalTz = aheadZ;
+      cam.az = cam.goalAz = fp.yaw;
+      cam.el = prefersReducedMotion ? HOME_EL : 0.24;
+      cam.goalEl = HOME_EL;
+      cam.ty = lowAngleTargetY(cam.el);
+      cam.goalTy = 0;
+      cam.zoom = prefersReducedMotion ? getHomeZoom() : 1.52;
+      cam.goalZoom = getHomeZoom();
+    }
+    canvas.style.cursor = idleCursor();
+  }
+
   function setDragMode(mode) {
-    dragMode = mode === "orbit" ? "orbit" : "pan";
-    if (!pointerGesture && activePointers.size === 0) {
-      canvas.style.cursor = idleCursor();
+    const next = mode === "walk" ? "walk" : mode === "orbit" ? "orbit" : "pan";
+    if (next === "walk") {
+      dragMode = "walk";
+      enterFirstPerson();
+    } else {
+      if (fp.active) {
+        exitFirstPerson(false);
+      }
+      dragMode = next;
+      if (!pointerGesture && activePointers.size === 0) {
+        canvas.style.cursor = idleCursor();
+      }
     }
     callbacks.onDragModeChange?.(dragMode);
   }
@@ -1935,6 +2312,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
   function recenterCamera() {
     cancelIntroSweep();
+    if (fp.active) {
+      exitFirstPerson(true);
+    }
     cam.az = HOME_AZ + wrapPi(cam.az - HOME_AZ);
     cam.goalTx = HOME_TX;
     cam.goalTy = 0;
@@ -1950,6 +2330,38 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     (e) => {
       e.preventDefault();
       cancelIntroSweep();
+      if (fp.active) {
+        if (e.ctrlKey || e.metaKey) {
+          const baseFov = (canvas.clientWidth || 1280) / Math.max(1, canvas.clientHeight || 800) < 0.8 ? 72 : 62;
+          fpCamera.fov = Math.max(42, Math.min(82, fpCamera.fov * Math.exp(e.deltaY * 0.0035)));
+          fpCamera.updateProjectionMatrix();
+          syncComposerCamera(fpCamera);
+          if (Math.abs(fpCamera.fov - baseFov) < 0.4) fpCamera.fov = baseFov;
+          return;
+        }
+        const nowFp = performance.now();
+        const notchedFp =
+          e.deltaMode !== 0 ||
+          (e.deltaX === 0 && Math.abs(e.wheelDeltaY) >= 120 && e.wheelDeltaY % 120 === 0);
+        if (notchedFp && nowFp - lastTrackpadAt > 400) {
+          const step = -Math.sign(e.deltaY) * 2.2;
+          const [nx, nz] = resolveWalkPosition(
+            fp.x - Math.sin(fp.yaw) * step,
+            fp.z - Math.cos(fp.yaw) * step,
+          );
+          fp.x = nx;
+          fp.z = nz;
+          fp.walkTarget = null;
+          return;
+        }
+        lastTrackpadAt = nowFp;
+        fp.goalYaw -= e.deltaX * 0.0038;
+        fp.goalPitch = Math.max(
+          FP_MIN_PITCH,
+          Math.min(FP_MAX_PITCH, fp.goalPitch - e.deltaY * 0.0032),
+        );
+        return;
+      }
       if (e.ctrlKey || e.metaKey) {
         zoomAt(Math.exp(-e.deltaY * 0.0085), e.clientX, e.clientY);
         return;
@@ -1971,6 +2383,32 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     },
     { passive: false },
   );
+
+  canvas.addEventListener("dblclick", () => {
+    if (!fp.active) return;
+    if (document.pointerLockElement === canvas) {
+      try {
+        document.exitPointerLock();
+      } catch {
+        // ignore
+      }
+    } else {
+      try {
+        canvas.requestPointerLock?.();
+      } catch {
+        // ignore unsupported environments
+      }
+    }
+  });
+
+  document.addEventListener("mousemove", (e) => {
+    if (!fp.active || document.pointerLockElement !== canvas) return;
+    fp.goalYaw -= (e.movementX || 0) * 0.0026;
+    fp.goalPitch = Math.max(
+      FP_MIN_PITCH,
+      Math.min(FP_MAX_PITCH, fp.goalPitch - (e.movementY || 0) * 0.0024),
+    );
+  });
 
   let pointerGesture = null;
   const activePointers = new Map();
@@ -1998,6 +2436,49 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     } catch {
       // Synthetic pointer events in tests may omit active capture handles
     }
+
+    if (fp.active) {
+      if (e.pointerType === "touch") {
+        const rect = canvas.getBoundingClientRect();
+        const lx = e.clientX - rect.left;
+        const ly = e.clientY - rect.top;
+        const inMoveZone = lx < rect.width * 0.48 && ly > rect.height * 0.42;
+        if (!fpTouchMove && inMoveZone) {
+          fpTouchMove = {
+            id: e.pointerId,
+            startX: e.clientX,
+            startY: e.clientY,
+            curX: e.clientX,
+            curY: e.clientY,
+            moved: false,
+          };
+        } else if (!fpTouchLook) {
+          fpTouchLook = {
+            id: e.pointerId,
+            startX: e.clientX,
+            startY: e.clientY,
+            lastX: e.clientX,
+            lastY: e.clientY,
+            moved: false,
+          };
+        }
+        callbacks.onHoverCreation?.(null, e.clientX, e.clientY, null);
+        return;
+      }
+
+      pointerGesture = {
+        id: e.pointerId,
+        kind: "fp_look",
+        button: e.button,
+        startX: e.clientX,
+        startY: e.clientY,
+        lastX: e.clientX,
+        lastY: e.clientY,
+        moved: false,
+      };
+      return;
+    }
+
     activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY, vx: 0, vy: 0 });
 
     if (activePointers.size >= 2) {
@@ -2024,6 +2505,62 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   });
 
   canvas.addEventListener("pointermove", (e) => {
+    if (fp.active) {
+      if (fpTouchMove && fpTouchMove.id === e.pointerId) {
+        fpTouchMove.curX = e.clientX;
+        fpTouchMove.curY = e.clientY;
+        if (Math.hypot(e.clientX - fpTouchMove.startX, e.clientY - fpTouchMove.startY) > 6) {
+          fpTouchMove.moved = true;
+          fp.walkTarget = null;
+        }
+        return;
+      }
+      if (fpTouchLook && fpTouchLook.id === e.pointerId) {
+        const dx = e.clientX - fpTouchLook.lastX;
+        const dy = e.clientY - fpTouchLook.lastY;
+        fpTouchLook.lastX = e.clientX;
+        fpTouchLook.lastY = e.clientY;
+        if (Math.hypot(e.clientX - fpTouchLook.startX, e.clientY - fpTouchLook.startY) > 5) {
+          fpTouchLook.moved = true;
+        }
+        if (fpTouchLook.moved) {
+          fp.goalYaw -= dx * 0.0056;
+          fp.goalPitch = Math.max(
+            FP_MIN_PITCH,
+            Math.min(FP_MAX_PITCH, fp.goalPitch - dy * 0.0048),
+          );
+        }
+        return;
+      }
+      if (pointerGesture && pointerGesture.kind === "fp_look" && pointerGesture.id === e.pointerId) {
+        const dx = e.clientX - pointerGesture.lastX;
+        const dy = e.clientY - pointerGesture.lastY;
+        pointerGesture.lastX = e.clientX;
+        pointerGesture.lastY = e.clientY;
+        if (Math.hypot(e.clientX - pointerGesture.startX, e.clientY - pointerGesture.startY) > 4) {
+          pointerGesture.moved = true;
+        }
+        if (pointerGesture.moved) {
+          callbacks.onHoverCreation?.(null, e.clientX, e.clientY, null);
+          fp.goalYaw -= dx * 0.0052;
+          fp.goalPitch = Math.max(
+            FP_MIN_PITCH,
+            Math.min(FP_MAX_PITCH, fp.goalPitch - dy * 0.0044),
+          );
+          canvas.style.cursor = "grabbing";
+        }
+        return;
+      }
+      if (document.pointerLockElement !== canvas) {
+        const hoveredFp = pickCreationAt(e.clientX, e.clientY);
+        const readingFp =
+          hoveredFp && hoveredFp.id !== "__city_sign__" ? liveFeedsById[hoveredFp.id] || null : null;
+        callbacks.onHoverCreation?.(hoveredFp ? hoveredFp.data : null, e.clientX, e.clientY, readingFp);
+        canvas.style.cursor = hoveredFp ? "pointer" : idleCursor();
+      }
+      return;
+    }
+
     if (activePointers.has(e.pointerId)) {
       const prevPtr = activePointers.get(e.pointerId);
       const stepX = e.clientX - prevPtr.x;
@@ -2120,7 +2657,45 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     }
   });
 
+  const handleFirstPersonTap = (clientX, clientY) => {
+    const picked = pickCreationAt(clientX, clientY);
+    if (picked) {
+      if (picked.id !== "__city_sign__") {
+        highlightedId = picked.id;
+      }
+      callbacks.onSelectCreation?.(picked.data, liveFeedsById[picked.id] || null);
+      return;
+    }
+    const walkHit = screenToGroundWalkTarget(clientX, clientY);
+    if (walkHit) {
+      fp.walkTarget = walkHit;
+      fp.walkStuckSec = 0;
+    }
+  };
+
   const endGesture = (e) => {
+    if (fp.active) {
+      if (fpTouchMove && fpTouchMove.id === e.pointerId) {
+        const wasTap = !fpTouchMove.moved && e.type === "pointerup";
+        fpTouchMove = null;
+        if (wasTap) handleFirstPersonTap(e.clientX, e.clientY);
+        return;
+      }
+      if (fpTouchLook && fpTouchLook.id === e.pointerId) {
+        const wasTap = !fpTouchLook.moved && e.type === "pointerup";
+        fpTouchLook = null;
+        if (wasTap) handleFirstPersonTap(e.clientX, e.clientY);
+        return;
+      }
+      if (pointerGesture && pointerGesture.id === e.pointerId) {
+        const wasClickFp = !pointerGesture.moved && pointerGesture.button === 0 && e.type === "pointerup";
+        pointerGesture = null;
+        canvas.style.cursor = idleCursor();
+        if (wasClickFp) handleFirstPersonTap(e.clientX, e.clientY);
+      }
+      return;
+    }
+
     activePointers.delete(e.pointerId);
 
     if (activePointers.size >= 2) {
@@ -2190,8 +2765,64 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   canvas.addEventListener("pointerup", endGesture);
   canvas.addEventListener("pointercancel", endGesture);
 
+  const isKeyDown = (...tokens) => tokens.some((tk) => pressedKeys.has(tk));
+
+  window.addEventListener("blur", () => {
+    pressedKeys.clear();
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") {
+      pressedKeys.clear();
+    }
+  });
+
+  window.addEventListener("keyup", (e) => {
+    if (e.code) pressedKeys.delete(e.code);
+    if (e.key) pressedKeys.delete(String(e.key).toLowerCase());
+  });
+
   window.addEventListener("keydown", (e) => {
     if (e.target?.matches?.("input, textarea")) return;
+
+    if (fp.active) {
+      if (e.code === "Space" && e.target?.matches?.("button, a")) return;
+      if (e.code) pressedKeys.add(e.code);
+      if (e.key) pressedKeys.add(String(e.key).toLowerCase());
+
+      if (
+        e.key === "ArrowUp" ||
+        e.key === "ArrowDown" ||
+        e.key === "ArrowLeft" ||
+        e.key === "ArrowRight" ||
+        e.code === "Space"
+      ) {
+        e.preventDefault();
+      }
+      if (e.code === "Space" && fp.jumpY <= 0.002) {
+        fp.jumpVy = 5.2;
+      }
+      if (
+        isKeyDown(
+          "KeyW",
+          "w",
+          "KeyS",
+          "s",
+          "KeyA",
+          "a",
+          "KeyD",
+          "d",
+          "ArrowUp",
+          "arrowup",
+          "ArrowDown",
+          "arrowdown",
+        )
+      ) {
+        fp.walkTarget = null;
+      }
+      return;
+    }
+
     if (
       e.key === "ArrowLeft" ||
       e.key === "ArrowRight" ||
@@ -2228,6 +2859,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     const ent = creationEntities.get(id);
     if (!ent) return;
     highlightedId = id;
+    if (fp.active) {
+      const stand = Math.max(7.5, (ent.footprintRadius || 3.4) + 5.0);
+      placeFirstPersonNear(ent.x, ent.z, fp.yaw, stand, ent.topY);
+      return;
+    }
     const altOffset = ent.y > 1 ? ent.y / Math.max(0.35, Math.tan(cam.el)) : 0;
     const projX = ent.x - Math.sin(cam.az) * altOffset;
     const projZ = ent.z - Math.cos(cam.az) * altOffset;
@@ -2255,10 +2891,14 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     camera.top = BASE_FRUSTUM;
     camera.bottom = -BASE_FRUSTUM;
     camera.updateProjectionMatrix();
+    fpCamera.aspect = aspect;
+    fpCamera.fov = aspect < 0.8 ? 72 : 62;
+    fpCamera.updateProjectionMatrix();
     if (composer) {
       composer.setSize(w, h);
       gtaoPass?.setSize(w, h);
       smaaPass?.setSize(w, h);
+      syncComposerCamera(fp.active ? fpCamera : camera);
     }
     if (ogMode && currentWorld) {
       frameActiveWorldForOg();
@@ -2301,90 +2941,247 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
     grassUniforms.uTime.value = t;
 
-    if (introSweep.active) {
-      if (currentWorld || bootWaitElapsed > 0.45) {
-        introSweep.elapsed += dt;
-      } else {
-        bootWaitElapsed += dt;
+    let focusWorldX = cam.tx;
+    let focusWorldZ = cam.tz;
+    let activeAz = cam.az;
+    let viewerPos = null;
+
+    if (fp.active) {
+      const turnRate = 1.95;
+      if (isKeyDown("ArrowLeft", "arrowleft", "KeyQ", "q")) {
+        fp.goalYaw += turnRate * dt;
       }
-      const homeZ = getHomeZoom();
-      cam.goalZoom = homeZ;
-      const rawU = Math.max(0, (introSweep.elapsed - introSweep.holdSec) / introSweep.durationSec);
-      if (rawU >= 1) {
-        introSweep.active = false;
-        cam.tx = cam.goalTx = HOME_TX;
-        cam.ty = cam.goalTy = 0;
-        cam.tz = cam.goalTz = HOME_TZ;
-        cam.zoom = cam.goalZoom = homeZ;
-        cam.az = cam.goalAz = HOME_AZ;
-        cam.el = cam.goalEl = HOME_EL;
-      } else {
-        // Quintic smootherstep for silky ground-level takeoff & gentle landing
-        const e = rawU * rawU * rawU * (rawU * (rawU * 6 - 15) + 10);
-        cam.tx = introSweep.fromTx + (HOME_TX - introSweep.fromTx) * e;
-        cam.ty = introSweep.fromTy + (0 - introSweep.fromTy) * e;
-        cam.tz = introSweep.fromTz + (HOME_TZ - introSweep.fromTz) * e;
-        cam.zoom = introSweep.fromZoom + (homeZ - introSweep.fromZoom) * e;
-        cam.az = introSweep.fromAz + (HOME_AZ - introSweep.fromAz) * e;
-        cam.el = introSweep.fromEl + (HOME_EL - introSweep.fromEl) * e;
+      if (isKeyDown("ArrowRight", "arrowright", "KeyE", "e")) {
+        fp.goalYaw -= turnRate * dt;
       }
+      if (isKeyDown("PageUp", "pageup")) {
+        fp.goalPitch = Math.min(FP_MAX_PITCH, fp.goalPitch + 1.15 * dt);
+      }
+      if (isKeyDown("PageDown", "pagedown")) {
+        fp.goalPitch = Math.max(FP_MIN_PITCH, fp.goalPitch - 1.15 * dt);
+      }
+
+      const lookDamp = 1 - Math.exp(-dt * 20);
+      fp.yaw += (fp.goalYaw - fp.yaw) * lookDamp;
+      fp.pitch += (fp.goalPitch - fp.pitch) * lookDamp;
+
+      let inFwd = 0;
+      let inRight = 0;
+      if (isKeyDown("KeyW", "w", "ArrowUp", "arrowup")) inFwd += 1;
+      if (isKeyDown("KeyS", "s", "ArrowDown", "arrowdown")) inFwd -= 1;
+      if (isKeyDown("KeyD", "d")) inRight += 1;
+      if (isKeyDown("KeyA", "a")) inRight -= 1;
+
+      if (fpTouchMove && fpTouchMove.moved) {
+        const jx = (fpTouchMove.curX - fpTouchMove.startX) / 46;
+        const jy = -(fpTouchMove.curY - fpTouchMove.startY) / 46;
+        const jMag = Math.hypot(jx, jy);
+        if (jMag > 0.08) {
+          const clampMag = Math.min(1, jMag);
+          inRight += (jx / jMag) * clampMag;
+          inFwd += (jy / jMag) * clampMag;
+        }
+      }
+
+      const sprint = isKeyDown("ShiftLeft", "ShiftRight", "shift");
+      const maxSpeed = sprint ? 9.6 : 5.8;
+
+      const fwdX = -Math.sin(fp.yaw);
+      const fwdZ = -Math.cos(fp.yaw);
+      const rightX = Math.cos(fp.yaw);
+      const rightZ = -Math.sin(fp.yaw);
+
+      let wishVx = 0;
+      let wishVz = 0;
+      const inMag = Math.hypot(inFwd, inRight);
+      if (inMag > 0.02) {
+        const scale = Math.min(1, inMag) / inMag;
+        const nf = inFwd * scale;
+        const nr = inRight * scale;
+        wishVx = (fwdX * nf + rightX * nr) * maxSpeed;
+        wishVz = (fwdZ * nf + rightZ * nr) * maxSpeed;
+      } else if (fp.walkTarget) {
+        const dx = fp.walkTarget.x - fp.x;
+        const dz = fp.walkTarget.z - fp.z;
+        const dist = Math.hypot(dx, dz);
+        if (dist < 0.55) {
+          fp.walkTarget = null;
+        } else {
+          const autoSpeed = Math.min(maxSpeed, Math.max(2.0, dist * 1.8));
+          wishVx = (dx / dist) * autoSpeed;
+          wishVz = (dz / dist) * autoSpeed;
+        }
+      }
+
+      const velDamp = 1 - Math.exp(-dt * 14);
+      fp.vx += (wishVx - fp.vx) * velDamp;
+      fp.vz += (wishVz - fp.vz) * velDamp;
+
+      const prevX = fp.x;
+      const prevZ = fp.z;
+      const [rx, rz] = resolveWalkPosition(fp.x + fp.vx * dt, fp.z + fp.vz * dt);
+      fp.x = rx;
+      fp.z = rz;
+
+      if (fp.walkTarget) {
+        const movedDist = Math.hypot(fp.x - prevX, fp.z - prevZ);
+        if (movedDist < dt * 0.65) {
+          fp.walkStuckSec += dt;
+          if (fp.walkStuckSec > 0.4) fp.walkTarget = null;
+        } else {
+          fp.walkStuckSec = 0;
+        }
+      }
+
+      if (fp.jumpY > 0 || fp.jumpVy > 0) {
+        fp.jumpY += fp.jumpVy * dt;
+        fp.jumpVy -= 15.5 * dt;
+        if (fp.jumpY <= 0) {
+          fp.jumpY = 0;
+          fp.jumpVy = 0;
+        }
+      }
+
+      if (fp.settleT < 1) {
+        fp.settleT = Math.min(1, fp.settleT + dt * 3.4);
+      }
+      const settleEase = 1 - (1 - fp.settleT) ** 3;
+      const settleLift = (1 - settleEase) * 1.15;
+
+      const horizSpeed = Math.hypot(fp.x - prevX, fp.z - prevZ) / Math.max(0.001, dt);
+      const bobBlend = prefersReducedMotion || fp.jumpY > 0.02 ? 0 : Math.min(1, horizSpeed / 4.8);
+      if (bobBlend > 0.02) {
+        fp.bobPhase += dt * (7.2 + horizSpeed * 0.52);
+      }
+      const bobY = Math.sin(fp.bobPhase * 2) * 0.036 * bobBlend;
+      const swayX = Math.cos(fp.bobPhase) * 0.016 * bobBlend;
+
+      fp.y = FP_EYE_HEIGHT + settleLift + fp.jumpY + bobY;
+      fpCamera.position.set(fp.x + rightX * swayX, fp.y, fp.z + rightZ * swayX);
+      fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
+      fpCamera.updateMatrixWorld();
+
+      skyDome.visible = true;
+      skyDome.position.set(fp.x, 0, fp.z);
+
+      focusWorldX = fp.x;
+      focusWorldZ = fp.z;
+      activeAz = fp.yaw;
+      viewerPos = fp;
+
+      const azDeltaFromHome = wrapPi(fp.yaw - HOME_AZ);
+      if (
+        callbacks.onCameraChange &&
+        (Number.isNaN(lastReportedAz) ||
+          Math.abs(fp.yaw - lastReportedAz) > 0.004 ||
+          lastReportedHome !== false)
+      ) {
+        lastReportedAz = fp.yaw;
+        lastReportedHome = false;
+        callbacks.onCameraChange({
+          az: fp.yaw,
+          el: fp.pitch,
+          zoom: 1,
+          tx: fp.x,
+          tz: fp.z,
+          azDeltaFromHome,
+          isHome: false,
+          fpActive: true,
+        });
+      }
+
+      groundMesh.position.set(fp.x, 0, fp.z);
+      grassUniforms.uFocusXZ.value.set(fp.x, fp.z);
+      grassUniforms.uHorizonRange.value.set(96, 238);
+      updateTexelSnappedSun(fp.x + fwdX * 18, fp.z + fwdZ * 18);
     } else {
-      const damp = 1 - Math.exp(-dt * 11);
-      cam.tx += (cam.goalTx - cam.tx) * damp;
-      cam.ty += (cam.goalTy - cam.ty) * damp;
-      cam.tz += (cam.goalTz - cam.tz) * damp;
-      cam.zoom += (cam.goalZoom - cam.zoom) * damp;
-      cam.az += (cam.goalAz - cam.az) * damp;
-      cam.el += (cam.goalEl - cam.el) * damp;
+      skyDome.visible = false;
+      if (introSweep.active) {
+        if (currentWorld || bootWaitElapsed > 0.45) {
+          introSweep.elapsed += dt;
+        } else {
+          bootWaitElapsed += dt;
+        }
+        const homeZ = getHomeZoom();
+        cam.goalZoom = homeZ;
+        const rawU = Math.max(0, (introSweep.elapsed - introSweep.holdSec) / introSweep.durationSec);
+        if (rawU >= 1) {
+          introSweep.active = false;
+          cam.tx = cam.goalTx = HOME_TX;
+          cam.ty = cam.goalTy = 0;
+          cam.tz = cam.goalTz = HOME_TZ;
+          cam.zoom = cam.goalZoom = homeZ;
+          cam.az = cam.goalAz = HOME_AZ;
+          cam.el = cam.goalEl = HOME_EL;
+        } else {
+          // Quintic smootherstep for silky ground-level takeoff & gentle landing
+          const e = rawU * rawU * rawU * (rawU * (rawU * 6 - 15) + 10);
+          cam.tx = introSweep.fromTx + (HOME_TX - introSweep.fromTx) * e;
+          cam.ty = introSweep.fromTy + (0 - introSweep.fromTy) * e;
+          cam.tz = introSweep.fromTz + (HOME_TZ - introSweep.fromTz) * e;
+          cam.zoom = introSweep.fromZoom + (homeZ - introSweep.fromZoom) * e;
+          cam.az = introSweep.fromAz + (HOME_AZ - introSweep.fromAz) * e;
+          cam.el = introSweep.fromEl + (HOME_EL - introSweep.fromEl) * e;
+        }
+      } else {
+        const damp = 1 - Math.exp(-dt * 11);
+        cam.tx += (cam.goalTx - cam.tx) * damp;
+        cam.ty += (cam.goalTy - cam.ty) * damp;
+        cam.tz += (cam.goalTz - cam.tz) * damp;
+        cam.zoom += (cam.goalZoom - cam.zoom) * damp;
+        cam.az += (cam.goalAz - cam.az) * damp;
+        cam.el += (cam.goalEl - cam.el) * damp;
+      }
+
+      const camDist = 240;
+      const horiz = Math.cos(cam.el) * camDist;
+      camera.position.set(
+        cam.tx + Math.sin(cam.az) * horiz,
+        cam.ty + Math.sin(cam.el) * camDist,
+        cam.tz + Math.cos(cam.az) * horiz,
+      );
+      camera.lookAt(cam.tx, cam.ty, cam.tz);
+      camera.zoom = cam.zoom;
+      camera.updateProjectionMatrix();
+
+      const azDeltaFromHome = wrapPi(cam.az - HOME_AZ);
+      const isHome =
+        !introSweep.active &&
+        Math.abs(azDeltaFromHome) < 0.03 &&
+        Math.abs(cam.el - HOME_EL) < 0.03 &&
+        Math.abs(cam.zoom - getHomeZoom()) < 0.04 &&
+        Math.hypot(cam.tx - HOME_TX, cam.tz - HOME_TZ) < 1.2;
+
+      if (
+        callbacks.onCameraChange &&
+        (Number.isNaN(lastReportedAz) ||
+          Math.abs(cam.az - lastReportedAz) > 0.004 ||
+          isHome !== lastReportedHome)
+      ) {
+        lastReportedAz = cam.az;
+        lastReportedHome = isHome;
+        callbacks.onCameraChange({
+          az: cam.az,
+          el: cam.el,
+          zoom: cam.zoom,
+          tx: cam.tx,
+          tz: cam.tz,
+          azDeltaFromHome,
+          isHome,
+          fpActive: false,
+        });
+      }
+
+      groundMesh.position.set(cam.tx, 0, cam.tz);
+      grassUniforms.uFocusXZ.value.set(cam.tx, cam.tz);
+      const lowHorizonT = Math.max(0, Math.min(1, (cam.el - 0.14) / 0.24));
+      const lowHorizonSmooth = lowHorizonT * lowHorizonT * (3 - 2 * lowHorizonT);
+      grassUniforms.uHorizonRange.value.set(
+        72 + (145 - 72) * lowHorizonSmooth,
+        142 + (295 - 142) * lowHorizonSmooth,
+      );
+      updateTexelSnappedSun(cam.tx, cam.tz);
     }
-
-    const camDist = 240;
-    const horiz = Math.cos(cam.el) * camDist;
-    camera.position.set(
-      cam.tx + Math.sin(cam.az) * horiz,
-      cam.ty + Math.sin(cam.el) * camDist,
-      cam.tz + Math.cos(cam.az) * horiz,
-    );
-    camera.lookAt(cam.tx, cam.ty, cam.tz);
-    camera.zoom = cam.zoom;
-    camera.updateProjectionMatrix();
-
-    const azDeltaFromHome = wrapPi(cam.az - HOME_AZ);
-    const isHome =
-      !introSweep.active &&
-      Math.abs(azDeltaFromHome) < 0.03 &&
-      Math.abs(cam.el - HOME_EL) < 0.03 &&
-      Math.abs(cam.zoom - getHomeZoom()) < 0.04 &&
-      Math.hypot(cam.tx - HOME_TX, cam.tz - HOME_TZ) < 1.2;
-
-    if (
-      callbacks.onCameraChange &&
-      (Number.isNaN(lastReportedAz) ||
-        Math.abs(cam.az - lastReportedAz) > 0.004 ||
-        isHome !== lastReportedHome)
-    ) {
-      lastReportedAz = cam.az;
-      lastReportedHome = isHome;
-      callbacks.onCameraChange({
-        az: cam.az,
-        el: cam.el,
-        zoom: cam.zoom,
-        tx: cam.tx,
-        tz: cam.tz,
-        azDeltaFromHome,
-        isHome,
-      });
-    }
-
-    groundMesh.position.set(cam.tx, 0, cam.tz);
-    grassUniforms.uFocusXZ.value.set(cam.tx, cam.tz);
-    const lowHorizonT = Math.max(0, Math.min(1, (cam.el - 0.14) / 0.24));
-    const lowHorizonSmooth = lowHorizonT * lowHorizonT * (3 - 2 * lowHorizonT);
-    grassUniforms.uHorizonRange.value.set(
-      72 + (145 - 72) * lowHorizonSmooth,
-      142 + (295 - 142) * lowHorizonSmooth,
-    );
-    updateTexelSnappedSun(cam.tx, cam.tz);
 
     const allEnts = Array.from(creationEntities.values());
     const ponds = (currentWorld?.props || []).filter((p) => p.kind === "pond");
@@ -2392,7 +3189,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     const obstacles = [{ x: CITY_SIGN_POS[0], z: CITY_SIGN_POS[1], r: 2.9 }];
 
     for (const ent of allEnts) {
-      ent.step(dt, t, allEnts, ponds, cam.az);
+      ent.step(dt, t, allEnts, ponds, activeAz, viewerPos);
       if (ent.data.behavior?.type === "vehicle_route") {
         activeVehicles.push(ent);
       } else if (ent.data.category === "building" || ent.data.behavior?.type === "landmark") {
@@ -2443,7 +3240,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     }
 
     if (composer) composer.render();
-    else renderer.render(scene, camera);
+    else renderer.render(scene, fp.active ? fpCamera : camera);
 
     if (ogMode && currentWorld) {
       ogSettledFrames++;
@@ -2464,7 +3261,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     recenterCamera,
     setDragMode,
     getDragMode,
-    getCameraTarget: () => ({ x: cam.tx, z: cam.tz, zoom: cam.zoom }),
+    enterFirstPerson: () => setDragMode("walk"),
+    exitFirstPerson: () => setDragMode("pan"),
+    isFirstPerson: () => fp.active,
+    getCameraTarget: () =>
+      fp.active ? { x: fp.x, z: fp.z, zoom: 1 } : { x: cam.tx, z: cam.tz, zoom: cam.zoom },
     getCameraState: () => ({
       tx: cam.tx,
       ty: cam.ty,
@@ -2474,9 +3275,19 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       el: cam.el,
       dragMode,
       introActive: introSweep.active,
+      fpActive: fp.active,
+      fpX: fp.x,
+      fpY: fp.y,
+      fpZ: fp.z,
+      fpYaw: fp.yaw,
+      fpPitch: fp.pitch,
     }),
     getPlotRadius: () => plotMarker.getPlotRadius(),
-    isPointerActive: () => Boolean(pointerGesture) || activePointers.size > 0,
+    isPointerActive: () =>
+      Boolean(pointerGesture) ||
+      Boolean(fpTouchMove) ||
+      Boolean(fpTouchLook) ||
+      activePointers.size > 0,
     getCreationEntity: (id) => creationEntities.get(id) || null,
   };
 }

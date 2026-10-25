@@ -41,6 +41,7 @@ const weaveToast = document.getElementById("weave-toast");
 
 const camPanBtn = document.getElementById("cam-pan-btn");
 const camOrbitBtn = document.getElementById("cam-orbit-btn");
+const camWalkBtn = document.getElementById("cam-walk-btn");
 const recenterBtn = document.getElementById("recenter-btn");
 const recenterCompass = document.getElementById("recenter-compass");
 
@@ -129,14 +130,20 @@ function stopJobTracking() {
 }
 
 function syncCameraModeUI(mode) {
+  const isPan = mode === "pan";
   const isOrbit = mode === "orbit";
+  const isWalk = mode === "walk";
   if (camPanBtn) {
-    camPanBtn.classList.toggle("is-active", !isOrbit);
-    camPanBtn.setAttribute("aria-pressed", isOrbit ? "false" : "true");
+    camPanBtn.classList.toggle("is-active", isPan);
+    camPanBtn.setAttribute("aria-pressed", isPan ? "true" : "false");
   }
   if (camOrbitBtn) {
     camOrbitBtn.classList.toggle("is-active", isOrbit);
     camOrbitBtn.setAttribute("aria-pressed", isOrbit ? "true" : "false");
+  }
+  if (camWalkBtn) {
+    camWalkBtn.classList.toggle("is-active", isWalk);
+    camWalkBtn.setAttribute("aria-pressed", isWalk ? "true" : "false");
   }
 }
 
@@ -201,6 +208,22 @@ camPanBtn?.addEventListener("click", () => {
 
 camOrbitBtn?.addEventListener("click", () => {
   engine.setDragMode("orbit");
+});
+
+camWalkBtn?.addEventListener("click", () => {
+  hoverCard.hidden = true;
+  if (engine.isFirstPerson()) {
+    engine.setDragMode("pan");
+    return;
+  }
+  if (uiState === "picking" || uiState === "composing") {
+    hideError();
+    chosenSpot = null;
+    uiState = "idle";
+    syncDockUI();
+  }
+  engine.setDragMode("walk");
+  camWalkBtn.blur();
 });
 
 recenterBtn?.addEventListener("click", () => {
@@ -376,6 +399,9 @@ promptInput.addEventListener("input", () => {
 
 // 1. Click "+ Add" -> pick where on the island it will go
 addBtn.addEventListener("click", () => {
+  if (engine.isFirstPerson()) {
+    engine.setDragMode("pan");
+  }
   if (myCreationId) {
     uiState = "placed";
     syncDockUI();
@@ -413,6 +439,10 @@ window.addEventListener("keydown", (e) => {
       chosenSpot = null;
       uiState = "idle";
       syncDockUI();
+    } else if (engine.isFirstPerson()) {
+      e.preventDefault();
+      hoverCard.hidden = true;
+      engine.setDragMode("pan");
     }
   }
 });

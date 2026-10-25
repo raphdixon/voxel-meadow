@@ -72,9 +72,9 @@
     <!-- Endless Animated Sunlit Grass Voxel Canvas -->
     <canvas id="world-canvas" aria-label="Shared animated 3D voxel grass world"></canvas>
 
-    <!-- Camera Controls (Desktop + Mobile: Pan / Orbit toggle + Recentre) -->
+    <!-- Camera Controls (Desktop + Mobile: Pan / Orbit / Walk + Recentre) -->
     <div id="cam-controls" class="cam-controls" role="toolbar" aria-label="Camera controls">
-      <div class="cam-mode-group" role="group" aria-label="Camera drag mode">
+      <div class="cam-mode-group" role="group" aria-label="Camera mode">
         <button
           type="button"
           id="cam-pan-btn"
@@ -99,6 +99,21 @@
             <polyline points="21 3 21 9 15 9" />
           </svg>
           <span>Orbit</span>
+        </button>
+        <button
+          type="button"
+          id="cam-walk-btn"
+          class="cam-mode-btn"
+          aria-pressed="false"
+          title="Walk in first person"
+        >
+          <svg class="cam-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="4.5" r="2" />
+            <path d="M8.5 20.5L10.8 14l3.2 2.8.6 3.7" />
+            <path d="M10.8 14l1-5.2" />
+            <path d="M7.5 12.4l3.8-3.4 3.4 1 2.3 2.2" />
+          </svg>
+          <span>Walk</span>
         </button>
       </div>
 

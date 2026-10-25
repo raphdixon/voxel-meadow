@@ -618,12 +618,12 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
     },
     {
       id: "path-green-walk",
-      kind: "dirt_trail",
+      kind: "footpath",
       points: [
-        [0, -16.5],
-        [1, -4],
-        [-2, 8],
-        [0, 16.5],
+        [0, -16.4],
+        [0.8, -5.0],
+        [-1.2, 6.5],
+        [0, 16.4],
       ],
     },
   ];

@@ -526,6 +526,13 @@ export default {
           });
           return jsonResponse(request, { ok: true, ...res }, 200);
         }
+        if (url.pathname === "/api/dev/load-world-snapshot" && request.method === "POST") {
+          const parsed = await readBoundedJsonBody(request, 8_000_000);
+          if (!parsed.ok) return jsonResponse(request, { ok: false, error: parsed.error }, 400);
+          const stub = getWorldStub(env);
+          const loaded = await stub.loadDevWorldSnapshot(parsed.data as Record<string, unknown>);
+          return jsonResponse(request, { ok: true, ...loaded }, 200);
+        }
       }
 
       // Reject any unknown /api/* route cleanly (never fall through to static assets)

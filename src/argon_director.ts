@@ -138,7 +138,7 @@ function findNearestPathCurb(
       bestD = hit.dist;
       bestCenter = [Number(hit.closestX.toFixed(1)), Number(hit.closestZ.toFixed(1))];
       bestKind = p.kind;
-      const offset = p.kind === "road" ? 2.54 : 1.16;
+      const offset = p.kind === "road" ? 2.52 : 0.48;
       const dx = x - hit.closestX;
       const dz = z - hit.closestZ;
       const len = Math.hypot(dx, dz);
@@ -435,11 +435,18 @@ export function buildInitialIntegration(
     const useMainLoop =
       Boolean(mainLoop && mainLoop.points.length >= 4) &&
       vehicleRoadKind === "road" &&
-      Math.hypot(target.x, target.z) < 36;
+      Math.hypot(target.x, target.z) < 95;
 
     let routePts: [number, number][];
     if (useMainLoop && mainLoop) {
-      routePts = mainLoop.points.map(([px, pz]) => [px, pz]);
+      const existingVehCount = world.creations.filter(
+        (c) => c.id !== target.id && c.behavior?.type === "vehicle_route",
+      ).length;
+      const shift = (existingVehCount * Math.floor(mainLoop.points.length / 2)) % mainLoop.points.length;
+      routePts = mainLoop.points.map((_, idx) => {
+        const pt = mainLoop.points[(idx + shift) % mainLoop.points.length];
+        return [pt[0], pt[1]];
+      });
     } else {
       const cx = target.x * 0.72 + nearestCurb.curb[0] * 0.28;
       const cz = target.z * 0.72 + nearestCurb.curb[1] * 0.28;
@@ -708,20 +715,20 @@ CRITICAL MOBILITY, SCALE & BLUEPRINT AMENDMENT RULES:
 
 PLANAR NON-CROSSING ROAD & TRAIL TOPOLOGY RULES (CRITICAL!):
 - Inspect \`world.paths\` and \`world.pathCrossings\` before designing ANY path or road!
-- NEVER draw a \`road\` or trail whose segments slice across \`path-main-loop\` or across any other existing \`road\` or trail!
-- Connect each stationary landmark using a short, clean spur from its doorway (\`footprintRadius + 0.7m\` outside \`[x, z]\`) to the **NEAREST** existing road curb (~2.5m OUTSIDE the road centerline, so flagstones/planks kiss the stone curb cleanly without overlapping the asphalt!) or nearest trail T-junction (~1.2m from trail centerline).
-- NEVER draw long cross-island trails that shoot straight across the central village green or across \`path-main-loop\` to reach a landmark on the far side — let travelers use the existing loop and spur network!
+- NEVER create \`"kind": "road"\` unless you are actively assigning \`"vehicle_route"\` to a driving vehicle along those exact waypoints! Stationary buildings (including stations and datacentres) MUST connect via pedestrian walkways (\`"cobblestone"\`, \`"footpath"\`, or \`"dirt_trail"\`), NEVER empty asphalt loops!
+- NEVER draw circumferential trails running parallel beside \`"path-main-loop"\`, and NEVER draw trails cutting across the central village green inside \`"path-main-loop"\`!
+- Connect each stationary landmark using a single short, clean radial spur (2 to 3 smooth points) from its doorway (\`footprintRadius + 0.75m\` outside \`[x, z]\`) to the **NEAREST** existing road curb (~2.52m OUTSIDE the road centerline, so flagstones kiss the stone curb cleanly without overlapping the asphalt!) or nearest existing trail (~0.5m from trail centerline).
 - If you replace an initial placeholder (\`initpath-<id>\` or \`initroad-<id>\`), or if \`world.pathCrossings.count > 0\` shows crossing/tangled non-seed paths, list the crossing or superseded path IDs in \`"removePathIds"\` (NEVER remove \`"path-main-loop"\`) and, if needed, provide a clean non-crossing curb-snapped replacement in \`"newPaths"\`!
 
-UNIQUE PATH STYLES & EVOLVING GROUND BIOMES (CRITICAL — MAKE EVERY NEIGHBORHOOD LOOK DISTINCT!):
-- NEVER default to normal asphalt \`"road"\` unless a motor bus/car transit route truly needs paved asphalt!
-- Choose \`newPaths[].kind\` to fit the creation's character:
-  * \`"dirt_trail"\` — warm winding dirt & pebble country trail (waterfalls, forests, cabins, farms, windmills, mines, campsites, wildlife, hills!).
-  * \`"boardwalk"\` — timber plank walkway (surf shacks, beaches, ponds, waterfalls, docks, lagoons!).
-  * \`"cobblestone"\` — old-world stone cobbles (castles, towers, shrines, fountains, cafes, plazas, bakeries!).
-  * \`"volcanic_trail"\` — dark charred basalt & glowing ember trail (volcanoes, dragon roosts, lava forges, geysers!).
-  * \`"footpath"\` — garden stepping flagstones (cottages, bookshops, parks).
-  * \`"road"\` — paved asphalt transit road (ONLY for city buses, cars, stations, datacentres).
+UNIQUE PATH STYLES & EVOLVING GROUND BIOMES (CRITICAL — MAKE EVERY NEIGHBORHOOD LOOK COHESIVE!):
+- NEVER default to normal asphalt \`"road"\` unless an active motor bus/car \`"vehicle_route"\` drives on it!
+- Choose \`newPaths[].kind\` to fit the creation's character cohesively (avoid switching styles mid-corridor):
+  * \`"footpath"\` — airy garden stepping flagstones (cottages, bookshops, parks, courts, halfpipes, shops).
+  * \`"cobblestone"\` — warm stone walkway (castles, towers, shrines, fountains, cafes, plazas, datacentres, stations).
+  * \`"dirt_trail"\` — gentle country path (waterfalls, forests, cabins, farms, windmills, quarries, campsites, hills).
+  * \`"boardwalk"\` — timber plank walkway (ONLY adjacent to beaches, ponds, surf shacks, docks, or lagoons!).
+  * \`"volcanic_trail"\` — dark basalt & ember trail (ONLY in volcanic basalt zones: volcanoes, lava forges, geysers).
+  * \`"road"\` — paved asphalt transit road (ONLY for active \`"vehicle_route"\` buses/cars outside the main loop).
 - Transform the ground around distinctive areas using \`newTerrainZones\` (\`radius\` 6..22 around \`[x, z]\`):
   * \`"volcanic_basalt"\` — scorched obsidian rock with glowing magma cracks (volcanoes, lava, dragon roosts)
   * \`"misty_moss"\` — damp mossy earth, ferns & river stones (waterfalls, springs, creeks, forests, cabins)
@@ -801,13 +808,46 @@ export function sanitizeWorldPatch(
           rawWaypoints.push(nudgeClearOfBuildings(num(pt[0], target.x), num(pt[1], target.z), world.creations, creationId));
         }
       }
-      const waypoints = uncrossPolyline2D(rawWaypoints, true).points;
+      let waypoints = uncrossPolyline2D(rawWaypoints, true).points;
+      const roadCurves = world.paths
+        .filter((rp) => rp.kind === "road" && rp.points.length >= 3)
+        .map((rp) => ({
+          path: rp,
+          curve: sampleCatmullRom2D(rp.points, Boolean(rp.closed), 0.75),
+        }));
+      const mainRoad = roadCurves.find((r) => r.path.id === "path-main-loop") ?? roadCurves[0];
+      const straysOffRoad =
+        mainRoad &&
+        waypoints.some(
+          ([wx, wz]) =>
+            Math.hypot(wx, wz) < 95 &&
+            !roadCurves.some((rc) => distPointToPolyline2D(wx, wz, rc.curve).dist <= 3.2),
+        );
+      if (straysOffRoad && mainRoad) {
+        const basePts = mainRoad.path.points;
+        const vehSlot = Math.max(
+          0,
+          world.creations
+            .filter((c) => c.behavior?.type === "vehicle_route")
+            .findIndex((c) => c.id === creationId),
+        );
+        const shift = (vehSlot * Math.floor(basePts.length / 2)) % basePts.length;
+        waypoints = basePts.map((_, idx) => {
+          const p = basePts[(idx + shift) % basePts.length];
+          return [p[0], p[1]];
+        });
+      }
       if (waypoints.length >= 3) {
+        const routeCurve = sampleCatmullRom2D(waypoints, true, 0.75);
         const stops: RouteStop[] = [];
         for (const sRaw of Array.isArray(bRaw.stops) ? bRaw.stops.slice(0, 6) : []) {
           if (!sRaw || typeof sRaw !== "object") continue;
           const sr = sRaw as Record<string, unknown>;
-          const [sx, sz] = nudgeClearOfBuildings(num(sr.x, waypoints[0][0]), num(sr.z, waypoints[0][1]), world.creations, creationId);
+          const [rawSx, rawSz] = nudgeClearOfBuildings(num(sr.x, waypoints[0][0]), num(sr.z, waypoints[0][1]), world.creations, creationId);
+          const snappedStop = distPointToPolyline2D(rawSx, rawSz, routeCurve);
+          const sx = Math.round(snappedStop.closestX * 10) / 10;
+          const sz = Math.round(snappedStop.closestZ * 10) / 10;
+          if (stops.some((prev) => Math.hypot(prev.x - sx, prev.z - sz) < 5.5)) continue;
           stops.push({
             id: sanitizePlainText(sr.id, 32, true) || shortId("stop"),
             name: sanitizePlainText(sr.name, 36, true) || "Meadow Stop",
@@ -969,6 +1009,18 @@ export function sanitizeWorldPatch(
     "boardwalk",
     "volcanic_trail",
   ]);
+  const activeVehicleWaypoints: [number, number][] = [];
+  for (const c of world.creations) {
+    if (c.behavior.type === "vehicle_route" && Array.isArray(c.behavior.waypoints)) {
+      activeVehicleWaypoints.push(...c.behavior.waypoints);
+    }
+  }
+  for (const ub of updatedBehaviors) {
+    if (ub.behavior.type === "vehicle_route" && Array.isArray(ub.behavior.waypoints)) {
+      activeVehicleWaypoints.push(...ub.behavior.waypoints);
+    }
+  }
+
   const newPaths: WorldPath[] = [];
   for (const pRaw of Array.isArray(raw.newPaths) ? raw.newPaths.slice(0, 6) : []) {
     if (!pRaw || typeof pRaw !== "object") continue;
@@ -982,9 +1034,30 @@ export function sanitizeWorldPatch(
           kind === "road"
             ? nudgeClearOfBuildings(num(pt[0], 0), num(pt[1], 0), world.creations)
             : [clamp(num(pt[0], 0), -160, 160), clamp(num(pt[1], 0), -160, 160)];
-        rawPts.push([Number(nx.toFixed(1)), Number(nz.toFixed(1))]);
+        const rounded: [number, number] = [Number(nx.toFixed(1)), Number(nz.toFixed(1))];
+        const prev = rawPts[rawPts.length - 1];
+        if (!prev || Math.hypot(rounded[0] - prev[0], rounded[1] - prev[1]) >= 1.2) {
+          rawPts.push(rounded);
+        }
       }
     }
+    if (rawPts.length < 2) continue;
+
+    // Keep "path-main-loop" as the single village asphalt ring road inside r < 95m;
+    // only smooth closed outer loops (r >= 95m) actively used by outer vehicles may use "road".
+    if (kind === "road") {
+      const minRad = Math.min(...rawPts.map(([rx, rz]) => Math.hypot(rx, rz)));
+      const isClosedLoop = Boolean(pr.closed) && rawPts.length >= 6 && minRad >= 95;
+      const usedByVehicle =
+        isClosedLoop &&
+        rawPts.some(([rx, rz]) =>
+          activeVehicleWaypoints.some(
+            ([vx, vz]) => Math.hypot(vx, vz) >= 95 && Math.hypot(rx - vx, rz - vz) <= 5.5,
+          ),
+        );
+      if (!usedByVehicle) continue;
+    }
+
     const isClosed = Boolean(pr.closed) && rawPts.length >= 3;
     const pts = uncrossPolyline2D(rawPts, isClosed).points;
     if (pts.length >= 2) {
@@ -1039,6 +1112,18 @@ export function sanitizeWorldPatch(
     const kindStr = typeof pr.kind === "string" ? pr.kind : "flower_patch";
     const kind = (propKinds.has(kindStr) ? kindStr : "flower_patch") as WorldProp["kind"];
     const [px, pz] = nudgeClearOfBuildings(num(pr.x, 0), num(pr.z, 0), world.creations, undefined, 4.2);
+    // Avoid orphaned bus stops far from any paved road
+    if (kind === "bus_stop") {
+      const allRoads = [
+        ...world.paths.filter((ep) => ep.kind === "road"),
+        ...newPaths.filter((ep) => ep.kind === "road"),
+      ];
+      const nearRoad = allRoads.some((rp) => {
+        const curve = sampleCatmullRom2D(rp.points, Boolean(rp.closed), 0.75);
+        return distPointToPolyline2D(px, pz, curve).dist <= 5.0;
+      });
+      if (!nearRoad) continue;
+    }
     // Avoid duplicate overlapping props
     if (world.props.some((ep) => ep.kind === kind && Math.hypot(ep.x - px, ep.z - pz) < 3.0)) continue;
     const cleanLabel = sanitizePlainText(pr.label, 32, true);

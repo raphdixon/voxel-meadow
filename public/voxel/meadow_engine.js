@@ -627,6 +627,7 @@ function buildRibbonMesh(
   colorHex,
   receiveShadow = true,
   polyOffset = -1,
+  roundCaps = true,
 ) {
   const pts = curve.getSpacedPoints(sampleCount);
   const isClosed = Boolean(curve.closed);
@@ -699,6 +700,59 @@ function buildRibbonMesh(
         }
       }
     }
+  }
+
+  if (!isClosed && roundCaps && pts.length >= 2) {
+    const CAP_SEGS = 8;
+    const appendCap = (centerPt, outTx, outTz) => {
+      const lx = -outTz;
+      const lz = outTx;
+      const centerIdx = positions.length / 3;
+      positions.push(centerPt.x, yOffset, centerPt.z);
+      normals.push(0, 1, 0);
+      uvs.push(0.5, 0.5);
+
+      const fanStart = positions.length / 3;
+      for (let k = 0; k <= CAP_SEGS; k++) {
+        const th = (k / CAP_SEGS) * Math.PI;
+        const dx = -lx * Math.cos(th) + outTx * Math.sin(th);
+        const dz = -lz * Math.cos(th) + outTz * Math.sin(th);
+        positions.push(centerPt.x + dx * halfWidth, yOffset, centerPt.z + dz * halfWidth);
+        normals.push(0, 1, 0);
+        uvs.push(0.5 + dx * 0.5, 0.5 + dz * 0.5);
+      }
+      for (let k = 0; k < CAP_SEGS; k++) {
+        indices.push(centerIdx, fanStart + k + 1, fanStart + k);
+      }
+
+      const skirtStart = positions.length / 3;
+      for (let k = 0; k <= CAP_SEGS; k++) {
+        const th = (k / CAP_SEGS) * Math.PI;
+        const dx = -lx * Math.cos(th) + outTx * Math.sin(th);
+        const dz = -lz * Math.cos(th) + outTz * Math.sin(th);
+        const ex = centerPt.x + dx * halfWidth;
+        const ez = centerPt.z + dz * halfWidth;
+        positions.push(ex, yOffset, ez);
+        positions.push(ex, 0, ez);
+        normals.push(dx, 0.25, dz, dx, 0.25, dz);
+        uvs.push(k / CAP_SEGS, 1, k / CAP_SEGS, 0);
+      }
+      for (let k = 0; k < CAP_SEGS; k++) {
+        const b = skirtStart + k * 2;
+        indices.push(b, b + 2, b + 3, b, b + 3, b + 1);
+      }
+    };
+
+    const sDx = pts[0].x - pts[1].x;
+    const sDz = pts[0].z - pts[1].z;
+    const sLen = Math.hypot(sDx, sDz) || 1;
+    appendCap(pts[0], sDx / sLen, sDz / sLen);
+
+    const last = pts.length - 1;
+    const eDx = pts[last].x - pts[last - 1].x;
+    const eDz = pts[last].z - pts[last - 1].z;
+    const eLen = Math.hypot(eDx, eDz) || 1;
+    appendCap(pts[last], eDx / eLen, eDz / eLen);
   }
 
   const geo = new THREE.BufferGeometry();
@@ -1367,33 +1421,33 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     fv.box(-2, 0, -2, 2, 1, 2, cMain);
     fv.put(-2, 0, -2, cEdge);
     fv.put(1, 0, 1, cEdge);
-    return buildVoxelMesh(fv, { scale: 0.24, castShadow: false, depthLayer: 1 });
+    return buildVoxelMesh(fv, { scale: 0.21, castShadow: false, depthLayer: 1 });
   });
 
   const dirtPebbleProtos = [0, 1, 2].map((variant) => {
     const pv = new Vox(450 + variant * 13);
     pv.box(-1, 0, -1, 1, 1, 1, variant === 0 ? "stone" : variant === 1 ? "path2" : "moss");
     if (variant === 0) pv.put(1, 0, 0, "concrete2");
-    return buildVoxelMesh(pv, { scale: 0.2, castShadow: false, depthLayer: 1 });
+    return buildVoxelMesh(pv, { scale: 0.16, castShadow: false, depthLayer: 1 });
   });
 
   const cobbleProtos = [0, 1, 2].map((variant) => {
     const cv = new Vox(490 + variant * 19);
-    const cA = variant === 0 ? "concrete" : variant === 1 ? "limestone" : "path";
-    const cB = variant === 0 ? "concrete2" : variant === 1 ? "stone" : "path2";
-    cv.box(-3, 0, -2, 0, 1, 1, cA);
-    cv.box(1, 0, -2, 3, 1, 2, cB);
-    cv.box(-2, 0, 1, 1, 1, 2, cB);
-    return buildVoxelMesh(cv, { scale: 0.23, castShadow: false, depthLayer: 2 });
+    const cA = variant === 0 ? "limestone" : variant === 1 ? "path" : "cream";
+    const cB = variant === 0 ? "concrete" : variant === 1 ? "path2" : "stone";
+    cv.box(-2, 0, -2, 0, 1, 0, cA);
+    cv.box(1, 0, -1, 3, 1, 1, cB);
+    cv.box(-1, 0, 1, 1, 1, 2, cB);
+    return buildVoxelMesh(cv, { scale: 0.17, castShadow: false, depthLayer: 2 });
   });
 
   const boardwalkPlankProtos = [0, 1].map((variant) => {
     const bv = new Vox(530 + variant * 11);
     const plankCol = variant === 0 ? "oak" : "woodLight";
-    bv.box(-5, 1, -1, 5, 2, 2, plankCol);
-    bv.box(-5, 0, -1, -4, 1, 2, "woodDark");
-    bv.box(4, 0, -1, 5, 1, 2, "woodDark");
-    return buildVoxelMesh(bv, { scale: 0.22, castShadow: true, depthLayer: 2 });
+    bv.box(-4, 1, -1, 4, 2, 2, plankCol);
+    bv.box(-4, 0, -1, -3, 1, 2, "woodDark");
+    bv.box(3, 0, -1, 4, 1, 2, "woodDark");
+    return buildVoxelMesh(bv, { scale: 0.19, castShadow: true, depthLayer: 2 });
   });
 
   const volcanicStepProtos = [0, 1].map((variant) => {
@@ -1401,7 +1455,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     vv.box(-2, 0, -2, 2, 1, 2, "basalt");
     vv.put(variant === 0 ? -2 : 1, 0, 0, "ash");
     vv.put(0, 0, variant === 0 ? 1 : -1, "lava", 1.15);
-    return buildVoxelMesh(vv, { scale: 0.24, castShadow: false, depthLayer: 2 });
+    return buildVoxelMesh(vv, { scale: 0.2, castShadow: false, depthLayer: 2 });
   });
 
   const pathsGroup = new THREE.Group();
@@ -1706,6 +1760,17 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
   function updatePerimeterTreeClearance(world) {
     const creations = world?.creations || [];
+    const sampledPaths = (world?.paths || [])
+      .filter((p) => Array.isArray(p.points) && p.points.length >= 2)
+      .map((p) => {
+        const vecs = p.points.map(([x, z]) => new THREE.Vector3(x, 0, z));
+        const curve = new THREE.CatmullRomCurve3(vecs, Boolean(p.closed), "centripetal", 0.5);
+        const len = Math.max(3, curve.getLength());
+        return {
+          clearance: p.kind === "road" ? 3.8 : 2.35,
+          pts: curve.getSpacedPoints(Math.min(120, Math.max(12, Math.round(len * 0.6)))),
+        };
+      });
     for (const item of perimeterScenery) {
       let blocked = false;
       for (const c of creations) {
@@ -1718,6 +1783,19 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         if (Math.hypot(item.x - c.x, item.z - c.z) < fr + 3.0) {
           blocked = true;
           break;
+        }
+      }
+      if (!blocked) {
+        for (const sp of sampledPaths) {
+          for (let i = 0; i + 1 < sp.pts.length; i++) {
+            const a = sp.pts[i];
+            const b = sp.pts[i + 1];
+            if (distToSeg2D(item.x, item.z, a.x, a.z, b.x, b.z) < sp.clearance) {
+              blocked = true;
+              break;
+            }
+          }
+          if (blocked) break;
         }
       }
       item.mesh.visible = !blocked;
@@ -1778,10 +1856,18 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           }
         }
       }
-      if (!bestCp || bestDist > 3.35 || bestDist < 0.05) return null;
-      const ux = (endVec.x - bestCp.x) / bestDist;
-      const uz = (endVec.z - bestCp.z) / bestDist;
-      return new THREE.Vector3(bestCp.x + ux * 0.42, 0, bestCp.z + uz * 0.42);
+      if (!bestCp || bestDist > 3.35) return null;
+      return new THREE.Vector3(bestCp.x, 0, bestCp.z);
+    };
+
+    const nearOtherRoadCenter = (px, pz, selfId) => {
+      for (const rc of roadSamples) {
+        if (rc.id === selfId) continue;
+        for (let i = 0; i < rc.pts.length; i++) {
+          if (Math.hypot(px - rc.pts[i].x, pz - rc.pts[i].z) < 2.85) return true;
+        }
+      }
+      return false;
     };
 
     for (let pIdx = 0; pIdx < allPaths.length; pIdx++) {
@@ -1803,15 +1889,15 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         }
       }
       const curve = new THREE.CatmullRomCurve3(vecs, Boolean(p.closed), "centripetal", 0.5);
-      const len = Math.max(4, curve.getLength());
-      const samples = Math.min(200, Math.max(28, Math.round(len * 1.4)));
+      const len = Math.max(2.5, curve.getLength());
+      const samples = Math.min(200, Math.max(28, Math.round(len * 1.45)));
 
       if (p.kind === "road") {
         const isPrimaryRoad = p.id === "path-main-loop" || Boolean(p.closed);
-        const asphaltY = isPrimaryRoad ? 0.091 : Math.max(0.082, 0.088 - Math.min(5, pIdx) * 0.001);
-        const asphaltPoly = isPrimaryRoad ? -2.3 : -1.9;
-        pathsGroup.add(buildRibbonMesh(curve, samples, 2.52, 0.052, "#dfd7c5", true, -1));
-        pathsGroup.add(buildRibbonMesh(curve, samples, 2.1, asphaltY, "#4b505c", true, asphaltPoly));
+        const asphaltY = isPrimaryRoad ? 0.091 : Math.max(0.084, 0.089 - Math.min(5, pIdx) * 0.001);
+        const asphaltPoly = isPrimaryRoad ? -2.3 : -2.0;
+        pathsGroup.add(buildRibbonMesh(curve, samples, 2.52, 0.052, "#dfd7c5", true, -1, true));
+        pathsGroup.add(buildRibbonMesh(curve, samples, 2.1, asphaltY, "#4b505c", true, asphaltPoly, true));
 
         const dashCount = Math.floor(len / 3.4);
         const dashGeo = new THREE.BoxGeometry(0.2, 0.026, 1.3);
@@ -1825,10 +1911,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           const u = (i + 0.5) / dashCount;
           const distFromStart = u * len;
           const distFromEnd = (1 - u) * len;
-          if ((tJunctionStart && distFromStart < 2.65) || (tJunctionEnd && distFromEnd < 2.65)) {
+          if ((tJunctionStart && distFromStart < 2.8) || (tJunctionEnd && distFromEnd < 2.8)) {
             continue;
           }
           const pt = curve.getPointAt(u);
+          if (!isPrimaryRoad && nearOtherRoadCenter(pt.x, pt.z, p.id)) continue;
           const tan = curve.getTangentAt(u);
           const dash = new THREE.Mesh(dashGeo, dashMat);
           dash.position.set(pt.x, 0.106, pt.z);
@@ -1836,12 +1923,13 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           pathsGroup.add(dash);
         }
       } else if (p.kind === "dirt_trail") {
-        // Warm country dirt road / forest trail with soft sandy-loam edge & scattered border pebbles
-        pathsGroup.add(buildRibbonMesh(curve, samples, 1.48, 0.042, "#b58b5e", true, -1));
-        pathsGroup.add(buildRibbonMesh(curve, samples, 1.08, 0.068, "#8e6239", true, -2));
+        // Gentle country dirt path with rounded ends, soft sandy-loam edge & subtle border stones
+        const zBias = Math.min(28, pIdx) * 0.00022;
+        pathsGroup.add(buildRibbonMesh(curve, samples, 0.98, 0.03 - zBias, "#bfa074", true, -1, true));
+        pathsGroup.add(buildRibbonMesh(curve, samples, 0.68, 0.045 - zBias, "#9b7248", true, -2, true));
 
-        const pebbleCount = Math.max(3, Math.floor(len / 2.2));
-        for (let i = 0; i <= pebbleCount; i++) {
+        const pebbleCount = Math.max(2, Math.floor(len / 2.8));
+        for (let i = 1; i < pebbleCount; i++) {
           const u = i / pebbleCount;
           const pt = curve.getPointAt(u);
           const tan = curve.getTangentAt(u);
@@ -1850,63 +1938,73 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           const nz = tan.x * side;
           const pebble = dirtPebbleProtos[i % dirtPebbleProtos.length].clone();
           pebble.userData.sharedProto = true;
-          pebble.position.set(pt.x + nx * 1.25, -0.14, pt.z + nz * 1.25);
+          pebble.position.set(pt.x + nx * 0.88, -0.115, pt.z + nz * 0.88);
           pebble.rotation.y = (i * 1.9) % (Math.PI * 2);
           pathsGroup.add(pebble);
         }
       } else if (p.kind === "cobblestone") {
-        // Old-world stone cobble lane with warm mortar ribbon + irregular stone clusters
-        pathsGroup.add(buildRibbonMesh(curve, samples, 1.32, 0.045, "#a39a8b", true, -1));
-        const cobbleCount = Math.max(4, Math.floor(len / 1.15));
+        // Refined warm stone cobble walkway with rounded limestone bed & staggered low-profile pavers
+        const zBias = Math.min(28, pIdx) * 0.00022;
+        pathsGroup.add(buildRibbonMesh(curve, samples, 0.88, 0.036 - zBias, "#c4baa6", true, -1, true));
+        const cobbleCount = Math.max(3, Math.floor(len / 0.95));
         for (let i = 0; i <= cobbleCount; i++) {
           const u = i / cobbleCount;
           const pt = curve.getPointAt(u);
           const tan = curve.getTangentAt(u);
+          const side = ((i % 3) - 1) * 0.16;
+          const nx = -tan.z * side;
+          const nz = tan.x * side;
           const cob = cobbleProtos[i % cobbleProtos.length].clone();
           cob.userData.sharedProto = true;
-          cob.position.set(pt.x, -0.155, pt.z);
-          cob.rotation.y = Math.atan2(tan.x, tan.z) + (i % 2 === 0 ? 0.05 : -0.05);
+          cob.position.set(pt.x + nx, -0.115, pt.z + nz);
+          cob.rotation.y = Math.atan2(tan.x, tan.z) + (((i * 5) % 7) - 3) * 0.14;
           pathsGroup.add(cob);
         }
       } else if (p.kind === "boardwalk") {
-        // Raised timber plank boardwalk for beaches, ponds, lagoons & waterfalls
-        const plankCount = Math.max(4, Math.floor(len / 0.92));
+        // Cohesive timber plank boardwalk over continuous dark-oak stringer rails
+        const zBias = Math.min(28, pIdx) * 0.00022;
+        pathsGroup.add(buildRibbonMesh(curve, samples, 0.62, 0.032 - zBias, "#6b4b30", true, -1, true));
+        const plankCount = Math.max(4, Math.floor(len / 0.78));
         for (let i = 0; i <= plankCount; i++) {
           const u = i / plankCount;
           const pt = curve.getPointAt(u);
           const tan = curve.getTangentAt(u);
           const plank = boardwalkPlankProtos[i % boardwalkPlankProtos.length].clone();
           plank.userData.sharedProto = true;
-          plank.position.set(pt.x, -0.18, pt.z);
+          plank.position.set(pt.x, -0.145, pt.z);
           plank.rotation.y = Math.atan2(tan.x, tan.z);
           pathsGroup.add(plank);
         }
       } else if (p.kind === "volcanic_trail") {
-        // Charred obsidian basalt path with warm glowing ember stones
-        pathsGroup.add(buildRibbonMesh(curve, samples, 1.38, 0.048, "#2b2d36", true, -1));
-        const stepCount = Math.max(3, Math.floor(len / 1.45));
+        // Charred obsidian basalt path with staggered ember stones
+        const zBias = Math.min(28, pIdx) * 0.00022;
+        pathsGroup.add(buildRibbonMesh(curve, samples, 0.92, 0.038 - zBias, "#2b2d36", true, -1, true));
+        const stepCount = Math.max(3, Math.floor(len / 1.35));
         for (let i = 0; i <= stepCount; i++) {
           const u = i / stepCount;
           const pt = curve.getPointAt(u);
           const tan = curve.getTangentAt(u);
           const st = volcanicStepProtos[i % volcanicStepProtos.length].clone();
           st.userData.sharedProto = true;
-          st.position.set(pt.x, -0.16, pt.z);
-          st.rotation.y = Math.atan2(tan.x, tan.z) + (((i % 3) - 1) * 0.12);
+          st.position.set(pt.x, -0.135, pt.z);
+          st.rotation.y = Math.atan2(tan.x, tan.z) + (((i % 3) - 1) * 0.15);
           pathsGroup.add(st);
         }
       } else {
-        // Garden stepping flagstones
-        const stoneCount = Math.max(3, Math.floor(len / 1.42));
+        // Airy garden stepping flagstones with gentle left/right walking rhythm
+        const stoneCount = Math.max(2, Math.floor(len / 1.22));
         for (let i = 0; i <= stoneCount; i++) {
-          const u = i / stoneCount;
+          const u = stoneCount === 0 ? 0.5 : i / stoneCount;
           const pt = curve.getPointAt(u);
           const tan = curve.getTangentAt(u);
+          const sway = (i % 2 === 0 ? 1 : -1) * 0.1;
+          const nx = -tan.z * sway;
+          const nz = tan.x * sway;
           const stone = flagstoneProtos[i % flagstoneProtos.length].clone();
           stone.userData.sharedProto = true;
-          stone.position.set(pt.x, -0.185, pt.z);
+          stone.position.set(pt.x + nx, -0.155, pt.z + nz);
           stone.rotation.y = Math.atan2(tan.x, tan.z) + (((i % 3) - 1) * 0.08);
-          stone.scale.set(1.0 + (i % 2) * 0.12, 1, 0.92 + ((i + 1) % 2) * 0.12);
+          stone.scale.set(1.0 + (i % 2) * 0.1, 1, 0.92 + ((i + 1) % 2) * 0.1);
           pathsGroup.add(stone);
         }
       }

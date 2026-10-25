@@ -1,4 +1,5 @@
 import type {
+  CreationBehavior,
   VoxelBlueprint,
   VoxelOp,
   VoxelPart,
@@ -804,25 +805,85 @@ const SEED_PATH_IDS = new Set([
   "path-green-walk",
 ]);
 
+const SEED_PROP_IDS = new Set([
+  "prop-central-pond",
+  "prop-stop-clocktower",
+  "prop-stop-bookshop",
+  "prop-stop-bakery",
+  "prop-lamp-1",
+  "prop-lamp-2",
+  "prop-lamp-3",
+  "prop-bench-pond",
+  "prop-flowers-1",
+  "prop-flowers-2",
+]);
+
 function round1(v: number): number {
   return Number(v.toFixed(1));
 }
 
 function dedupeSequentialPts(pts: [number, number][], minStep = 0.85): [number, number][] {
-  if (pts.length <= 2) return pts.map(([x, z]) => [round1(x), round1(z)]);
+  if (pts.length === 0) return [];
+  if (pts.length === 1) return [[round1(pts[0][0]), round1(pts[0][1])]];
   const out: [number, number][] = [[round1(pts[0][0]), round1(pts[0][1])]];
   for (let i = 1; i < pts.length; i++) {
     const prev = out[out.length - 1];
     const cur: [number, number] = [round1(pts[i][0]), round1(pts[i][1])];
-    if (Math.hypot(cur[0] - prev[0], cur[1] - prev[1]) >= minStep) {
+    const d = Math.hypot(cur[0] - prev[0], cur[1] - prev[1]);
+    if (d >= minStep) {
       out.push(cur);
-    } else if (i === pts.length - 1 && out.length >= 2) {
-      out[out.length - 1] = cur;
-    } else if (i === pts.length - 1 && out.length === 1) {
-      out.push(cur);
+    } else if (i === pts.length - 1) {
+      if (out.length >= 2) {
+        out[out.length - 1] = cur;
+      } else if (d >= 0.4) {
+        out.push(cur);
+      }
     }
   }
   return out;
+}
+
+function deKinkPolyline2D(
+  pts: [number, number][],
+  closed = false,
+): { points: [number, number][]; changed: boolean } {
+  const deduped = dedupeSequentialPts(pts, 1.15);
+  const samePts = (a: [number, number][], b: [number, number][]): boolean =>
+    a.length === b.length && a.every((p, i) => p[0] === b[i][0] && p[1] === b[i][1]);
+  if (closed || deduped.length < 3) {
+    return { points: deduped, changed: !samePts(pts, deduped) };
+  }
+  let cur = deduped;
+  for (let pass = 0; pass < 3 && cur.length >= 3; pass++) {
+    const next: [number, number][] = [cur[0]];
+    let removedInPass = false;
+    for (let i = 1; i < cur.length - 1; i++) {
+      const prev = next[next.length - 1];
+      const p = cur[i];
+      const after = cur[i + 1];
+      const v1x = p[0] - prev[0];
+      const v1z = p[1] - prev[1];
+      const v2x = after[0] - p[0];
+      const v2z = after[1] - p[1];
+      const l1 = Math.hypot(v1x, v1z);
+      const l2 = Math.hypot(v2x, v2z);
+      if (l1 < 1.15 || l2 < 1.15) {
+        removedInPass = true;
+        continue;
+      }
+      const cosTurn = (v1x * v2x + v1z * v2z) / (l1 * l2);
+      // Drop sharp hairpin folds (> ~102 degree turn)
+      if (cosTurn < -0.2) {
+        removedInPass = true;
+        continue;
+      }
+      next.push(p);
+    }
+    next.push(cur[cur.length - 1]);
+    cur = next;
+    if (!removedInPass) break;
+  }
+  return { points: cur, changed: !samePts(pts, cur) };
 }
 
 /**
@@ -1278,19 +1339,74 @@ export function auditAndRepairWorldSpatial(
     return { pt: [x, z], moved };
   };
 
+  // Pre-scan active vehicle routes to identify whether any non-seed asphalt road is actually driven on
+  const mainLoopSeed = paths.find((p) => p.id === "path-main-loop");
+  const mainLoopRefCurve = mainLoopSeed
+    ? sampleCatmullRom2D(mainLoopSeed.points, true, 0.7)
+    : [];
+  const activeVehicleRouteSets = creations
+    .filter(
+      (
+        c,
+      ): c is WorldCreation & {
+        behavior: Extract<CreationBehavior, { type: "vehicle_route" }>;
+      } =>
+        c.behavior?.type === "vehicle_route" &&
+        Array.isArray(c.behavior.waypoints) &&
+        c.behavior.waypoints.length >= 3,
+    )
+    .map((c) => c.behavior.waypoints);
+
   // Pre-scan non-init paths to see which creations already have dedicated integrated paths
   const nonInitPaths = paths.filter(
-    (p) => !p.id.startsWith("initpath-") && !p.id.startsWith("initroad-") && p.points.length >= 2,
+    (p) =>
+      !p.id.startsWith("initpath-") &&
+      !p.id.startsWith("initroad-") &&
+      !p.id.startsWith("spur-") &&
+      p.points.length >= 2,
   );
 
-  // Stage 1: Filter out stale initpath-*/initroad-* and orphan mobile-target trails
+  // Stage 1: Upgrade legacy village-green mud strip, prune unused secondary asphalt roads & stale placeholders
   const candidatePool: WorldPath[] = [];
   for (const p of paths) {
     if (!Array.isArray(p.points) || p.points.length < 2) continue;
 
     if (SEED_PATH_IDS.has(p.id)) {
-      candidatePool.push(p);
+      if (p.id === "path-green-walk" && p.kind === "dirt_trail") {
+        footpathTrimCount++;
+        details.push(`refined central "path-green-walk" to garden stepping stones`);
+        candidatePool.push({ ...p, kind: "footpath" });
+      } else {
+        candidatePool.push(p);
+      }
       continue;
+    }
+
+    if (p.kind === "road") {
+      // Keep "path-main-loop" as the single crisp village asphalt ring road inside r < 95m;
+      // only smooth closed outer loops (minOrigin >= 95m) driven by outer vehicles are allowed.
+      const minRad = Math.min(...p.points.map(([rx, rz]) => Math.hypot(rx, rz)));
+      const isOuterSmoothLoop = Boolean(p.closed) && p.points.length >= 6 && minRad >= 95;
+      const roadCurve = sampleCatmullRom2D(p.points, Boolean(p.closed), 0.75);
+      const usedByActiveVehicle =
+        isOuterSmoothLoop &&
+        activeVehicleRouteSets.some((wps) => {
+          let offMainMatches = 0;
+          for (const [wx, wz] of wps) {
+            const onMain =
+              mainLoopRefCurve.length >= 2 &&
+              distPointToPolyline2D(wx, wz, mainLoopRefCurve).dist <= 5.0;
+            if (!onMain && distPointToPolyline2D(wx, wz, roadCurve).dist <= 4.8) {
+              offMainMatches++;
+            }
+          }
+          return offMainMatches >= 3;
+        });
+      if (!usedByActiveVehicle) {
+        redundantPathsRemoved++;
+        details.push(`removed cluttered secondary asphalt road "${p.id}"`);
+        continue;
+      }
     }
 
     if (p.id.startsWith("initpath-")) {
@@ -1332,6 +1448,16 @@ export function auditAndRepairWorldSpatial(
       }
     }
 
+    if (p.id.startsWith("spur-")) {
+      const cid = p.id.slice("spur-".length);
+      const owner = creationsById.get(cid);
+      if (!owner || (owner.category !== "building" && owner.behavior?.type !== "landmark")) {
+        redundantPathsRemoved++;
+        details.push(`removed stale landmark spur "${p.id}"`);
+        continue;
+      }
+    }
+
     if (p.kind !== "road") {
       const firstPt = p.points[0];
       const lastPt = p.points[p.points.length - 1];
@@ -1367,22 +1493,32 @@ export function auditAndRepairWorldSpatial(
     candidatePool.push(p);
   }
 
-  // Priority order:
-  // 1. Seed main loop ("path-main-loop")
-  // 2. Other seed paths
-  // 3. Roads (longer/established first)
-  // 4. Custom non-init trails (contextual trails before generic footpaths)
-  // 5. Remaining initpath-* spurs
+  // Priority order (radially outward from village core within each tier so inner paths accept before outer branches!):
+  // 0. Seed main loop ("path-main-loop")
+  // 1. Other seed paths
+  // 2. Active vehicle roads
+  // 3. Integrated pedestrian walkways (sorted radially outward from [0,0])
+  // 4. Remaining initpath-* spurs
+  // 5. Auto-generated Stage 5 radial spurs ("spur-*", sorted by owner landmark radial distance)
   const kindRank = (p: WorldPath): number => {
     if (p.id === "path-main-loop") return 0;
     if (SEED_PATH_IDS.has(p.id)) return 1;
     if (p.kind === "road") return 2;
-    if (p.id.startsWith("initpath-")) return 5;
-    if (p.kind === "footpath") return 4;
+    if (p.id.startsWith("spur-")) return 5;
+    if (p.id.startsWith("initpath-")) return 4;
     return 3;
   };
+  const sortDistKey = (p: WorldPath): number => {
+    if (p.id.startsWith("spur-")) {
+      const owner = creationsById.get(p.id.slice("spur-".length));
+      if (owner) return Math.hypot(owner.x, owner.z);
+    }
+    return Math.min(...p.points.map(([x, z]) => Math.hypot(x, z)));
+  };
 
-  candidatePool.sort((a, b) => kindRank(a) - kindRank(b));
+  candidatePool.sort(
+    (a, b) => kindRank(a) - kindRank(b) || sortDistKey(a) - sortDistKey(b) || a.id.localeCompare(b.id),
+  );
 
   interface AcceptedPathEntry {
     path: WorldPath;
@@ -1442,6 +1578,15 @@ export function auditAndRepairWorldSpatial(
     return false;
   };
 
+  const landmarkConnectedByAccepted = (b: WorldCreation): boolean => {
+    const baseR = plinthRadiusOf(b);
+    for (const acc of accepted) {
+      const reach = baseR + (acc.isRoad ? 5.6 : 3.8);
+      if (distPointToPolyline2D(b.x, b.z, acc.curve).dist <= reach) return true;
+    }
+    return false;
+  };
+
   const isEndpointAnchored = (pt: [number, number]): boolean => {
     const [x, z] = pt;
     for (const acc of accepted) {
@@ -1450,21 +1595,33 @@ export function auditAndRepairWorldSpatial(
     for (const b of buildings) {
       if (Math.hypot(x - b.x, z - b.z) <= plinthRadiusOf(b) + 5.6) return true;
     }
-    for (const pr of props) {
-      if (pr.kind === "pond" && Math.hypot(x - pr.x, z - pr.z) <= (pr.radius ?? 6.5) + 3.8) return true;
-      if ((pr.kind === "bus_stop" || pr.kind === "signpost") && Math.hypot(x - pr.x, z - pr.z) <= 4.0) {
+    for (const pr of ponds) {
+      if (Math.hypot(x - pr.x, z - pr.z) <= (pr.radius ?? 6.5) + 3.8) return true;
+    }
+    return false;
+  };
+
+  const touchesConnectedNetwork = (pt: [number, number]): boolean => {
+    const [x, z] = pt;
+    for (const acc of accepted) {
+      if (distPointToPolyline2D(x, z, acc.curve).dist <= 3.7) return true;
+    }
+    for (const b of buildings) {
+      if (
+        landmarkConnectedByAccepted(b) &&
+        Math.hypot(x - b.x, z - b.z) <= plinthRadiusOf(b) + 5.6
+      ) {
         return true;
       }
     }
     return false;
   };
 
-  const landmarkConnectedByAccepted = (b: WorldCreation): boolean => {
-    const reach = plinthRadiusOf(b) + 6.6;
-    for (const acc of accepted) {
-      if (distPointToPolyline2D(b.x, b.z, acc.curve).dist <= reach) return true;
-    }
-    return false;
+  const isPointNearAccOpenEnd = (px: number, pz: number, acc: AcceptedPathEntry, grace: number): boolean => {
+    if (acc.path.closed || acc.curve.length < 2) return false;
+    const s = acc.curve[0];
+    const e = acc.curve[acc.curve.length - 1];
+    return Math.hypot(px - s[0], pz - s[1]) <= grace || Math.hypot(px - e[0], pz - e[1]) <= grace;
   };
 
   const validateCleanSpline = (
@@ -1483,12 +1640,12 @@ export function auditAndRepairWorldSpatial(
     for (const acc of accepted) {
       if (isRoad && acc.isRoad) {
         for (let i = 0; i < curve.length; i++) {
-          const nearEnd = !closed && (cum[i] <= 1.05 || tot - cum[i] <= 1.05);
+          const nearEnd = !closed && (cum[i] <= 1.25 || tot - cum[i] <= 1.25);
           if (distPointToPolyline2D(curve[i][0], curve[i][1], acc.curve).dist < (nearEnd ? 1.92 : 2.22)) {
             return null;
           }
         }
-        if (polylineIntersectsCurveInterior(curve, closed, acc.curve, Boolean(acc.path.closed), 2.15)) {
+        if (polylineIntersectsCurveInterior(curve, closed, acc.curve, Boolean(acc.path.closed), 2.10)) {
           return null;
         }
       } else if (isRoad !== acc.isRoad) {
@@ -1500,12 +1657,13 @@ export function auditAndRepairWorldSpatial(
         }
       } else {
         for (let i = 0; i < curve.length; i++) {
-          const nearEnd = !closed && (cum[i] <= 1.05 || tot - cum[i] <= 1.05);
-          if (!nearEnd && distPointToPolyline2D(curve[i][0], curve[i][1], acc.curve).dist < 0.85) {
+          const nearOwnEnd = !closed && (cum[i] <= 1.25 || tot - cum[i] <= 1.25);
+          const nearAccEnd = isPointNearAccOpenEnd(curve[i][0], curve[i][1], acc, 1.25);
+          if (!nearOwnEnd && !nearAccEnd && distPointToPolyline2D(curve[i][0], curve[i][1], acc.curve).dist < 0.85) {
             return null;
           }
         }
-        if (polylineIntersectsCurveInterior(curve, closed, acc.curve, Boolean(acc.path.closed), 0.92)) {
+        if (polylineIntersectsCurveInterior(curve, closed, acc.curve, Boolean(acc.path.closed), 0.90)) {
           return null;
         }
       }
@@ -1513,29 +1671,143 @@ export function auditAndRepairWorldSpatial(
     return curve;
   };
 
-  for (const rawPath of candidatePool) {
-    if (SEED_PATH_IDS.has(rawPath.id)) {
-      const curve = sampleCatmullRom2D(rawPath.points, Boolean(rawPath.closed), 0.65);
-      accepted.push({ path: rawPath, curve, isRoad: rawPath.kind === "road" });
-      continue;
+  // Check corridor redundancy, road-hugging tracks, central village-green clutter & dangling ends
+  const checkRedundant = (
+    curvePts: [number, number][],
+    curveClosed: boolean,
+    isRoad: boolean,
+  ): boolean => {
+    if (accepted.length === 0 || curvePts.length < 2) return false;
+
+    const totalCurveLen = polylineLength2D(curvePts);
+
+    // Never allow non-seed asphalt roads to cut across the central village green inside path-main-loop
+    if (isRoad) {
+      let insideGreen = 0;
+      for (const [sx, sz] of curvePts) {
+        if (Math.hypot(sx, sz) < 21.0) insideGreen++;
+      }
+      if (insideGreen / curvePts.length >= 0.25) {
+        return true;
+      }
     }
 
-    const isRoad = rawPath.kind === "road";
-    let pts: [number, number][] = rawPath.points.map(([x, z]) => [x, z]);
-    let closed = Boolean(rawPath.closed) && pts.length >= 3;
+    // Open pedestrian trails must have BOTH ends anchored and connect into the accepted island network
+    if (!isRoad && !curveClosed) {
+      const pStart = curvePts[0];
+      const pEnd = curvePts[curvePts.length - 1];
+      if (!isEndpointAnchored(pStart) || !isEndpointAnchored(pEnd)) {
+        return true;
+      }
+      if (!touchesConnectedNetwork(pStart) && !touchesConnectedNetwork(pEnd)) {
+        return true;
+      }
+    }
+
+    // Keep if this path uniquely connects an otherwise-unconnected landmark
+    const uniquelyConnectsLandmark = buildings.some((b) => {
+      if (landmarkConnectedByAccepted(b)) return false;
+      const reach = plinthRadiusOf(b) + (isRoad ? 5.6 : 3.8);
+      return distPointToPolyline2D(b.x, b.z, curvePts).dist <= reach;
+    });
+
+    // Keep the central village green inside path-main-loop calm (only short direct landmark curb spurs allowed)
+    if (!isRoad) {
+      let insideCentralGreen = 0;
+      for (const [sx, sz] of curvePts) {
+        if ((sx / 21.6) * (sx / 21.6) + (sz / 16.6) * (sz / 16.6) < 1.0) {
+          insideCentralGreen++;
+        }
+      }
+      if (insideCentralGreen / curvePts.length > 0.30) {
+        if (!uniquelyConnectsLandmark || totalCurveLen > 8.5) {
+          return true;
+        }
+      }
+
+      // Prune circumferential tracks running parallel beside an accepted asphalt road
+      let parallelRoadLen = 0;
+      for (let i = 0; i + 1 < curvePts.length; i++) {
+        const ax = curvePts[i][0];
+        const az = curvePts[i][1];
+        const dx = curvePts[i + 1][0] - ax;
+        const dz = curvePts[i + 1][1] - az;
+        const segLen = Math.hypot(dx, dz);
+        if (segLen < 1e-4) continue;
+        const mx = ax + dx * 0.5;
+        const mz = az + dz * 0.5;
+        for (const acc of accepted) {
+          if (!acc.isRoad) continue;
+          const h = distPointToPolyline2D(mx, mz, acc.curve);
+          if (h.dist <= 10.2) {
+            const radialDot = Math.abs((dx / segLen) * h.normalX + (dz / segLen) * h.normalZ);
+            if (radialDot < 0.62) {
+              parallelRoadLen += segLen;
+            }
+            break;
+          }
+        }
+      }
+      if (
+        parallelRoadLen >= 7.2 ||
+        (totalCurveLen > 8.0 && parallelRoadLen / Math.max(0.1, totalCurveLen) >= 0.45)
+      ) {
+        return true;
+      }
+    }
+
+    // Prevent opposite-curb 4-way visual X-crossovers across an accepted road unless uniquely required by a landmark
+    if (!uniquelyConnectsLandmark && hasOppositeCurbCrossOver(curvePts, curveClosed)) {
+      return true;
+    }
+
+    const proxThresh = isRoad ? 7.6 : 4.2;
+    let closeCount = 0;
+    for (const [sx, sz] of curvePts) {
+      for (const acc of accepted) {
+        if (isRoad && !acc.isRoad) continue;
+        if (distPointToPolyline2D(sx, sz, acc.curve).dist <= proxThresh) {
+          closeCount++;
+          break;
+        }
+      }
+    }
+    const ratio = closeCount / curvePts.length;
+    if (ratio < (isRoad ? 0.62 : 0.58)) return false;
+
+    return !uniquelyConnectsLandmark;
+  };
+
+  const normalizePathControlPoints = (
+    rawPts: [number, number][],
+    closed: boolean,
+    isRoad: boolean,
+  ): {
+    points: [number, number][];
+    deKinked: boolean;
+    selfUncrossed: boolean;
+    trimmedPlinth: boolean;
+  } => {
+    let pts: [number, number][] = rawPts.map(([x, z]) => [x, z]);
+    let deKinked = false;
+    let selfUncrossed = false;
     let trimmedPlinth = false;
 
-    // Step A: Uncross any figure-8 self-intersection
-    let selfUncrossed = false;
+    const kinkRes = deKinkPolyline2D(pts, closed);
+    if (kinkRes.changed) {
+      pts = kinkRes.points;
+      deKinked = true;
+    }
+    if (pts.length < 2) {
+      return { points: pts, deKinked, selfUncrossed, trimmedPlinth };
+    }
+
     const uncrossed = uncrossPolyline2D(pts, closed);
     if (uncrossed.changed) {
       pts = uncrossed.points;
       selfUncrossed = true;
-      pathCrossingsFixed++;
-      details.push(`uncrossed self-intersecting ${rawPath.kind} "${rawPath.id}"`);
     }
 
-    // Step B: Trim non-road control points clear of building plinths & pond water
     if (!isRoad) {
       for (let idx = 0; idx < pts.length; idx++) {
         const neighbor = pts[idx === 0 ? 1 : idx - 1];
@@ -1546,6 +1818,11 @@ export function auditAndRepairWorldSpatial(
         }
       }
       if (trimmedPlinth) {
+        const reKink = deKinkPolyline2D(pts, closed);
+        if (reKink.changed) {
+          pts = reKink.points;
+          deKinked = true;
+        }
         const reUncross = uncrossPolyline2D(pts, closed);
         if (reUncross.changed) {
           pts = reUncross.points;
@@ -1553,54 +1830,35 @@ export function auditAndRepairWorldSpatial(
         }
       }
     }
+    return { points: pts, deKinked, selfUncrossed, trimmedPlinth };
+  };
+
+  for (const rawPath of candidatePool) {
+    if (SEED_PATH_IDS.has(rawPath.id)) {
+      const curve = sampleCatmullRom2D(rawPath.points, Boolean(rawPath.closed), 0.65);
+      accepted.push({ path: rawPath, curve, isRoad: rawPath.kind === "road" });
+      continue;
+    }
+
+    const isRoad = rawPath.kind === "road";
+    const closed = Boolean(rawPath.closed) && rawPath.points.length >= 3;
+    const norm = normalizePathControlPoints(rawPath.points, closed, isRoad);
+    const pts = norm.points;
+    const { deKinked, selfUncrossed, trimmedPlinth } = norm;
+
+    if (pts.length < 2) {
+      redundantPathsRemoved++;
+      details.push(`removed degenerate path "${rawPath.id}"`);
+      continue;
+    }
+    if (selfUncrossed) {
+      pathCrossingsFixed++;
+      details.push(`uncrossed self-intersecting ${rawPath.kind} "${rawPath.id}"`);
+    }
 
     // Step C: Sample curve and inspect against already-accepted planar network
     const sampled = sampleCatmullRom2D(pts, closed, 0.6);
     if (sampled.length < 2) continue;
-
-    // Check corridor redundancy & central village-green road clutter
-    const checkRedundant = (curvePts: [number, number][], curveClosed: boolean): boolean => {
-      if (accepted.length === 0 || curvePts.length === 0) return false;
-
-      // Never allow non-seed asphalt roads to cut across the central village green inside path-main-loop
-      if (isRoad) {
-        let insideGreen = 0;
-        for (const [sx, sz] of curvePts) {
-          if (Math.hypot(sx, sz) < 21.0) insideGreen++;
-        }
-        if (insideGreen / curvePts.length >= 0.25) {
-          return true;
-        }
-      }
-
-      // Keep if this path uniquely connects an otherwise-unconnected landmark
-      const uniquelyConnectsLandmark = buildings.some((b) => {
-        if (landmarkConnectedByAccepted(b)) return false;
-        const reach = plinthRadiusOf(b) + 6.4;
-        return distPointToPolyline2D(b.x, b.z, curvePts).dist <= reach;
-      });
-
-      // Prevent opposite-curb 4-way visual X-crossovers across an accepted road unless uniquely required by a landmark
-      if (!uniquelyConnectsLandmark && hasOppositeCurbCrossOver(curvePts, curveClosed)) {
-        return true;
-      }
-
-      const proxThresh = isRoad ? 7.6 : 3.7;
-      let closeCount = 0;
-      for (const [sx, sz] of curvePts) {
-        for (const acc of accepted) {
-          if (isRoad && !acc.isRoad) continue;
-          if (distPointToPolyline2D(sx, sz, acc.curve).dist <= proxThresh) {
-            closeCount++;
-            break;
-          }
-        }
-      }
-      const ratio = closeCount / curvePts.length;
-      if (ratio < (isRoad ? 0.62 : 0.6)) return false;
-
-      return !uniquelyConnectsLandmark;
-    };
 
     // Determine which sampled points are blocked by road interiors or trail crossings
     const M = sampled.length;
@@ -1617,20 +1875,18 @@ export function auditAndRepairWorldSpatial(
 
     for (let i = 0; i < M; i++) {
       const [sx, sz] = sampled[i];
-      const nearOwnOpenEnd = !closed && (cumArc[i] <= 1.05 || totalArc - cumArc[i] <= 1.05);
+      const nearOwnOpenEnd = !closed && (cumArc[i] <= 1.25 || totalArc - cumArc[i] <= 1.25);
 
       for (const acc of accepted) {
         if (acc.isRoad) {
           const hit = distPointToPolyline2D(sx, sz, acc.curve);
           if (isRoad) {
-            // Secondary road vs accepted road: block interior overlaps; allow open endpoint T-junctions >= 2.2m
             if (hit.dist < (nearOwnOpenEnd ? 1.85 : 2.15)) {
               blocked[i] = 1;
               hasAnyCrossing = true;
               break;
             }
           } else {
-            // Non-road trail vs accepted road: trails MUST stop outside the stone curb (~2.52m), never < 2.10m!
             if (hit.dist < 2.10) {
               blocked[i] = 1;
               hasAnyCrossing = true;
@@ -1638,7 +1894,6 @@ export function auditAndRepairWorldSpatial(
             }
           }
         } else if (isRoad) {
-          // Secondary road vs already-accepted seed trail: keep asphalt >= 2.10m clear of village green walks!
           const hit = distPointToPolyline2D(sx, sz, acc.curve);
           if (hit.dist < 2.10) {
             blocked[i] = 1;
@@ -1646,9 +1901,9 @@ export function auditAndRepairWorldSpatial(
             break;
           }
         } else {
-          // Trail vs accepted trail: block close interior crossings (< 0.80m away from open T-junction ends)
           const hit = distPointToPolyline2D(sx, sz, acc.curve);
-          if (!nearOwnOpenEnd && hit.dist < 0.80) {
+          const nearAccEnd = isPointNearAccOpenEnd(sx, sz, acc, 1.30);
+          if (!nearOwnOpenEnd && !nearAccEnd && hit.dist < 0.80) {
             blocked[i] = 1;
             hasAnyCrossing = true;
             break;
@@ -1657,7 +1912,7 @@ export function auditAndRepairWorldSpatial(
       }
     }
 
-    // Also mark exact segment-segment crossings (in case a 0.6m step hopped straight across a thin 1.1m trail!)
+    // Also mark exact segment-segment crossings
     for (let i = 0; i + 1 < M; i++) {
       const a1 = sampled[i];
       const a2 = sampled[i + 1];
@@ -1668,14 +1923,7 @@ export function auditAndRepairWorldSpatial(
         for (let j = 0; j + 1 < acc.curve.length; j++) {
           const hit = segSegHit2D(a1, a2, acc.curve[j], acc.curve[j + 1]);
           if (!hit) continue;
-          const nearAccOpenEnd =
-            !acc.path.closed &&
-            acc.curve.length >= 2 &&
-            (Math.hypot(hit[0] - acc.curve[0][0], hit[1] - acc.curve[0][1]) <= 0.95 ||
-              Math.hypot(
-                hit[0] - acc.curve[acc.curve.length - 1][0],
-                hit[1] - acc.curve[acc.curve.length - 1][1],
-              ) <= 0.95);
+          const nearAccOpenEnd = isPointNearAccOpenEnd(hit[0], hit[1], acc, 0.95);
           if (!isRoad && !acc.isRoad && (nearOwnOpenEnd || nearAccOpenEnd)) continue;
           blocked[i] = 1;
           blocked[i + 1] = 1;
@@ -1687,15 +1935,16 @@ export function auditAndRepairWorldSpatial(
     }
 
     if (!hasAnyCrossing) {
-      if (checkRedundant(sampled, closed)) {
+      if (checkRedundant(sampled, closed, isRoad)) {
         redundantPathsRemoved++;
-        details.push(`removed redundant parallel ${rawPath.kind} "${rawPath.id}"`);
+        details.push(`removed redundant or unanchored ${rawPath.kind} "${rawPath.id}"`);
         continue;
       }
-      const nextPath = trimmedPlinth || selfUncrossed ? { ...rawPath, points: pts } : rawPath;
-      if (trimmedPlinth) {
+      const nextPath =
+        trimmedPlinth || selfUncrossed || deKinked ? { ...rawPath, points: pts } : rawPath;
+      if (trimmedPlinth || deKinked) {
         footpathTrimCount++;
-        details.push(`trimmed ${rawPath.kind} "${rawPath.id}" clear of building plinth`);
+        details.push(`smoothed/trimmed ${rawPath.kind} "${rawPath.id}"`);
       }
       const pathJunctions = getRoadCurbJunctions(sampled, closed);
       accepted.push({ path: nextPath, curve: sampled, isRoad });
@@ -1718,7 +1967,6 @@ export function auditAndRepairWorldSpatial(
     if (runStart !== -1 && M - 1 >= runStart) {
       runs.push({ start: runStart, end: M - 1 });
     }
-    // If originally closed and both first and last samples were unblocked, merge wrap-around run
     if (closed && runs.length >= 2 && runs[0].start === 0 && runs[runs.length - 1].end === M - 1) {
       const tail = runs.pop()!;
       runs[0] = { start: tail.start, end: runs[0].end + M };
@@ -1737,8 +1985,7 @@ export function auditAndRepairWorldSpatial(
       if (!bestAcc || !bestHit || bestHit.dist > 4.2) {
         return [round1(freePt[0]), round1(freePt[1])];
       }
-      const targetOffset = isRoad || bestAcc.isRoad ? 2.58 : 1.24;
-      // Step strictly along the perpendicular curve normal pointing toward the unblocked interior!
+      const targetOffset = isRoad || bestAcc.isRoad ? 2.52 : 0.48;
       const refDx = interiorRef[0] - bestHit.closestX;
       const refDz = interiorRef[1] - bestHit.closestZ;
       const dot = refDx * bestHit.normalX + refDz * bestHit.normalZ;
@@ -1785,7 +2032,6 @@ export function auditAndRepairWorldSpatial(
       });
       if (arcLen < (connectsUnconnectedLandmark ? 1.85 : minArc)) continue;
 
-      // Prevent opposite-curb visual 4-way X-crossings from the same split path unless uniquely required by a landmark
       const formsOppositeCurbX =
         !connectsUnconnectedLandmark &&
         ((cutAtStart && keptCutEnds.some((ep) => Math.hypot(ep[0] - subSamples[0][0], ep[1] - subSamples[0][1]) < 8.5)) ||
@@ -1799,32 +2045,28 @@ export function auditAndRepairWorldSpatial(
             )));
       if (formsOppositeCurbX) continue;
 
-      // Drop split fragments with a dangling end in open grass
       const startOk = isEndpointAnchored(subSamples[0]);
       const endOk = isEndpointAnchored(subSamples[subSamples.length - 1]);
-      if ((!startOk || !endOk) && !connectsUnconnectedLandmark) continue;
+      if (!startOk || !endOk) continue;
 
-      let ctrlPts = simplifyRDP2D(subSamples, 0.3, isRoad ? 8 : 5);
+      let ctrlPts = simplifyRDP2D(subSamples, 0.35, isRoad ? 7 : 4);
+      ctrlPts = normalizePathControlPoints(ctrlPts, false, isRoad).points;
+      // Ensure fixed-point stability on Pass 2
+      ctrlPts = normalizePathControlPoints(ctrlPts, false, isRoad).points;
       if (ctrlPts.length < 2) continue;
 
-      if (!isRoad) {
-        for (let idx = 0; idx < ctrlPts.length; idx++) {
-          const neighbor = ctrlPts[idx === 0 ? 1 : idx - 1];
-          ctrlPts[idx] = pushPointClearOfObstacles(ctrlPts[idx][0], ctrlPts[idx][1], neighbor, false).pt;
-        }
-        ctrlPts = uncrossPolyline2D(ctrlPts, false).points;
-      }
-
-      // Verify Catmull-Rom spline does not bow back into a road or trail; fallback to straight 2-point chord if needed
       let verifiedCurve = validateCleanSpline(ctrlPts, false, isRoad);
       if (!verifiedCurve && ctrlPts.length > 2) {
-        const chord: [number, number][] = [ctrlPts[0], ctrlPts[ctrlPts.length - 1]];
-        verifiedCurve = validateCleanSpline(chord, false, isRoad);
-        if (verifiedCurve) ctrlPts = chord;
+        let chord: [number, number][] = [ctrlPts[0], ctrlPts[ctrlPts.length - 1]];
+        chord = normalizePathControlPoints(chord, false, isRoad).points;
+        if (chord.length >= 2) {
+          verifiedCurve = validateCleanSpline(chord, false, isRoad);
+          if (verifiedCurve) ctrlPts = chord;
+        }
       }
       if (!verifiedCurve) continue;
 
-      if (checkRedundant(verifiedCurve, false)) continue;
+      if (checkRedundant(verifiedCurve, false, isRoad)) continue;
 
       const pieceId = keptPieces === 0 ? rawPath.id : `${rawPath.id}-s${keptPieces + 1}`;
       const repairedPiece: WorldPath = {
@@ -1847,8 +2089,24 @@ export function auditAndRepairWorldSpatial(
     );
   }
 
-  // Stage 5: Guarantee every stationary landmark has a clean non-crossing connection spur
-  for (const b of buildings) {
+  // Stage 5: Radial Spanning-Tree Spur Builder — connect every stationary landmark cleanly (outward from [0,0])
+  const buildingsRadial = [...buildings].sort(
+    (a, b) => Math.hypot(a.x, a.z) - Math.hypot(b.x, b.z),
+  );
+  const curveHitsObstacle = (curvePts: [number, number][], ownerId: string): boolean => {
+    for (const [cx, cz] of curvePts) {
+      for (const ob of buildings) {
+        if (ob.id === ownerId) continue;
+        if (Math.hypot(cx - ob.x, cz - ob.z) < plinthRadiusOf(ob) - 0.05) return true;
+      }
+      for (const pond of ponds) {
+        if (Math.hypot(cx - pond.x, cz - pond.z) < (pond.radius ?? 6.5) - 0.2) return true;
+      }
+    }
+    return false;
+  };
+
+  for (const b of buildingsRadial) {
     if (landmarkConnectedByAccepted(b) || accepted.length === 0) continue;
 
     const footR = plinthRadiusOf(b);
@@ -1861,58 +2119,208 @@ export function auditAndRepairWorldSpatial(
         bestAcc = acc;
       }
     }
-    if (!bestAcc || !bestHit || bestHit.dist > 68) continue;
+    if (!bestAcc || !bestHit || bestHit.dist > 220) continue;
 
-    const dirToNetX = bestHit.closestX - b.x;
-    const dirToNetZ = bestHit.closestZ - b.z;
-    const dirLen = Math.hypot(dirToNetX, dirToNetZ);
-    if (dirLen < footR + 2.2) continue;
+    // Also check if a landmark whose plinth already meets a trail has an outer plaza edge closer to `b`
+    let bestPlazaAnchor: { x: number; z: number; dist: number; owner: WorldCreation } | null = null;
+    for (const connB of buildings) {
+      if (connB.id === b.id) continue;
+      const connFootR = plinthRadiusOf(connB);
+      const hasDirectPlinthTrail = accepted.some(
+        (acc) =>
+          !acc.isRoad &&
+          distPointToPolyline2D(connB.x, connB.z, acc.curve).dist <= connFootR + 1.6,
+      );
+      if (!hasDirectPlinthTrail) continue;
+      const dxC = b.x - connB.x;
+      const dzC = b.z - connB.z;
+      const centerDist = Math.hypot(dxC, dzC);
+      if (centerDist < footR + connFootR + 2.2) continue;
+      const edgeDist = centerDist - connFootR;
+      if (edgeDist < bestHit.dist - 1.5 && (!bestPlazaAnchor || edgeDist < bestPlazaAnchor.dist)) {
+        const uxC = dxC / centerDist;
+        const uzC = dzC / centerDist;
+        bestPlazaAnchor = {
+          x: round1(connB.x + uxC * (connFootR + 0.72)),
+          z: round1(connB.z + uzC * (connFootR + 0.72)),
+          dist: edgeDist,
+          owner: connB,
+        };
+      }
+    }
 
-    const ux = dirToNetX / dirLen;
-    const uz = dirToNetZ / dirLen;
-    const doorPt: [number, number] = [
-      round1(b.x + ux * (footR + 0.65)),
-      round1(b.z + uz * (footR + 0.65)),
-    ];
-    const curbOffset = bestAcc.isRoad ? 2.54 : 1.16;
-    const curbPt: [number, number] = [
-      round1(bestHit.closestX - ux * curbOffset),
-      round1(bestHit.closestZ - uz * curbOffset),
-    ];
-    if (Math.hypot(curbPt[0] - doorPt[0], curbPt[1] - doorPt[1]) < 1.6) continue;
+    const buildSpurCandidatesForAnchor = (
+      targetX: number,
+      targetZ: number,
+      curbOffset: number,
+    ): [number, number][][] => {
+      const dirToNetX = targetX - b.x;
+      const dirToNetZ = targetZ - b.z;
+      const dirLen = Math.hypot(dirToNetX, dirToNetZ);
+      if (dirLen < footR + 1.6) return [];
 
-    const spurPts: [number, number][] = [doorPt, curbPt];
-    const verified = validateCleanSpline(spurPts, false, false);
-    if (verified) {
-      const spurKind =
-        /\b(volcano|lava|magma)\b/i.test(b.name)
-          ? "volcanic_trail"
-          : /\b(waterfall|forest|farm|mill|cabin)\b/i.test(b.name)
+      const ux = dirToNetX / dirLen;
+      const uz = dirToNetZ / dirLen;
+      const rawDoor: [number, number] = [
+        round1(b.x + ux * (footR + 0.72)),
+        round1(b.z + uz * (footR + 0.72)),
+      ];
+      const rawCurb: [number, number] = [
+        round1(targetX - ux * curbOffset),
+        round1(targetZ - uz * curbOffset),
+      ];
+      const doorPt = pushPointClearOfObstacles(rawDoor[0], rawDoor[1], rawCurb, false).pt;
+      const curbPt = pushPointClearOfObstacles(rawCurb[0], rawCurb[1], doorPt, false).pt;
+      const span = Math.hypot(curbPt[0] - doorPt[0], curbPt[1] - doorPt[1]);
+      if (span < 1.35) return [];
+
+      const sets: [number, number][][] = [];
+      const perpX = -uz;
+      const perpZ = ux;
+      if (span <= 18.0) {
+        sets.push([doorPt, curbPt]);
+      } else {
+        const bow = Math.min(3.2, span * 0.05);
+        const midGentle = pushPointClearOfObstacles(
+          round1((doorPt[0] + curbPt[0]) * 0.5 + perpX * bow),
+          round1((doorPt[1] + curbPt[1]) * 0.5 + perpZ * bow),
+          doorPt,
+          false,
+        ).pt;
+        sets.push([doorPt, midGentle, curbPt]);
+        sets.push([doorPt, curbPt]);
+      }
+
+      const chordRef: [number, number][] = [doorPt, curbPt];
+      for (const ob of buildings) {
+        if (ob.id === b.id) continue;
+        const obR = plinthRadiusOf(ob);
+        if (distPointToPolyline2D(ob.x, ob.z, chordRef).dist < obR + 1.4) {
+          for (const extra of [1.8, 3.6, 6.2]) {
+            for (const side of [1, -1]) {
+              const wp = pushPointClearOfObstacles(
+                round1(ob.x + perpX * (obR + extra) * side),
+                round1(ob.z + perpZ * (obR + extra) * side),
+                doorPt,
+                false,
+              ).pt;
+              sets.push([doorPt, wp, curbPt]);
+            }
+          }
+        }
+      }
+      for (const pond of ponds) {
+        const pr = pond.radius ?? 6.5;
+        if (distPointToPolyline2D(pond.x, pond.z, chordRef).dist < pr + 1.2) {
+          for (const extra of [1.8, 3.8]) {
+            for (const side of [1, -1]) {
+              const wp = pushPointClearOfObstacles(
+                round1(pond.x + perpX * (pr + extra) * side),
+                round1(pond.z + perpZ * (pr + extra) * side),
+                doorPt,
+                false,
+              ).pt;
+              sets.push([doorPt, wp, curbPt]);
+            }
+          }
+        }
+      }
+      for (const mag of [5.0, 9.5, 15.0, 22.0]) {
+        for (const side of [1, -1]) {
+          const midDeflect = pushPointClearOfObstacles(
+            round1((doorPt[0] + curbPt[0]) * 0.5 + perpX * mag * side),
+            round1((doorPt[1] + curbPt[1]) * 0.5 + perpZ * mag * side),
+            doorPt,
+            false,
+          ).pt;
+          sets.push([doorPt, midDeflect, curbPt]);
+        }
+      }
+      return sets;
+    };
+
+    const candidateCtrlSets: [number, number][][] = [];
+    if (bestPlazaAnchor) {
+      candidateCtrlSets.push(...buildSpurCandidatesForAnchor(bestPlazaAnchor.x, bestPlazaAnchor.z, 0));
+    }
+    candidateCtrlSets.push(
+      ...buildSpurCandidatesForAnchor(
+        bestHit.closestX,
+        bestHit.closestZ,
+        bestAcc.isRoad ? 2.52 : 0.48,
+      ),
+    );
+
+    let chosenPts: [number, number][] | null = null;
+    let chosenCurve: [number, number][] | null = null;
+
+    for (const rawCand of candidateCtrlSets) {
+      let cand = normalizePathControlPoints(rawCand, false, false).points;
+      cand = normalizePathControlPoints(cand, false, false).points;
+      if (cand.length < 2) continue;
+      const recheck = normalizePathControlPoints(cand, false, false);
+      if (recheck.deKinked || recheck.selfUncrossed || recheck.trimmedPlinth) continue;
+      const verified = validateCleanSpline(cand, false, false);
+      if (!verified) continue;
+      if (curveHitsObstacle(verified, b.id)) continue;
+      if (checkRedundant(verified, false, false)) continue;
+      chosenPts = cand;
+      chosenCurve = verified;
+      break;
+    }
+
+    if (chosenPts && chosenCurve) {
+      const bText = `${b.name} ${b.description} ${b.creatorPrompt ?? ""}`;
+      const spurKind = /\b(volcano|lava|magma|obsidian)\b/i.test(bText)
+        ? "volcanic_trail"
+        : /\b(beach|surf|dock|pier|coast(?:line|al)?|lagoon|island)\b/i.test(bText)
+          ? "boardwalk"
+          : /\b(waterfall|forest|farm|mill|cabin|quarry|mine|pub|outback|ranch|camp)\b/i.test(bText)
             ? "dirt_trail"
-            : /\b(beach|surf|dock|pond)\b/i.test(b.name)
-              ? "boardwalk"
-              : "cobblestone";
+            : /\b(castle|tower|datacentre|datacenter|station|cathedral|stadium|museum|firehouse|mansion|pavilion)\b/i.test(
+                  bText,
+                )
+              ? "cobblestone"
+              : !bestAcc.isRoad && bestAcc.path.kind !== "volcanic_trail"
+                ? bestAcc.path.kind
+                : "footpath";
       const spur: WorldPath = {
         id: `spur-${b.id}`,
         kind: spurKind,
-        points: spurPts,
+        points: chosenPts,
       };
-      accepted.push({ path: spur, curve: verified, isRoad: false });
+      const spurJunctions = getRoadCurbJunctions(chosenCurve, false);
+      accepted.push({ path: spur, curve: chosenCurve, isRoad: false });
+      acceptedCurbJunctions.push(...spurJunctions);
       footpathTrimCount++;
       details.push(`added clean curb-snapped spur "${spur.id}" for "${b.name}"`);
     }
   }
 
   const repairedPaths = accepted.map((a) => a.path);
+  const acceptedRoads = accepted.filter((a) => a.isRoad);
+  const acceptedTrails = accepted.filter((a) => !a.isRoad);
 
   const repairedProps: WorldProp[] = [];
   for (const pr of props) {
+    // Prune orphaned non-seed bus stops sitting where no asphalt road exists
+    if (!SEED_PROP_IDS.has(pr.id) && pr.kind === "bus_stop") {
+      const onRoad = acceptedRoads.some(
+        (rd) => distPointToPolyline2D(pr.x, pr.z, rd.curve).dist <= 5.2,
+      );
+      if (!onRoad) {
+        propNudgeCount++;
+        details.push(`removed orphaned bus_stop "${pr.id}" far from active roads`);
+        continue;
+      }
+    }
+
     let px = pr.x;
     let pz = pr.z;
     let moved = false;
 
-    if (pr.kind !== "pond") {
-      for (let pass = 0; pass < 6; pass++) {
+    if (pr.kind !== "pond" && !SEED_PROP_IDS.has(pr.id)) {
+      for (let pass = 0; pass < 16; pass++) {
         let passMoved = false;
         // Keep props outside building plinths
         for (const b of buildings) {
@@ -1929,7 +2337,27 @@ export function auditAndRepairWorldSpatial(
             passMoved = true;
           }
         }
-        // Keep props separated from each other so meshes never stack on the same coordinates
+        // Keep props off asphalt road interiors
+        for (const rd of acceptedRoads) {
+          const h = distPointToPolyline2D(px, pz, rd.curve);
+          if (h.dist < 2.58) {
+            px = round1(h.closestX + h.normalX * 2.9);
+            pz = round1(h.closestZ + h.normalZ * 2.9);
+            moved = true;
+            passMoved = true;
+          }
+        }
+        // Keep signposts/benches/lamps off pedestrian trail centers
+        for (const tr of acceptedTrails) {
+          const h = distPointToPolyline2D(px, pz, tr.curve);
+          if (h.dist < 1.15) {
+            px = round1(h.closestX + h.normalX * 1.5);
+            pz = round1(h.closestZ + h.normalZ * 1.5);
+            moved = true;
+            passMoved = true;
+          }
+        }
+        // Keep props separated from each other
         for (const prev of repairedProps) {
           if (prev.kind === "pond") continue;
           const minSep = 1.65;

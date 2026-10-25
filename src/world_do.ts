@@ -35,6 +35,8 @@ import {
   auditBlueprintOverlaps,
   autoRepairBlueprintOverlaps,
   detectPathCrossings,
+  distPointToPolyline2D,
+  sampleCatmullRom2D,
 } from "./voxel_audit";
 import { reviewBlueprintWithCritic } from "./voxel_critic";
 import {
@@ -511,14 +513,14 @@ export class WorldDO extends DurableObject<Env> {
 
     // Lightweight startup overlap & planar road-crossing repair (< 4ms, zero LLM calls)
     const bootAudit = this.auditAndRepairWorld();
-    const upgradedV10 = sql
-      .exec(`SELECT value FROM meta WHERE key = 'upgrade_v10_planar_roads' LIMIT 1`)
+    const upgradedV14 = sql
+      .exec(`SELECT value FROM meta WHERE key = 'upgrade_v14_refined_roads' LIMIT 1`)
       .toArray();
-    if (upgradedV10.length === 0) {
+    if (upgradedV14.length === 0) {
       if (bootAudit.repairedCount > 0) {
         sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('lastOgCaptureAt', '0')`);
       }
-      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v10_planar_roads', '1')`);
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v14_refined_roads', '1')`);
     }
 
     // Resume queue if any jobs are waiting
@@ -569,10 +571,93 @@ export class WorldDO extends DurableObject<Env> {
       for (const p of spatial.paths) {
         sql.exec(`INSERT OR REPLACE INTO paths (id, json) VALUES (?, ?)`, p.id, JSON.stringify(p));
       }
+      const keptPropIds = new Set(spatial.props.map((pr) => pr.id));
+      for (const row of propRows) {
+        const oldPropId = String(row.id);
+        if (!keptPropIds.has(oldPropId)) {
+          sql.exec(`DELETE FROM props WHERE id = ?`, oldPropId);
+        }
+      }
       for (const pr of spatial.props) {
         sql.exec(`INSERT OR REPLACE INTO props (id, json) VALUES (?, ?)`, pr.id, JSON.stringify(pr));
       }
       repairs.push(...spatial.report.details);
+    }
+
+    // Ensure every active vehicle_route creation cruises strictly on accepted asphalt roads (no off-road detours!)
+    const acceptedRoadCurves = spatial.paths
+      .filter((p) => p.kind === "road" && p.points.length >= 3)
+      .map((p) => ({
+        path: p,
+        curve: sampleCatmullRom2D(p.points, Boolean(p.closed), 0.7),
+      }));
+    const mainLoopEntry =
+      acceptedRoadCurves.find((r) => r.path.id === "path-main-loop") ?? acceptedRoadCurves[0];
+    if (mainLoopEntry) {
+      let vehIdx = 0;
+      for (const c of creations) {
+        if (c.behavior?.type !== "vehicle_route") continue;
+        const myVehSlot = vehIdx++;
+        const wps = c.behavior.waypoints ?? [];
+        const hasOffRoadWaypoint =
+          wps.length < 4 ||
+          wps.some(
+            ([wx, wz]) =>
+              !acceptedRoadCurves.some(
+                (rc) => distPointToPolyline2D(wx, wz, rc.curve).dist <= 3.2,
+              ),
+          );
+        if (hasOffRoadWaypoint) {
+          const basePts = mainLoopEntry.path.points;
+          const shift = (myVehSlot * Math.floor(basePts.length / 2)) % basePts.length;
+          const alignedWps: [number, number][] = basePts.map((_, idx) => {
+            const p = basePts[(idx + shift) % basePts.length];
+            return [p[0], p[1]];
+          });
+          const rawStops = c.behavior.stops ?? [];
+          const alignedStops = rawStops
+            .map((st) => {
+              const h = distPointToPolyline2D(st.x, st.z, mainLoopEntry.curve);
+              return {
+                ...st,
+                x: Math.round(h.closestX * 10) / 10,
+                z: Math.round(h.closestZ * 10) / 10,
+              };
+            })
+            .filter(
+              (st, idx, arr) =>
+                arr.findIndex((o) => Math.hypot(o.x - st.x, o.z - st.z) < 6.0) === idx,
+            )
+            .slice(0, 5);
+          c.x = alignedWps[0][0];
+          c.z = alignedWps[0][1];
+          c.behavior = {
+            ...c.behavior,
+            waypoints: alignedWps,
+            stops:
+              alignedStops.length >= 2
+                ? alignedStops
+                : [
+                    {
+                      id: `stop-${c.id}-north`,
+                      name: "Clocktower Station",
+                      x: basePts[1][0],
+                      z: basePts[1][1],
+                      dwellSec: 4.0,
+                    },
+                    {
+                      id: `stop-${c.id}-south`,
+                      name: "Clover Pond South",
+                      x: basePts[5 % basePts.length][0],
+                      z: basePts[5 % basePts.length][1],
+                      dwellSec: 4.0,
+                    },
+                  ],
+          };
+          sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(c), c.id);
+          repairs.push(`aligned vehicle "${c.name}" (${c.id}) cleanly onto village ring road`);
+        }
+      }
     }
 
     const now = Date.now();
@@ -648,6 +733,72 @@ export class WorldDO extends DurableObject<Env> {
     return {
       repairedCount: res.repairedCount,
       repairs: res.repairs,
+      audit: this.getWorldAuditReport(),
+    };
+  }
+
+  public loadDevWorldSnapshot(snapshot: {
+    creations?: WorldCreation[];
+    paths?: WorldPath[];
+    props?: WorldProp[];
+    terrainZones?: WorldTerrainZone[];
+    villagers?: WorldVillager[];
+  }): {
+    repairedCount: number;
+    repairs: string[];
+    pathsAfter: number;
+    propsAfter: number;
+    audit: WorldAuditSummary;
+  } {
+    const sql = this.ctx.storage.sql;
+    if (Array.isArray(snapshot.creations)) {
+      sql.exec(`DELETE FROM creations`);
+      for (const c of snapshot.creations) {
+        sql.exec(
+          `INSERT OR REPLACE INTO creations (id, created_at, integrated_level, json)
+           VALUES (?, ?, ?, ?)`,
+          c.id,
+          c.createdAt || Date.now(),
+          c.integratedLevel ?? 2,
+          JSON.stringify(c),
+        );
+      }
+    }
+    if (Array.isArray(snapshot.paths)) {
+      sql.exec(`DELETE FROM paths`);
+      for (const p of snapshot.paths) {
+        sql.exec(`INSERT OR REPLACE INTO paths (id, json) VALUES (?, ?)`, p.id, JSON.stringify(p));
+      }
+    }
+    if (Array.isArray(snapshot.props)) {
+      sql.exec(`DELETE FROM props`);
+      for (const pr of snapshot.props) {
+        sql.exec(`INSERT OR REPLACE INTO props (id, json) VALUES (?, ?)`, pr.id, JSON.stringify(pr));
+      }
+    }
+    if (Array.isArray(snapshot.terrainZones)) {
+      sql.exec(`DELETE FROM terrain_zones`);
+      for (const tz of snapshot.terrainZones) {
+        sql.exec(
+          `INSERT OR REPLACE INTO terrain_zones (id, json) VALUES (?, ?)`,
+          tz.id,
+          JSON.stringify(tz),
+        );
+      }
+    }
+    if (Array.isArray(snapshot.villagers)) {
+      sql.exec(`DELETE FROM villagers`);
+      for (const v of snapshot.villagers) {
+        sql.exec(`INSERT OR REPLACE INTO villagers (id, json) VALUES (?, ?)`, v.id, JSON.stringify(v));
+      }
+    }
+    const repairRes = this.auditAndRepairWorld();
+    const after = this.readBaseWorld();
+    this.bumpVersion();
+    return {
+      ...repairRes,
+      pathsAfter: after.paths.length,
+      propsAfter: after.props.length,
       audit: this.getWorldAuditReport(),
     };
   }

@@ -19,8 +19,15 @@ import {
   estimateRemainingBuildMs,
   summarizeTelemetryStats,
 } from "./eta_estimator";
+import { buildGeminiModelCascade } from "./gemini_models";
 import { buildSeedWorld } from "./seed_world";
-import { formatDayKeyInTz, safeLogError, sanitizePlainText, verifyWebSocketOrigin } from "./security";
+import {
+  formatDayKeyInTz,
+  redactSecrets,
+  safeLogError,
+  sanitizePlainText,
+  verifyWebSocketOrigin,
+} from "./security";
 import type {
   BuildQueueJobInfo,
   WorldCreation,
@@ -130,7 +137,38 @@ interface BuildJobRow {
   started_at: number | null;
   finished_at: number | null;
   creation_id: string | null;
+  model_used: string | null;
   error_msg: string | null;
+  error_detail: string | null;
+}
+
+export interface SanitizedBuildJobDiagnostic {
+  jobId: string;
+  status: "done" | "failed";
+  phase: string;
+  hasImage: boolean;
+  complexity: BuildComplexityBucket;
+  round1Ms: number | null;
+  durationMs: number | null;
+  createdAt: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+  modelUsed: string | null;
+  errorMsg?: string | null;
+  errorDetail?: string | null;
+}
+
+export interface BuildDiagnosticsSummary {
+  modelCascade: string[];
+  fallbackRate: number;
+  countsLast36h: {
+    done: number;
+    failed: number;
+    active: number;
+    queued: number;
+  };
+  recentFailures: SanitizedBuildJobDiagnostic[];
+  recentCompleted: SanitizedBuildJobDiagnostic[];
 }
 
 function distToSegment(px: number, pz: number, ax: number, az: number, bx: number, bz: number): number {
@@ -233,7 +271,9 @@ export class WorldDO extends DurableObject<Env> {
         started_at INTEGER,
         finished_at INTEGER,
         creation_id TEXT,
-        error_msg TEXT
+        model_used TEXT,
+        error_msg TEXT,
+        error_detail TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_build_jobs_cookie_day
         ON build_jobs (cookie_id, day_key);
@@ -458,6 +498,12 @@ export class WorldDO extends DurableObject<Env> {
     }
     if (!jobCols.has("has_image")) {
       sql.exec(`ALTER TABLE build_jobs ADD COLUMN has_image INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!jobCols.has("model_used")) {
+      sql.exec(`ALTER TABLE build_jobs ADD COLUMN model_used TEXT`);
+    }
+    if (!jobCols.has("error_detail")) {
+      sql.exec(`ALTER TABLE build_jobs ADD COLUMN error_detail TEXT`);
     }
 
     const upgradedV9 = sql.exec(`SELECT value FROM meta WHERE key = 'upgrade_v9_eta_telemetry'`).toArray();
@@ -890,6 +936,97 @@ export class WorldDO extends DurableObject<Env> {
     return summarizeTelemetryStats(this.readTelemetryHistory());
   }
 
+  public getBuildDiagnostics(): BuildDiagnosticsSummary {
+    const sql = this.ctx.storage.sql;
+    const history = this.readTelemetryHistory();
+    const fallbackCount = history.filter((s) => s.usedFallback).length;
+    const fallbackRate =
+      history.length > 0 ? Number((fallbackCount / history.length).toFixed(3)) : 0;
+
+    const statusRows = sql
+      .exec(`SELECT status, COUNT(*) AS c FROM build_jobs GROUP BY status`)
+      .toArray();
+    const counts = { done: 0, failed: 0, active: 0, queued: 0 };
+    for (const r of statusRows) {
+      const st = String(r.status);
+      const c = Number(r.c) || 0;
+      if (st === "done") counts.done = c;
+      else if (st === "failed") counts.failed = c;
+      else if (st === "sculpting") counts.active = c;
+      else if (st === "queued") counts.queued = c;
+    }
+
+    const toDiagnostic = (r: Record<string, unknown>, status: "done" | "failed"): SanitizedBuildJobDiagnostic => {
+      const hasImage = Number(r.has_image) === 1;
+      const feat = classifyBuildFeatures(String(r.prompt ?? ""), hasImage);
+      const startedAt = typeof r.started_at === "number" ? r.started_at : null;
+      const finishedAt = typeof r.finished_at === "number" ? r.finished_at : null;
+      const durationMs =
+        startedAt !== null && finishedAt !== null && finishedAt >= startedAt
+          ? finishedAt - startedAt
+          : null;
+      return {
+        jobId: String(r.job_id),
+        status,
+        phase: String(r.phase ?? "queued"),
+        hasImage,
+        complexity: feat.complexity,
+        round1Ms: typeof r.round1_ms === "number" ? r.round1_ms : null,
+        durationMs,
+        createdAt: Number(r.created_at) || 0,
+        startedAt,
+        finishedAt,
+        modelUsed: typeof r.model_used === "string" ? r.model_used : null,
+        ...(status === "failed"
+          ? {
+              errorMsg:
+                typeof r.error_msg === "string"
+                  ? redactSecrets(r.error_msg, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET])
+                  : null,
+              errorDetail:
+                typeof r.error_detail === "string"
+                  ? redactSecrets(r.error_detail, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET])
+                  : null,
+            }
+          : {}),
+      };
+    };
+
+    const failedRows = sql
+      .exec(
+        `SELECT job_id, status, phase, round1_ms, has_image, prompt, created_at, started_at, finished_at, model_used, error_msg, error_detail
+         FROM build_jobs
+         WHERE status = 'failed'
+         ORDER BY COALESCE(finished_at, created_at) DESC, created_at DESC
+         LIMIT 10`,
+      )
+      .toArray();
+
+    const completedRows = sql
+      .exec(
+        `SELECT job_id, status, phase, round1_ms, has_image, prompt, created_at, started_at, finished_at, model_used
+         FROM build_jobs
+         WHERE status = 'done'
+           AND sim_delay_ms IS NULL
+           AND (image_mime IS NULL OR image_mime != '__dev_sim_bp__')
+         ORDER BY COALESCE(finished_at, created_at) DESC, created_at DESC
+         LIMIT 8`,
+      )
+      .toArray();
+
+    return {
+      modelCascade: buildGeminiModelCascade({
+        primaryModel: this.env.ARGON_MODEL,
+        bariumModels: this.env.BARIUM_MODELS,
+        fallbackModel: this.env.FALLBACK_MODEL,
+      }),
+      fallbackRate,
+      countsLast36h: counts,
+      recentFailures: failedRows.map((r) => toDiagnostic(r as Record<string, unknown>, "failed")),
+      recentCompleted: completedRows.map((r) => toDiagnostic(r as Record<string, unknown>, "done")),
+    };
+  }
+
   private getAvgSculptMs(): number {
     return estimateInitialBuildMs(
       { complexity: "standard", hasImage: false },
@@ -1033,7 +1170,9 @@ export class WorldDO extends DurableObject<Env> {
       started_at: typeof r.started_at === "number" ? r.started_at : null,
       finished_at: typeof r.finished_at === "number" ? r.finished_at : null,
       creation_id: typeof r.creation_id === "string" ? r.creation_id : null,
+      model_used: typeof r.model_used === "string" ? r.model_used : null,
       error_msg: typeof r.error_msg === "string" ? r.error_msg : null,
+      error_detail: typeof r.error_detail === "string" ? r.error_detail : null,
     };
   }
 
@@ -1564,15 +1703,19 @@ export class WorldDO extends DurableObject<Env> {
         this.env.GEMINI_API_KEY,
         this.env.ARGON_MODEL,
         this.env.FALLBACK_MODEL,
+        this.env.BARIUM_MODELS,
       );
 
       if (!sculpted.ok) {
         sql.exec(
           `UPDATE build_jobs
-           SET status = 'failed', finished_at = ?, error_msg = ?, image_base64 = NULL
+           SET status = 'failed', finished_at = ?, error_msg = ?, error_detail = ?, image_base64 = NULL
            WHERE job_id = ?`,
           Date.now(),
           sculpted.error || "Could not sculpt creation.",
+          sculpted.errorDetail
+            ? redactSecrets(sculpted.errorDetail, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET])
+            : null,
           job.job_id,
         );
         this.broadcastQueueTick();
@@ -1607,9 +1750,10 @@ export class WorldDO extends DurableObject<Env> {
       if (!placed.ok) {
         sql.exec(
           `UPDATE build_jobs
-           SET status = 'failed', finished_at = ?, error_msg = ?, creation_id = ?, image_base64 = NULL
+           SET status = 'failed', finished_at = ?, model_used = ?, error_msg = ?, creation_id = ?, image_base64 = NULL
            WHERE job_id = ?`,
           finishedAt,
+          sculpted.modelUsed,
           placed.error,
           placed.myCreationId ?? null,
           job.job_id,
@@ -1620,21 +1764,24 @@ export class WorldDO extends DurableObject<Env> {
 
       sql.exec(
         `UPDATE build_jobs
-         SET status = 'done', finished_at = ?, creation_id = ?, image_base64 = NULL
+         SET status = 'done', finished_at = ?, creation_id = ?, model_used = ?, image_base64 = NULL
          WHERE job_id = ?`,
         finishedAt,
         placed.creation.id,
+        sculpted.modelUsed,
         job.job_id,
       );
       this.broadcastQueueTick();
     } catch (err) {
+      const redactedDetail = redactSecrets(err, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET]);
       safeLogError("build_queue_worker", err, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET]);
       sql.exec(
         `UPDATE build_jobs
-         SET status = 'failed', finished_at = ?, error_msg = ?, image_base64 = NULL
+         SET status = 'failed', finished_at = ?, error_msg = ?, error_detail = ?, image_base64 = NULL
          WHERE job_id = ?`,
         Date.now(),
         "Argon took a moment too long building that — please try once more.",
+        redactedDetail,
         job.job_id,
       );
       this.broadcastQueueTick();
@@ -2085,6 +2232,7 @@ export class WorldDO extends DurableObject<Env> {
           this.env.GEMINI_API_KEY,
           this.env.ARGON_MODEL,
           this.env.FALLBACK_MODEL,
+          this.env.BARIUM_MODELS,
         );
         if (patch) {
           this.applyWorldPatch(patch);
@@ -2152,6 +2300,7 @@ export class WorldDO extends DurableObject<Env> {
         promptText: priorityTarget.creatorPrompt!,
         apiKey: this.env.GEMINI_API_KEY,
         primaryModel: this.env.ARGON_MODEL,
+        bariumModels: this.env.BARIUM_MODELS,
         fallbackModel: this.env.FALLBACK_MODEL,
       });
 
@@ -2188,6 +2337,7 @@ export class WorldDO extends DurableObject<Env> {
         this.env.GEMINI_API_KEY,
         this.env.ARGON_MODEL,
         this.env.FALLBACK_MODEL,
+        this.env.BARIUM_MODELS,
       );
 
       if (!resculpted.ok) {
@@ -2304,6 +2454,7 @@ export class WorldDO extends DurableObject<Env> {
         this.env.GEMINI_API_KEY,
         this.env.ARGON_MODEL,
         this.env.FALLBACK_MODEL,
+        this.env.BARIUM_MODELS,
       );
       if (patch) {
         this.applyWorldPatch(patch);

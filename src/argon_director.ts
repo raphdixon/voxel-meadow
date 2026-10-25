@@ -1185,6 +1185,7 @@ export async function integrateCreationWithArgon(
   apiKey: string,
   primaryModel?: string,
   fallbackModel?: string,
+  bariumModels?: string | readonly string[],
 ): Promise<WorldPatch | null> {
   const target = world.creations.find((c) => c.id === targetId);
   if (!target) return null;
@@ -1232,7 +1233,9 @@ Intelligently incorporate creation id "${target.id}" into GeminIsland!
 
   const res = await callGeminiArgon({
     apiKey,
+    mode: "director",
     primaryModel,
+    bariumModels,
     fallbackModel,
     systemPrompt: DIRECTOR_SYSTEM_PROMPT,
     userText,
@@ -1249,6 +1252,7 @@ export async function weaveWorldCronWithArgon(
   apiKey: string,
   primaryModel?: string,
   fallbackModel?: string,
+  bariumModels?: string | readonly string[],
 ): Promise<WorldPatch | null> {
   if (!world.creations.length) return null;
 
@@ -1280,7 +1284,9 @@ export async function weaveWorldCronWithArgon(
 
   const res = await callGeminiArgon({
     apiKey,
+    mode: "director",
     primaryModel,
+    bariumModels,
     fallbackModel,
     systemPrompt: DIRECTOR_SYSTEM_PROMPT,
     userText: `PERIODIC GEMINI 4 WORLD-WEAVER CRON RUN:\n${focusParts.join("\n")}\n\n<world_state_json>\n${JSON.stringify(summary)}\n</world_state_json>`,

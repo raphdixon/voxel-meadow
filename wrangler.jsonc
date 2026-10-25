@@ -42,6 +42,7 @@
   },
   "vars": {
     "ARGON_MODEL": "gemini-4-argon",
+    "BARIUM_MODELS": "barium-b,barium-c,barium-bb-v2,barium-bb3,barium-bb2,barium-bb,barium-a,barium-cc3",
     "FALLBACK_MODEL": "gemini-3.8-flash"
   },
   "observability": {

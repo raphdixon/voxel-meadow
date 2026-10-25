@@ -212,16 +212,19 @@ export default {
         });
       }
 
-      // Live adaptive build telemetry & ETA calibration summary (read-only aggregated stats)
+      // Live adaptive build telemetry, model cascade & recent failure diagnostics
       if (url.pathname === "/api/eta") {
         if (request.method !== "GET") {
           return jsonResponse(request, { ok: false, error: "Method not allowed." }, 405);
         }
         const stub = getWorldStub(env);
-        const telemetry = await stub.getBuildEtaTelemetry();
+        const [telemetry, diagnostics] = await Promise.all([
+          stub.getBuildEtaTelemetry(),
+          stub.getBuildDiagnostics(),
+        ]);
         return jsonResponse(
           request,
-          { ok: true, telemetry },
+          { ok: true, telemetry, diagnostics },
           200,
           { "cache-control": "public, max-age=5" },
         );
@@ -333,18 +336,27 @@ export default {
             if (!env.GEMINI_API_KEY) {
               return jsonResponse(request, { ok: false, error: "Missing GEMINI_API_KEY" }, 503);
             }
+            const overrideModels = Array.isArray(body.overrideModels)
+              ? body.overrideModels.filter((m): m is string => typeof m === "string")
+              : undefined;
             const phases: string[] = [];
             const sculpted = await sculptWithArgon(
               {
                 prompt,
+                overrideModels,
                 onPhase: (ph) => phases.push(ph),
               },
               env.GEMINI_API_KEY,
               env.ARGON_MODEL,
               env.FALLBACK_MODEL,
+              env.BARIUM_MODELS,
             );
             if (!sculpted.ok) {
-              return jsonResponse(request, { ok: false, error: sculpted.error, phases }, 200);
+              return jsonResponse(
+                request,
+                { ok: false, error: sculpted.error, errorDetail: sculpted.errorDetail, phases },
+                200,
+              );
             }
             const contactSheetPngBase64 = await renderBlueprintContactSheetPng(sculpted.blueprint);
             const crossSectionSummary = summarizeBlueprintCrossSections(sculpted.blueprint);
@@ -386,6 +398,7 @@ export default {
             promptText: prompt,
             apiKey: env.GEMINI_API_KEY,
             primaryModel: env.ARGON_MODEL,
+            bariumModels: env.BARIUM_MODELS,
             fallbackModel: env.FALLBACK_MODEL,
           });
 
@@ -403,6 +416,7 @@ export default {
               env.GEMINI_API_KEY,
               env.ARGON_MODEL,
               env.FALLBACK_MODEL,
+              env.BARIUM_MODELS,
             );
             if (resculpted.ok) {
               resculptedContactSheetPngBase64 = await renderBlueprintContactSheetPng(

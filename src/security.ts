@@ -78,6 +78,21 @@ export function safeLogError(
   );
 }
 
+export function safeLogWarn(
+  context: string,
+  detail: unknown,
+  extraSecrets: readonly (string | undefined | null)[] = [],
+): void {
+  console.warn(
+    JSON.stringify({
+      level: "warn",
+      context,
+      detail: redactSecrets(detail, extraSecrets),
+      ts: Date.now(),
+    }),
+  );
+}
+
 /**
  * True ONLY when running locally in `wrangler dev` over HTTP loopback (`localhost` / `127.0.0.1`).
  * Impossible on production (`https://geminisland.raph.plus` with `workers_dev: false`).

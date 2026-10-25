@@ -1,4 +1,11 @@
-import { redactSecrets, safeLogError, sanitizePlainText } from "./security";
+import {
+  buildGeminiModelCascade,
+  callGeminiWithFallbacks,
+  extractJsonObject,
+  type GeminiAttemptRecord,
+  type GeminiCallMode,
+} from "./gemini_models";
+import { redactSecrets, safeLogError, safeLogWarn, sanitizePlainText } from "./security";
 import type { VoxelBlueprint } from "./types";
 import {
   auditBlueprintOverlaps,
@@ -8,12 +15,15 @@ import {
 import { type CriticReviewResult, reviewBlueprintWithCritic } from "./voxel_critic";
 import { normalizeAndGroundBlueprint } from "./voxel_dsl";
 
+export { buildGeminiModelCascade, extractJsonObject };
+
 export interface SculptRequest {
   prompt?: string;
   imageBase64?: string;
   imageMimeType?: string;
   initialCriticHint?: string;
   initialCriticRenderPngBase64?: string;
+  overrideModels?: readonly string[];
   onPhase?: (phase: "reviewing" | "refining", round1Ms: number) => void;
 }
 
@@ -25,6 +35,7 @@ export interface SculptTelemetry {
   criticAttempts?: number;
   criticScore?: number;
   criticApproved?: boolean;
+  attempts?: GeminiAttemptRecord[];
 }
 
 export type SculptResult =
@@ -35,7 +46,7 @@ export type SculptResult =
       modelUsed: string;
       telemetry: SculptTelemetry;
     }
-  | { ok: false; unsafe?: boolean; error: string };
+  | { ok: false; unsafe?: boolean; error: string; errorDetail?: string };
 
 const BLOCKED_PATTERNS = [
   /\b(nazi|swastika|hitler|kkk|child\s*porn|csam|rape|suicide\s*bomb|beheading|pornography|genitalia)\b/i,
@@ -50,30 +61,13 @@ export function quickSafetyPrecheck(text: string): string | null {
   return null;
 }
 
-export function extractJsonObject(raw: unknown): Record<string, unknown> {
-  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    return raw as Record<string, unknown>;
-  }
-  const text = String(raw ?? "").trim();
-  const stripped = text.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
-  const start = stripped.indexOf("{");
-  const end = stripped.lastIndexOf("}");
-  if (start === -1 || end <= start) {
-    throw new Error("Model response did not contain a JSON object");
-  }
-  const slice = stripped.slice(start, end + 1);
-  try {
-    return JSON.parse(slice) as Record<string, unknown>;
-  } catch {
-    const repaired = slice.replace(/,\s*([}\]])/g, "$1");
-    return JSON.parse(repaired) as Record<string, unknown>;
-  }
-}
-
 export async function callGeminiArgon(opts: {
   apiKey: string;
+  mode?: GeminiCallMode;
   primaryModel?: string;
+  bariumModels?: string | readonly string[];
   fallbackModel?: string;
+  overrideModels?: readonly string[];
   systemPrompt: string;
   userText: string;
   imageBase64?: string;
@@ -82,87 +76,12 @@ export async function callGeminiArgon(opts: {
   temperature?: number;
   thinkingBudget?: number;
   maxOutputTokens?: number;
-}): Promise<{ json: Record<string, unknown>; modelUsed: string }> {
-  const models = [
-    opts.primaryModel || "gemini-4-argon",
-    "gemini-4-argon-eap",
-    opts.fallbackModel || "gemini-3.8-flash",
-  ].filter((m) => /^[a-zA-Z0-9._-]+$/.test(m));
-
-  const userParts: Record<string, unknown>[] = [];
-  if (opts.imageBase64 && opts.imageMimeType) {
-    userParts.push({
-      inlineData: {
-        mimeType: opts.imageMimeType,
-        data: opts.imageBase64,
-      },
-    });
-  }
-  if (Array.isArray(opts.extraImages)) {
-    for (const img of opts.extraImages) {
-      if (img?.data && img?.mimeType) {
-        userParts.push({
-          inlineData: {
-            mimeType: img.mimeType,
-            data: img.data,
-          },
-        });
-      }
-    }
-  }
-  userParts.push({ text: opts.userText });
-
-  let lastErr: Error | null = null;
-  for (const model of models) {
-    try {
-      // Security invariant: API key MUST only be sent via x-goog-api-key header, NEVER in URL query parameters
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-      const res = await fetch(endpoint, {
-        method: "POST",
-        signal: AbortSignal.timeout(25_000),
-        headers: {
-          "content-type": "application/json",
-          "x-goog-api-key": opts.apiKey,
-        },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: opts.systemPrompt }] },
-          contents: [{ role: "user", parts: userParts }],
-          generationConfig: {
-            temperature: opts.temperature ?? 0.45,
-            maxOutputTokens: opts.maxOutputTokens ?? 16384,
-            responseMimeType: "application/json",
-            thinkingConfig: { thinkingBudget: opts.thinkingBudget ?? 2048 },
-          },
-        }),
-      });
-
-      if (!res.ok) {
-        const body = await res.text();
-        lastErr = new Error(
-          `${model} HTTP ${res.status}: ${redactSecrets(body.slice(0, 140), [opts.apiKey])}`,
-        );
-        continue;
-      }
-
-      const data = (await res.json()) as {
-        candidates?: {
-          content?: { parts?: { text?: string; thought?: boolean }[] };
-        }[];
-      };
-      const parts = data.candidates?.[0]?.content?.parts ?? [];
-      const nonThought = parts
-        .filter((p) => !p.thought && typeof p.text === "string")
-        .map((p) => p.text!)
-        .join("");
-      const rawText = nonThought.trim() || parts.map((p) => p.text ?? "").join("");
-      const json = extractJsonObject(rawText);
-      return { json, modelUsed: model };
-    } catch (err) {
-      lastErr = new Error(redactSecrets(err, [opts.apiKey]));
-    }
-  }
-
-  throw lastErr ?? new Error("All Argon/Gemini models failed");
+}): Promise<{
+  json: Record<string, unknown>;
+  modelUsed: string;
+  attempts: GeminiAttemptRecord[];
+}> {
+  return callGeminiWithFallbacks(opts);
 }
 
 const SCULPTOR_SYSTEM_PROMPT = `You are Master Voxel Sculptor Argon, creating breathtaking, tactile, high-definition 3D MagicaVoxel miniatures for a sunlit, family-friendly shared grass meadow world.
@@ -282,6 +201,7 @@ export async function sculptWithArgon(
   apiKey: string,
   primaryModel?: string,
   fallbackModel?: string,
+  bariumModels?: string | readonly string[],
 ): Promise<SculptResult> {
   const promptText = sanitizePlainText(req.prompt, 480, true);
   const hasImage = Boolean(req.imageBase64 && req.imageMimeType);
@@ -307,23 +227,37 @@ export async function sculptWithArgon(
 
   const tStart = Date.now();
   const expectedPrimary = primaryModel || "gemini-4-argon";
-  const first = await callGeminiArgon({
-    apiKey,
-    primaryModel,
-    fallbackModel,
-    systemPrompt: SCULPTOR_SYSTEM_PROMPT,
-    userText: userDirective,
-    imageBase64: req.imageBase64,
-    imageMimeType: req.imageMimeType,
-    ...(req.initialCriticRenderPngBase64
-      ? { extraImages: [{ mimeType: "image/png", data: req.initialCriticRenderPngBase64 }] }
-      : {}),
-    temperature: 0.42,
-    thinkingBudget: 1024,
-    maxOutputTokens: 12288,
-  });
+  let first: Awaited<ReturnType<typeof callGeminiArgon>>;
+  try {
+    first = await callGeminiArgon({
+      apiKey,
+      mode: "sculpt",
+      primaryModel,
+      bariumModels,
+      fallbackModel,
+      overrideModels: req.overrideModels,
+      systemPrompt: SCULPTOR_SYSTEM_PROMPT,
+      userText: userDirective,
+      imageBase64: req.imageBase64,
+      imageMimeType: req.imageMimeType,
+      ...(req.initialCriticRenderPngBase64
+        ? { extraImages: [{ mimeType: "image/png", data: req.initialCriticRenderPngBase64 }] }
+        : {}),
+      temperature: 0.42,
+      thinkingBudget: 1024,
+      maxOutputTokens: 12288,
+    });
+  } catch (err) {
+    safeLogError("sculpt_round1_exhausted", err, [apiKey]);
+    return {
+      ok: false,
+      error: "Argon took a moment too long building that — please try once more.",
+      errorDetail: redactSecrets(err, [apiKey]),
+    };
+  }
 
   const round1Ms = Math.max(1, Date.now() - tStart);
+  const allAttempts: GeminiAttemptRecord[] = [...first.attempts];
   let usedFallback = first.modelUsed !== expectedPrimary;
   let hadRefinementPass = false;
   let lastModelUsed = first.modelUsed;
@@ -362,7 +296,9 @@ export async function sculptWithArgon(
         userImageMimeType: req.imageMimeType,
         apiKey,
         primaryModel,
+        bariumModels,
         fallbackModel,
+        overrideModels: req.overrideModels,
       });
     } catch (err) {
       safeLogError("voxel_critic_review", err, [apiKey]);
@@ -388,7 +324,7 @@ export async function sculptWithArgon(
   const candidates: CandidateAttempt[] = [current];
 
   const MAX_CRITIC_RETRIES = 2;
-  const MAX_LOOP_BUDGET_MS = 72_000;
+  const MAX_LOOP_BUDGET_MS = 78_000;
 
   for (let retry = 1; retry <= MAX_CRITIC_RETRIES; retry++) {
     const needsVolume = current.rawVoxels < 160;
@@ -434,22 +370,33 @@ export async function sculptWithArgon(
       );
     }
 
-    const retryRes = await callGeminiArgon({
-      apiKey,
-      primaryModel,
-      fallbackModel,
-      systemPrompt: SCULPTOR_SYSTEM_PROMPT,
-      userText: `${baseDirective}\n\nIMPORTANT 3D REVIEWER & ORCHESTRATOR REBUILD DIRECTIVE (Attempt ${retry + 1}):\n${notes.join("\n\n")}\n\nPrevious rejected JSON (rewrite/fix ops & geometry completely where needed):\n${JSON.stringify(current.rawJson)}`,
-      imageBase64: req.imageBase64,
-      imageMimeType: req.imageMimeType,
-      ...(current.critic?.contactSheetPngBase64
-        ? { extraImages: [{ mimeType: "image/png", data: current.critic.contactSheetPngBase64 }] }
-        : {}),
-      temperature: 0.35,
-      thinkingBudget: 1536,
-      maxOutputTokens: 16384,
-    });
+    let retryRes: Awaited<ReturnType<typeof callGeminiArgon>>;
+    try {
+      retryRes = await callGeminiArgon({
+        apiKey,
+        mode: "sculpt",
+        primaryModel,
+        bariumModels,
+        fallbackModel,
+        overrideModels: req.overrideModels,
+        systemPrompt: SCULPTOR_SYSTEM_PROMPT,
+        userText: `${baseDirective}\n\nIMPORTANT 3D REVIEWER & ORCHESTRATOR REBUILD DIRECTIVE (Attempt ${retry + 1}):\n${notes.join("\n\n")}\n\nPrevious rejected JSON (rewrite/fix ops & geometry completely where needed):\n${JSON.stringify(current.rawJson)}`,
+        imageBase64: req.imageBase64,
+        imageMimeType: req.imageMimeType,
+        ...(current.critic?.contactSheetPngBase64
+          ? { extraImages: [{ mimeType: "image/png", data: current.critic.contactSheetPngBase64 }] }
+          : {}),
+        temperature: 0.35,
+        thinkingBudget: 1536,
+        maxOutputTokens: 16384,
+      });
+    } catch (retryErr) {
+      // Never discard a valid Round-1 3D creation if a Round-2 refinement pass encounters an upstream outage
+      safeLogWarn("sculpt_refinement_degraded_to_round1", retryErr, [apiKey]);
+      break;
+    }
 
+    allAttempts.push(...retryRes.attempts);
     lastModelUsed = retryRes.modelUsed;
     if (retryRes.modelUsed !== expectedPrimary) {
       usedFallback = true;
@@ -523,6 +470,7 @@ export async function sculptWithArgon(
       criticAttempts: candidates.length,
       criticScore: winner.critic?.score,
       criticApproved: winner.critic?.approved,
+      attempts: allAttempts,
     },
   };
 }

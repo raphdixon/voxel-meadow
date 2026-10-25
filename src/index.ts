@@ -1,3 +1,4 @@
+import { sculptWithArgon } from "./argon_sculptor";
 import { resolveWorldLiveFeeds } from "./live_feeds";
 import { refreshDailyOgScreenshotsIfDue } from "./og_renderer";
 import {
@@ -12,6 +13,11 @@ import {
   verifyWebSocketOrigin,
 } from "./security";
 import { autoRepairBlueprintOverlaps } from "./voxel_audit";
+import {
+  renderBlueprintContactSheetPng,
+  reviewBlueprintWithCritic,
+  summarizeBlueprintCrossSections,
+} from "./voxel_critic";
 import { normalizeAndGroundBlueprint } from "./voxel_dsl";
 import { WorldDO } from "./world_do";
 
@@ -316,6 +322,104 @@ export default {
           const stub = getWorldStub(env);
           const res = await stub.runCronWeaver();
           return jsonResponse(request, res, 200);
+        }
+        if (url.pathname === "/api/dev/critic-test" && request.method === "POST") {
+          const parsed = await readBoundedJsonBody(request, 512_000);
+          if (!parsed.ok) return jsonResponse(request, { ok: false, error: parsed.error }, 400);
+          const body = parsed.data;
+          const prompt = typeof body.prompt === "string" ? body.prompt : "Meadow Creation";
+
+          if (body.sculptFromScratch === true) {
+            if (!env.GEMINI_API_KEY) {
+              return jsonResponse(request, { ok: false, error: "Missing GEMINI_API_KEY" }, 503);
+            }
+            const phases: string[] = [];
+            const sculpted = await sculptWithArgon(
+              {
+                prompt,
+                onPhase: (ph) => phases.push(ph),
+              },
+              env.GEMINI_API_KEY,
+              env.ARGON_MODEL,
+              env.FALLBACK_MODEL,
+            );
+            if (!sculpted.ok) {
+              return jsonResponse(request, { ok: false, error: sculpted.error, phases }, 200);
+            }
+            const contactSheetPngBase64 = await renderBlueprintContactSheetPng(sculpted.blueprint);
+            const crossSectionSummary = summarizeBlueprintCrossSections(sculpted.blueprint);
+            return jsonResponse(request, {
+              ok: true,
+              phases,
+              sculpted,
+              contactSheetPngBase64,
+              crossSectionSummary,
+            });
+          }
+
+          if (!body.blueprint || typeof body.blueprint !== "object") {
+            return jsonResponse(request, { ok: false, error: "blueprint required" }, 400);
+          }
+
+          const bp = normalizeAndGroundBlueprint(
+            body.blueprint as Record<string, unknown>,
+            prompt,
+          );
+          const contactSheetPngBase64 = await renderBlueprintContactSheetPng(bp);
+          const crossSectionSummary = summarizeBlueprintCrossSections(bp);
+
+          if (body.renderOnly === true) {
+            return jsonResponse(request, {
+              ok: true,
+              stats: bp.stats,
+              contactSheetPngBase64,
+              crossSectionSummary,
+            });
+          }
+
+          if (!env.GEMINI_API_KEY) {
+            return jsonResponse(request, { ok: false, error: "Missing GEMINI_API_KEY" }, 503);
+          }
+
+          const review = await reviewBlueprintWithCritic({
+            blueprint: bp,
+            promptText: prompt,
+            apiKey: env.GEMINI_API_KEY,
+            primaryModel: env.ARGON_MODEL,
+            fallbackModel: env.FALLBACK_MODEL,
+          });
+
+          let resculpted: Awaited<ReturnType<typeof sculptWithArgon>> | null = null;
+          let resculptedContactSheetPngBase64: string | null = null;
+          let resculptedCrossSectionSummary: string | null = null;
+
+          if (!review.approved && body.resculptIfRejected === true) {
+            resculpted = await sculptWithArgon(
+              {
+                prompt,
+                initialCriticHint: `${review.diagnosis}\n${review.rebuildInstructions}`,
+                initialCriticRenderPngBase64: review.contactSheetPngBase64,
+              },
+              env.GEMINI_API_KEY,
+              env.ARGON_MODEL,
+              env.FALLBACK_MODEL,
+            );
+            if (resculpted.ok) {
+              resculptedContactSheetPngBase64 = await renderBlueprintContactSheetPng(
+                resculpted.blueprint,
+              );
+              resculptedCrossSectionSummary = summarizeBlueprintCrossSections(resculpted.blueprint);
+            }
+          }
+
+          return jsonResponse(request, {
+            ok: true,
+            review,
+            crossSectionSummary,
+            resculpted,
+            resculptedContactSheetPngBase64,
+            resculptedCrossSectionSummary,
+          });
         }
         if (url.pathname === "/api/dev/audit-repair" && request.method === "POST") {
           const parsed = await readBoundedJsonBody(request, 512_000);

@@ -1,17 +1,20 @@
-import { redactSecrets, sanitizePlainText } from "./security";
+import { redactSecrets, safeLogError, sanitizePlainText } from "./security";
 import type { VoxelBlueprint } from "./types";
 import {
   auditBlueprintOverlaps,
   autoRepairBlueprintOverlaps,
   formatAuditFeedbackForArgon,
 } from "./voxel_audit";
+import { type CriticReviewResult, reviewBlueprintWithCritic } from "./voxel_critic";
 import { normalizeAndGroundBlueprint } from "./voxel_dsl";
 
 export interface SculptRequest {
   prompt?: string;
   imageBase64?: string;
   imageMimeType?: string;
-  onPhase?: (phase: "refining", round1Ms: number) => void;
+  initialCriticHint?: string;
+  initialCriticRenderPngBase64?: string;
+  onPhase?: (phase: "reviewing" | "refining", round1Ms: number) => void;
 }
 
 export interface SculptTelemetry {
@@ -19,6 +22,9 @@ export interface SculptTelemetry {
   totalMs: number;
   hadRefinementPass: boolean;
   usedFallback: boolean;
+  criticAttempts?: number;
+  criticScore?: number;
+  criticApproved?: boolean;
 }
 
 export type SculptResult =
@@ -72,6 +78,7 @@ export async function callGeminiArgon(opts: {
   userText: string;
   imageBase64?: string;
   imageMimeType?: string;
+  extraImages?: { mimeType: string; data: string }[];
   temperature?: number;
   thinkingBudget?: number;
   maxOutputTokens?: number;
@@ -90,6 +97,18 @@ export async function callGeminiArgon(opts: {
         data: opts.imageBase64,
       },
     });
+  }
+  if (Array.isArray(opts.extraImages)) {
+    for (const img of opts.extraImages) {
+      if (img?.data && img?.mimeType) {
+        userParts.push({
+          inlineData: {
+            mimeType: img.mimeType,
+            data: img.data,
+          },
+        });
+      }
+    }
   }
   userParts.push({ text: opts.userText });
 
@@ -182,8 +201,9 @@ const SCULPTOR_SYSTEM_PROMPT = `You are Master Voxel Sculptor Argon, creating br
      * \`"watercraft"\` — ANYTHING THAT SWIMS OR FLOATS ON WATER: boats, sailboats, ferries, submarines, surfboards, ducks, swans, whales, dolphins, sharks, sea serpents, turtles! NEVER include a \`plinth\`!
      * \`"creature"\` — WALKING, TROTTING, HOPPING, OR LOW-GLIDING LAND CREATURES, ANIMALS, CHARACTERS, DINOSAURS & MOBILE ROBOTS: Use \`sphere\` / \`roundedBox\` for organic torso, head, snout, ears (\`mirrorX: true\`), pixel eyes, NEVER include a \`plinth\`, and put 2 or 4 articulated legs in \`parts\` with \`"kind": "swingX"\` (left \`phase: 0\`, right \`phase: 3.14\`) + wagging tail (\`"kind": "swingY"\`)!
      * \`"building"\` or \`"prop"\` — STATIONARY STRUCTURES, FIXTURES & NATURAL LANDFORMS:
-       - Architectural buildings (houses, shops, towers, windmills, castles, datacentres): Grounded \`plinth\` + \`stairs\` at +Z, multi-volume \`hollowBox\` / \`cylinder\`, \`roofGable\` / \`dome\` / \`cone\`, \`arch\` doorway, glowing windows (\`emit: 0.95\`), and 1-2 animated \`parts\`.
+       - Architectural buildings & stationary sports/park structures (houses, pubs, shops, towers, windmills, castles, datacentres, skateboard halfpipes, skateparks, ramps, courts, pools): Use \`"category": "building"\`! Grounded \`plinth\` + \`stairs\` at +Z (or open-top carved ramp/court deck), multi-volume geometry, glowing lights (\`emit: 0.95\`), and 1-2 animated \`parts\`.
        - Natural landforms (volcanoes, waterfalls, mountains, cliffs, caves, oasis, giant trees): NEVER include a rectangular concrete \`plinth\`! Sculpt wide organic rock/basalt/earth/moss bases (\`cone\` rBottom 18..25, asymmetric \`sphere\` foothills) touching Y = 0 directly, with glowing magma craters/streams (\`emit: 1.8\`) + rising \`bob\` ash/smoke plumes for volcanoes, or cascading cyan/white water ribbons + \`bob\` mist clouds for waterfalls!
+       - CONCAVE & OPEN-TOP STRUCTURES (skateboard halfpipes, quarter-pipes, skate bowls, swimming pools, bathtubs, sports courts, stadiums, amphitheatres, rowboats/canoes): MUST BE 100% OPEN TO THE SKY ABOVE! Build a solid ramp/basin block up to deck height (e.g. \`box\` \`x0:-13, y0:0, z0:-10, x1:13, y1:10, z1:10\`) and SUBTRACT the smooth U-shaped concave trough from above using \`cylinder\` or \`sphere\` with \`"carve": true\` centered AT OR ABOVE deck height (e.g. \`{"op":"cylinder","axis":"x","x0":-14,"x1":14,"cy":10,"cz":0,"radius":7.5,"carve":true}\` leaves two elevated flat decks on \`z=-10..-8\` and \`z=8..10\` with coping/railings and a smooth open-sky U-ramp between them!). NEVER place a solid horizontal \`cylinder\` and only \`clear\` partway up — that leaves a floating barrel roof arching over the ramp!
 
 5. PIVOT-LOCAL ANIMATED \`parts\` & ZERO Z-FIGHTING CLEARANCE LAW (CRITICAL):
    - Every item in \`parts\` has \`"pivot": [px, py, pz]\` in model coordinates, and ALL \`ops\` inside \`part.ops\` MUST BE AUTHORED AROUND LOCAL \`[0, 0, 0]\`!
@@ -207,11 +227,13 @@ const SCULPTOR_SYSTEM_PROMPT = `You are Master Voxel Sculptor Argon, creating br
    - \`{"op":"cylinder","axis":"y","cx":0,"y0":2,"y1":16,"cz":0,"radius":3.5,"color":"brick","mirrorX":false}\`
    - \`{"op":"cylinder","axis":"x","x0":5,"x1":7,"cy":0,"cz":0,"radius":3.0,"color":"rubber","mirrorX":true}\`
    - \`{"op":"cylinder","axis":"z","cx":0,"cy":8,"z0":-8,"z1":8,"radius":4.0,"color":"body"}\`
+   - \`{"op":"cylinder","axis":"x","x0":-14,"x1":14,"cy":10,"cz":0,"radius":7.5,"carve":true}\` (subtracts a smooth cylindrical U-trough / arch / cavity!)
    - \`{"op":"ring","axis":"x","x0":5,"x1":7,"cy":0,"cz":0,"outerR":3.0,"innerR":1.5,"color":"rubber","mirrorX":true}\`
    - \`{"op":"ring","axis":"y","cx":0,"y0":10,"y1":11,"cz":0,"outerR":4.5,"innerR":3.2,"color":"brass"}\`
    - \`{"op":"ring","axis":"z","cx":0,"cy":10,"z0":5,"z1":6,"outerR":3.5,"innerR":2.2,"color":"gold"}\`
    - \`{"op":"cone","cx":0,"y0":14,"y1":22,"cz":0,"rBottom":4.5,"rTop":0.6,"color":"roof"}\`
    - \`{"op":"sphere","cx":0,"cy":6,"cz":0,"rx":4.0,"ry":3.5,"rz":5.5,"color":"fur","mirrorX":false}\`
+   - \`{"op":"sphere","cx":0,"cy":8,"cz":0,"rx":6.0,"ry":5.0,"rz":6.0,"carve":true}\` (subtracts a smooth concave bowl / basin!)
    - \`{"op":"dome","cx":0,"yBase":14,"cz":0,"radius":4.5,"color":"copper"}\`
    - \`{"op":"roofGable","x0":-8,"yBase":14,"z0":-7,"x1":8,"z1":7,"rise":5,"axis":"x","color":"terracotta","trim":"cream"}\`
    - \`{"op":"roofPyramid","x0":-7,"yBase":14,"z0":-7,"x1":7,"z1":7,"color":"slate","trim":"gold"}\`
@@ -273,11 +295,15 @@ export async function sculptWithArgon(
     if (blocked) return { ok: false, unsafe: true, error: blocked };
   }
 
-  const userDirective = hasImage
+  const baseDirective = hasImage
     ? promptText
       ? `Extract the main foreground subject from this image guided by the user's description below and sculpt an ultra-detailed 3D micro-voxel miniature with rich parts and colors.\n<untrusted_user_description>\n${promptText}\n</untrusted_user_description>`
       : `Carefully inspect this uploaded image, isolate the main foreground object/creature/vehicle/building, and sculpt an ultra-detailed, faithful 3D micro-voxel miniature of it with animated parts.`
     : `Sculpt an ultra-detailed, iconic 3D micro-voxel miniature of the subject described below. Include rich surface greebles, harmonious custom palette, emissive details, and lifelike animated parts.\n<untrusted_user_description>\n${promptText}\n</untrusted_user_description>`;
+
+  const userDirective = req.initialCriticHint
+    ? `${baseDirective}\n\nIMPORTANT PRIOR 3D REVIEWER FEEDBACK TO FIX IMMEDIATELY:\n${req.initialCriticHint}`
+    : baseDirective;
 
   const tStart = Date.now();
   const expectedPrimary = primaryModel || "gemini-4-argon";
@@ -289,14 +315,18 @@ export async function sculptWithArgon(
     userText: userDirective,
     imageBase64: req.imageBase64,
     imageMimeType: req.imageMimeType,
-    temperature: 0.45,
-    thinkingBudget: 768,
-    maxOutputTokens: 10240,
+    ...(req.initialCriticRenderPngBase64
+      ? { extraImages: [{ mimeType: "image/png", data: req.initialCriticRenderPngBase64 }] }
+      : {}),
+    temperature: 0.42,
+    thinkingBudget: 1024,
+    maxOutputTokens: 12288,
   });
 
   const round1Ms = Math.max(1, Date.now() - tStart);
   let usedFallback = first.modelUsed !== expectedPrimary;
   let hadRefinementPass = false;
+  let lastModelUsed = first.modelUsed;
 
   if (first.json.safe === false) {
     const reason =
@@ -305,81 +335,194 @@ export async function sculptWithArgon(
     return { ok: false, unsafe: true, error: reason };
   }
 
-  const rawDraft = normalizeAndGroundBlueprint(first.json, promptText || "Meadow Creation", {
-    skipAutoRepair: true,
-  });
-  const draftAudit = auditBlueprintOverlaps(rawDraft);
-  const needsVolumeRefinement = rawDraft.stats.voxels < 160;
-  const needsStructuralCollisionPass = draftAudit.overlapCells >= 42;
+  interface CandidateAttempt {
+    bp: VoxelBlueprint;
+    rawJson: Record<string, unknown>;
+    rawVoxels: number;
+    overlapCells: number;
+    critic: CriticReviewResult | null;
+    attemptNumber: number;
+  }
 
-  let bp = autoRepairBlueprintOverlaps(rawDraft).blueprint;
+  const evaluateDraft = async (
+    rawJson: Record<string, unknown>,
+    fallbackTitle: string,
+    attemptNumber: number,
+  ): Promise<CandidateAttempt> => {
+    const rawDraft = normalizeAndGroundBlueprint(rawJson, fallbackTitle, { skipAutoRepair: true });
+    const draftAudit = auditBlueprintOverlaps(rawDraft);
+    const repairedBp = autoRepairBlueprintOverlaps(rawDraft).blueprint;
 
-  // If round 1 was sparse (< 160 voxels) OR had a major structural collision (e.g. sails slicing through a roof),
-  // run one targeted Argon self-repair pass before final deterministic clearance enforcement.
-  if (needsVolumeRefinement || needsStructuralCollisionPass) {
+    let critic: CriticReviewResult | null = null;
+    try {
+      critic = await reviewBlueprintWithCritic({
+        blueprint: repairedBp,
+        promptText,
+        userImageBase64: req.imageBase64,
+        userImageMimeType: req.imageMimeType,
+        apiKey,
+        primaryModel,
+        fallbackModel,
+      });
+    } catch (err) {
+      safeLogError("voxel_critic_review", err, [apiKey]);
+    }
+
+    return {
+      bp: repairedBp,
+      rawJson,
+      rawVoxels: rawDraft.stats.voxels,
+      overlapCells: draftAudit.overlapCells,
+      critic,
+      attemptNumber,
+    };
+  };
+
+  try {
+    req.onPhase?.("reviewing", round1Ms);
+  } catch {
+    // ignore phase listener errors
+  }
+
+  let current = await evaluateDraft(first.json, promptText || "Meadow Creation", 1);
+  const candidates: CandidateAttempt[] = [current];
+
+  const MAX_CRITIC_RETRIES = 2;
+  const MAX_LOOP_BUDGET_MS = 72_000;
+
+  for (let retry = 1; retry <= MAX_CRITIC_RETRIES; retry++) {
+    const needsVolume = current.rawVoxels < 160;
+    const needsCollision = current.overlapCells >= 42;
+    const criticRejected = current.critic ? !current.critic.approved : false;
+
+    if (!needsVolume && !needsCollision && !criticRejected) {
+      break;
+    }
+    if (Date.now() - tStart > MAX_LOOP_BUDGET_MS) {
+      break;
+    }
+
     hadRefinementPass = true;
     try {
       req.onPhase?.("refining", round1Ms);
     } catch {
       // ignore phase listener errors
     }
+
     const notes: string[] = [];
-    if (needsVolumeRefinement) {
+    if (current.critic && !current.critic.approved) {
       notes.push(
-        `Your previous draft only produced ${rawDraft.stats.voxels} voxels, which is too sparse. Expand the body volume using roundedBox/sphere/hollowBox/cylinder across [-12..12] so it has 600 to 3000 crisp micro-voxels and at least 1 animated part in \`parts\`.`,
+        [
+          `3D MODEL REVIEWER AGENT REJECTED YOUR DRAFT #${current.attemptNumber} (Score ${current.critic.score}/10):`,
+          `- Visual & Cross-Section Diagnosis: ${current.critic.diagnosis}`,
+          `- Mandatory 3D Rebuild Instructions: ${current.critic.rebuildInstructions}`,
+          `Look carefully at the attached 4-panel 3D render of your rejected draft (Panel 1: Iso Front, Panel 2: Iso Back, Panel 3: Front/Side Elevations, Panel 4: Top-Down). Re-sculpt the 3D geometry cleanly so it unmistakably matches the user's prompt with proper orientation, concave/open-top carving where needed, and zero leftover CSG roof/arch artifacts!`,
+        ].join("\n"),
       );
     }
-    if (needsStructuralCollisionPass) {
+    if (needsVolume) {
+      notes.push(
+        `Your previous draft only produced ${current.rawVoxels} voxels, which is too sparse. Expand the body volume using roundedBox/sphere/hollowBox/cylinder across [-12..12] so it has 600 to 3000 crisp micro-voxels and at least 1 animated part in \`parts\`.`,
+      );
+    }
+    if (needsCollision) {
+      const draftAudit = auditBlueprintOverlaps(
+        normalizeAndGroundBlueprint(current.rawJson, current.bp.name, { skipAutoRepair: true }),
+      );
       notes.push(
         `VOXEL Z-FIGHTING / COLLISION DETECTED IN ANIMATED PARTS:\n${formatAuditFeedbackForArgon(draftAudit)}\nReposition the colliding part pivots or adjust the base roof/wall ops so every animated part spins/swings with >= 1 full voxel of clearance.`,
       );
     }
-    const second = await callGeminiArgon({
+
+    const retryRes = await callGeminiArgon({
       apiKey,
       primaryModel,
       fallbackModel,
       systemPrompt: SCULPTOR_SYSTEM_PROMPT,
-      userText: `${userDirective}\n\nIMPORTANT ORCHESTRATOR REFINEMENT:\n${notes.join("\n\n")}\n\nPrevious JSON:\n${JSON.stringify(first.json)}`,
+      userText: `${baseDirective}\n\nIMPORTANT 3D REVIEWER & ORCHESTRATOR REBUILD DIRECTIVE (Attempt ${retry + 1}):\n${notes.join("\n\n")}\n\nPrevious rejected JSON (rewrite/fix ops & geometry completely where needed):\n${JSON.stringify(current.rawJson)}`,
       imageBase64: req.imageBase64,
       imageMimeType: req.imageMimeType,
-      temperature: 0.38,
+      ...(current.critic?.contactSheetPngBase64
+        ? { extraImages: [{ mimeType: "image/png", data: current.critic.contactSheetPngBase64 }] }
+        : {}),
+      temperature: 0.35,
       thinkingBudget: 1536,
       maxOutputTokens: 16384,
     });
-    if (second.modelUsed !== expectedPrimary) {
+
+    lastModelUsed = retryRes.modelUsed;
+    if (retryRes.modelUsed !== expectedPrimary) {
       usedFallback = true;
     }
-    if (second.json.safe === false) {
+    if (retryRes.json.safe === false) {
       return { ok: false, unsafe: true, error: "Please try creating something family-friendly." };
     }
-    const enriched = normalizeAndGroundBlueprint(second.json, bp.name);
-    if (enriched.stats.voxels >= Math.min(160, bp.stats.voxels)) {
-      bp = enriched;
+
+    try {
+      req.onPhase?.("reviewing", round1Ms);
+    } catch {
+      // ignore
     }
+
+    current = await evaluateDraft(retryRes.json, current.bp.name, retry + 1);
+    candidates.push(current);
   }
 
-  if (bp.stats.voxels < 25) {
+  // Pick the strongest verified blueprint across attempts (approved first, then highest critic score, then voxel richness)
+  const validCandidates = candidates.filter((c) => c.bp.stats.voxels >= 25);
+  if (validCandidates.length === 0) {
     return { ok: false, error: "Argon couldn't form a clear 3D sculpture from that — try adding a few descriptive words." };
   }
+
+  validCandidates.sort((a, b) => {
+    const aApp = a.critic?.approved ? 1 : 0;
+    const bApp = b.critic?.approved ? 1 : 0;
+    if (aApp !== bApp) return bApp - aApp;
+    const aScore = a.critic?.score ?? 6;
+    const bScore = b.critic?.score ?? 6;
+    if (aScore !== bScore) return bScore - aScore;
+    return b.attemptNumber - a.attemptNumber;
+  });
+
+  const winner = validCandidates[0];
+  const bp: VoxelBlueprint = {
+    ...winner.bp,
+    ...(winner.critic
+      ? {
+          criticReview: {
+            approved: winner.critic.approved,
+            score: winner.critic.score,
+            attempts: candidates.length,
+            summary: winner.critic.diagnosis,
+            reviewedAt: Date.now(),
+          },
+        }
+      : {}),
+  };
 
   const outputBlocked = quickSafetyPrecheck(`${bp.name} ${bp.description}`);
   if (outputBlocked) {
     return { ok: false, unsafe: true, error: outputBlocked };
   }
 
-  const extractedSubject = sanitizePlainText(first.json.extractedSubject, 100, true) || bp.name;
+  const extractedSubject =
+    sanitizePlainText(winner.rawJson.extractedSubject ?? first.json.extractedSubject, 100, true) ||
+    bp.name;
   const totalMs = Math.max(round1Ms, Date.now() - tStart);
 
   return {
     ok: true,
     blueprint: bp,
     extractedSubject,
-    modelUsed: first.modelUsed,
+    modelUsed: lastModelUsed,
     telemetry: {
       round1Ms,
       totalMs,
       hadRefinementPass,
       usedFallback,
+      criticAttempts: candidates.length,
+      criticScore: winner.critic?.score,
+      criticApproved: winner.critic?.approved,
     },
   };
 }

@@ -3,6 +3,7 @@ import { sanitizePlainText } from "./security";
 import { autoRepairBlueprintOverlaps } from "./voxel_audit";
 import type {
   BlueprintAmendment,
+  BlueprintCriticReview,
   CreationCategory,
   ScaleClass,
   VoxelBlueprint,
@@ -337,7 +338,7 @@ export class SimVox {
     return this;
   }
 
-  cylinderAxis(axis: "x" | "y" | "z", c1: number, c2: number, s0: number, s1: number, radius: number, color: string, emit = 0): this {
+  cylinderAxis(axis: "x" | "y" | "z", c1: number, c2: number, s0: number, s1: number, radius: number, color: string | null, emit = 0): this {
     const ri = Math.ceil(Math.max(0.5, radius)) + 1;
     const as0 = Math.round(Math.min(s0, s1));
     const as1 = Math.max(as0 + 1, Math.round(Math.max(s0, s1)));
@@ -388,7 +389,7 @@ export class SimVox {
     return this;
   }
 
-  sphere(cx: number, cy: number, cz: number, rx: number, ry = rx, rz = rx, color = "leaf", emit = 0): this {
+  sphere(cx: number, cy: number, cz: number, rx: number, ry = rx, rz = rx, color: string | null = "leaf", emit = 0): this {
     const arx = Math.max(0.5, rx), ary = Math.max(0.5, ry), arz = Math.max(0.5, rz);
     for (let x = Math.floor(cx - arx) - 1; x <= Math.ceil(cx + arx) + 1; x++) {
       for (let y = Math.floor(cy - ary) - 1; y <= Math.ceil(cy + ary) + 1; y++) {
@@ -571,9 +572,10 @@ export function applySimOps(vox: SimVox, ops: VoxelOp[], palette: Record<string,
         break;
       case "cylinder": {
         const axis = op.axis ?? "y";
-        if (axis === "x") vox.cylinderAxis("x", op.cy ?? 2, op.cz ?? 0, op.x0 ?? -2, op.x1 ?? 2, op.radius, col(op.color), op.emit ?? 0);
-        else if (axis === "z") vox.cylinderAxis("z", op.cx ?? 0, op.cy ?? 2, op.z0 ?? -2, op.z1 ?? 2, op.radius, col(op.color), op.emit ?? 0);
-        else vox.cylinderAxis("y", op.cx ?? 0, op.cz ?? 0, op.y0 ?? 0, op.y1 ?? 6, op.radius, col(op.color), op.emit ?? 0);
+        const c = op.carve ? null : col(op.color ?? "steel");
+        if (axis === "x") vox.cylinderAxis("x", op.cy ?? 2, op.cz ?? 0, op.x0 ?? -2, op.x1 ?? 2, op.radius, c, op.emit ?? 0);
+        else if (axis === "z") vox.cylinderAxis("z", op.cx ?? 0, op.cy ?? 2, op.z0 ?? -2, op.z1 ?? 2, op.radius, c, op.emit ?? 0);
+        else vox.cylinderAxis("y", op.cx ?? 0, op.cz ?? 0, op.y0 ?? 0, op.y1 ?? 6, op.radius, c, op.emit ?? 0);
         break;
       }
       case "ring": {
@@ -587,7 +589,7 @@ export function applySimOps(vox: SimVox, ops: VoxelOp[], palette: Record<string,
         vox.cone(op.cx, op.y0, op.y1, op.cz, op.rBottom, op.rTop, col(op.color), op.emit ?? 0);
         break;
       case "sphere":
-        vox.sphere(op.cx, op.cy, op.cz, op.rx, op.ry, op.rz, col(op.color), op.emit ?? 0);
+        vox.sphere(op.cx, op.cy, op.cz, op.rx, op.ry, op.rz, op.carve ? null : col(op.color ?? "leaf"), op.emit ?? 0);
         break;
       case "dome":
         vox.dome(op.cx, op.yBase, op.cz, op.radius, col(op.color), op.emit ?? 0);
@@ -772,6 +774,7 @@ export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string,
     case "cylinder": {
       const axis: "x" | "y" | "z" = raw.axis === "x" || raw.axis === "z" ? raw.axis : "y";
       const radius = clamp(num(raw.radius, 2.5), 0.5, 24);
+      const carve = Boolean(raw.carve);
       if (axis === "x") {
         const [x0, x1] = orderedSpan(raw.x0, raw.x1, -1, 1);
         return {
@@ -782,8 +785,8 @@ export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string,
           cy: clamp(num(raw.cy, 0), loY, MAX_Y),
           cz: clamp(num(raw.cz, 0), -B, B),
           radius: Number(radius.toFixed(2)),
-          color: normalizeColorToken(raw.color, palette, "rubber"),
-          ...(emitVal ? { emit: emitVal } : {}),
+          ...(carve ? { carve: true } : { color: normalizeColorToken(raw.color, palette, "rubber") }),
+          ...(!carve && emitVal ? { emit: emitVal } : {}),
           ...(mirrorX ? { mirrorX: true } : {}),
         };
       }
@@ -797,8 +800,8 @@ export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string,
           z0: clamp(z0, -B, B - 1),
           z1: clamp(Math.max(z0 + 1, z1), -B + 1, B),
           radius: Number(radius.toFixed(2)),
-          color: normalizeColorToken(raw.color, palette, "steel"),
-          ...(emitVal ? { emit: emitVal } : {}),
+          ...(carve ? { carve: true } : { color: normalizeColorToken(raw.color, palette, "steel") }),
+          ...(!carve && emitVal ? { emit: emitVal } : {}),
           ...(mirrorX ? { mirrorX: true } : {}),
         };
       }
@@ -811,8 +814,8 @@ export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string,
         y1: clamp(Math.max(y0 + 1, y1), loY + 1, MAX_Y),
         cz: clamp(num(raw.cz, 0), -B, B),
         radius: Number(radius.toFixed(2)),
-        color: normalizeColorToken(raw.color, palette, "steel"),
-        ...(emitVal ? { emit: emitVal } : {}),
+        ...(carve ? { carve: true } : { color: normalizeColorToken(raw.color, palette, "steel") }),
+        ...(!carve && emitVal ? { emit: emitVal } : {}),
         ...(mirrorX ? { mirrorX: true } : {}),
       };
     }
@@ -888,6 +891,7 @@ export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string,
       const rx = clamp(num(raw.rx ?? raw.radius, 2.5), 0.5, 24);
       const ry = clamp(num(raw.ry ?? rx, rx), 0.5, 24);
       const rz = clamp(num(raw.rz ?? rx, rx), 0.5, 24);
+      const carve = Boolean(raw.carve);
       return {
         op: "sphere",
         cx: clamp(num(raw.cx, 0), -B, B),
@@ -896,8 +900,8 @@ export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string,
         rx: Number(rx.toFixed(2)),
         ry: Number(ry.toFixed(2)),
         rz: Number(rz.toFixed(2)),
-        color: normalizeColorToken(raw.color, palette, "leaf"),
-        ...(emitVal ? { emit: emitVal } : {}),
+        ...(carve ? { carve: true } : { color: normalizeColorToken(raw.color, palette, "leaf") }),
+        ...(!carve && emitVal ? { emit: emitVal } : {}),
         ...(mirrorX ? { mirrorX: true } : {}),
       };
     }
@@ -1166,6 +1170,21 @@ export function normalizeAndGroundBlueprint(
   }
 
   const liveFeed = sanitizeLiveFeed(raw.liveFeed);
+  let criticReview: BlueprintCriticReview | undefined;
+  if (raw.criticReview && typeof raw.criticReview === "object") {
+    const cr = raw.criticReview as Record<string, unknown>;
+    if (typeof cr.approved === "boolean" && Number.isFinite(Number(cr.score))) {
+      criticReview = {
+        approved: cr.approved,
+        score: clamp(Math.round(Number(cr.score)), 1, 10),
+        attempts: clamp(Math.round(num(cr.attempts, 1)), 1, 5),
+        ...(typeof cr.summary === "string" && cr.summary
+          ? { summary: sanitizePlainText(cr.summary, 240, true) }
+          : {}),
+        reviewedAt: Number(cr.reviewedAt) || Date.now(),
+      };
+    }
+  }
 
   const normalized: VoxelBlueprint = {
     version: 1,
@@ -1177,6 +1196,7 @@ export function normalizeAndGroundBlueprint(
     ops,
     parts,
     ...(liveFeed ? { liveFeed } : {}),
+    ...(criticReview ? { criticReview } : {}),
     stats: {
       voxels: b.count,
       footprintX: Math.max(2, b.maxX - b.minX),
@@ -1302,6 +1322,7 @@ export function applyBlueprintAmendment(
       ops: nextOps,
       parts: nextParts,
       liveFeed: existing.liveFeed ?? null,
+      ...(existing.criticReview ? { criticReview: existing.criticReview } : {}),
     },
     existing.name,
   );
@@ -1312,4 +1333,16 @@ export function applyBlueprintAmendment(
     return applyBlueprintAmendment(existing, { ...amendment, clearOps: undefined });
   }
   return candidate.stats.voxels >= 25 ? candidate : existing;
+}
+
+export function rasterizeCompleteBlueprint(bp: VoxelBlueprint): SimVox {
+  const full = new SimVox();
+  applySimOps(full, bp.ops || [], bp.palette || {});
+  for (const part of bp.parts || []) {
+    const pv = new SimVox();
+    applySimOps(pv, part.ops || [], bp.palette || {});
+    const [px, py, pz] = part.pivot || [0, 0, 0];
+    full.merge(pv, Math.round(px), Math.round(py), Math.round(pz));
+  }
+  return full;
 }

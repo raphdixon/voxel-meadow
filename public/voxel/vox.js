@@ -555,9 +555,10 @@ export function applyOps(vox, ops = [], customPalette = {}) {
         break;
       case "cylinder": {
         const axis = op.axis ?? "y";
-        if (axis === "x") vox.cylinderAxis("x", op.cy ?? 0, op.cz ?? 0, op.x0 ?? -2, op.x1 ?? 2, op.radius ?? 2.5, col(op.color), emit);
-        else if (axis === "z") vox.cylinderAxis("z", op.cx ?? 0, op.cy ?? 2, op.z0 ?? -2, op.z1 ?? 2, op.radius ?? 2.5, col(op.color), emit);
-        else vox.cylinderAxis("y", op.cx ?? 0, op.cz ?? 0, op.y0 ?? 0, op.y1 ?? 6, op.radius ?? 2.5, col(op.color), emit);
+        const c = op.carve ? null : col(op.color ?? "steel");
+        if (axis === "x") vox.cylinderAxis("x", op.cy ?? 0, op.cz ?? 0, op.x0 ?? -2, op.x1 ?? 2, op.radius ?? 2.5, c, emit);
+        else if (axis === "z") vox.cylinderAxis("z", op.cx ?? 0, op.cy ?? 2, op.z0 ?? -2, op.z1 ?? 2, op.radius ?? 2.5, c, emit);
+        else vox.cylinderAxis("y", op.cx ?? 0, op.cz ?? 0, op.y0 ?? 0, op.y1 ?? 6, op.radius ?? 2.5, c, emit);
         break;
       }
       case "ring": {
@@ -571,7 +572,7 @@ export function applyOps(vox, ops = [], customPalette = {}) {
         vox.cone(op.cx, op.y0, op.y1, op.cz, op.rBottom, op.rTop ?? 0.5, col(op.color), emit);
         break;
       case "sphere":
-        vox.sphere(op.cx, op.cy, op.cz, op.rx, op.ry ?? op.rx, op.rz ?? op.rx, col(op.color), emit);
+        vox.sphere(op.cx, op.cy, op.cz, op.rx, op.ry ?? op.rx, op.rz ?? op.rx, op.carve ? null : col(op.color ?? "leaf"), emit);
         break;
       case "dome":
         vox.dome(op.cx, op.yBase, op.cz, op.radius, col(op.color), emit);

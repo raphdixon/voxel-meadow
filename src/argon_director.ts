@@ -154,7 +154,7 @@ function findNearestPathCurb(
 }
 
 const STATIONARY_OVERRIDE_RE =
-  /\b(statue|monument|memorial|sculpture|fountain|shrine|temple|house|cottage|shop|bakery|cafe|station|tower|castle|barn|windmill|datacentre|datacenter|museum|library|school|kiosk|stall|bench|sign|tree|bush|garden|bridge|archway|volcano|mountain|waterfall|cliff|canyon|pyramid|stadium|colosseum|cathedral)\b/i;
+  /\b(statue|monument|memorial|sculpture|fountain|shrine|temple|house|cottage|shop|bakery|cafe|pub|bar|inn|hotel|restaurant|diner|station|tower|castle|barn|windmill|datacentre|datacenter|museum|library|school|kiosk|stall|bench|sign|tree|bush|garden|bridge|archway|volcano|mountain|waterfall|cliff|canyon|pyramid|stadium|colosseum|cathedral|half-?pipe|quarter-?pipe|skate\s*park|skatepark|ramp|bowl|court|rink|pool|playground|park|gazebo|pavilion|garage)\b/i;
 
 const COLOSSAL_SUBJECT_RE =
   /\b(volcano|stratovolcano|caldera|mountain|mt\.|everest|fuji|matterhorn|glacier|canyon|mesa|castle|citadel|fortress|palace|cathedral|stadium|arena|colosseum|amphitheater|amphitheatre|pyramid|ziggurat|launch\s*pad|spaceport|world\s*tree|yggdrasil|colossus|kaiju|godzilla|giant\s+waterfall|niagara|skyscraper|megastructure)\b/i;
@@ -211,7 +211,7 @@ export function inferBiomeAndPathStyle(target: WorldCreation): {
   if (/\b(autumn|maple|pumpkin|harvest|fox|mushroom|toadstool|windmill|bakery|acorn)\b/i.test(combined)) {
     return { biome: "autumn_grove", pathKind: "dirt_trail", vehicleRoadKind: "dirt_trail" };
   }
-  if (/\b(castle|citadel|fortress|tower|clocktower|cathedral|shrine|temple|pagoda|fountain|statue|monument|plaza|cafe|bistro|museum|library|station|datacentre|datacenter|stadium|colosseum)\b/i.test(combined)) {
+  if (/\b(castle|citadel|fortress|tower|clocktower|cathedral|shrine|temple|pagoda|fountain|statue|monument|plaza|cafe|bistro|pub|inn|museum|library|station|datacentre|datacenter|stadium|colosseum|half-?pipe|quarter-?pipe|skate\s*park|skatepark|court|rink)\b/i.test(combined)) {
     return { biome: "stone_plaza", pathKind: "cobblestone", vehicleRoadKind: "road" };
   }
   if (/\b(jeep|atv|buggy|tractor|excavator|bulldozer|rover|wagon|cart|carriage|horse|bike|bicycle|mountain\s*bike)\b/i.test(combined)) {
@@ -252,7 +252,8 @@ export function inferEffectiveMobility(target: WorldCreation): CreationCategory 
     return target.category;
   }
   if (target.category === "vehicle") {
-    if (!isExplicitlyStationary && AIRBORNE_SUBJECT_RE.test(combined)) return "aircraft";
+    if (isExplicitlyStationary) return "building";
+    if (AIRBORNE_SUBJECT_RE.test(combined)) return "aircraft";
     return "vehicle";
   }
 

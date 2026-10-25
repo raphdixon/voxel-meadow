@@ -117,6 +117,8 @@ function renderActiveJobLabel() {
   const remSec = Math.round(Number(activeJob.displayEtaSec ?? activeJob.etaSeconds) || 30);
   if (activeJob.status === "queued" && activeJob.position >= 1) {
     buildingPillLabel.textContent = `Queue #${activeJob.position} · ${formatEta(remSec)}`;
+  } else if (activeJob.phase === "reviewing") {
+    buildingPillLabel.textContent = remSec <= 5 ? "Reviewing…" : `Reviewing · ${formatEta(remSec)}`;
   } else if (activeJob.phase === "refining") {
     buildingPillLabel.textContent = remSec <= 5 ? "Polishing…" : `Polishing · ${formatEta(remSec)}`;
   } else {

@@ -49,7 +49,8 @@ export type VoxelOp =
       z0?: number;
       z1?: number;
       radius: number;
-      color: string;
+      color?: string;
+      carve?: boolean;
       emit?: number;
       mirrorX?: boolean;
     }
@@ -72,7 +73,7 @@ export type VoxelOp =
       mirrorX?: boolean;
     }
   | { op: "cone"; cx: number; y0: number; y1: number; cz: number; rBottom: number; rTop: number; color: string; emit?: number; mirrorX?: boolean }
-  | { op: "sphere"; cx: number; cy: number; cz: number; rx: number; ry: number; rz: number; color: string; emit?: number; mirrorX?: boolean }
+  | { op: "sphere"; cx: number; cy: number; cz: number; rx: number; ry: number; rz: number; color?: string; carve?: boolean; emit?: number; mirrorX?: boolean }
   | { op: "dome"; cx: number; yBase: number; cz: number; radius: number; color: string; emit?: number; mirrorX?: boolean }
   | { op: "roofGable"; x0: number; yBase: number; z0: number; x1: number; z1: number; rise: number; axis: "x" | "z"; color: string; trim?: string }
   | { op: "roofPyramid"; x0: number; yBase: number; z0: number; x1: number; z1: number; color: string; trim?: string }
@@ -91,6 +92,14 @@ export interface VoxelPart {
   ops: VoxelOp[];
 }
 
+export interface BlueprintCriticReview {
+  approved: boolean;
+  score: number;
+  attempts: number;
+  summary?: string;
+  reviewedAt: number;
+}
+
 export interface VoxelBlueprint {
   version: 1;
   name: string;
@@ -101,6 +110,7 @@ export interface VoxelBlueprint {
   ops: VoxelOp[];
   parts: VoxelPart[];
   liveFeed?: LiveFeedSpec | null;
+  criticReview?: BlueprintCriticReview;
   stats: {
     voxels: number;
     footprintX: number;
@@ -247,7 +257,7 @@ export interface WorldVillager {
 export interface BuildQueueJobInfo {
   jobId: string;
   status: "queued" | "sculpting" | "done" | "failed";
-  phase?: "queued" | "sculpting" | "refining";
+  phase?: "queued" | "sculpting" | "reviewing" | "refining";
   /** 0 when actively sculpting right now; >= 1 for your spot in the waiting queue */
   position: number;
   activeCount: number;

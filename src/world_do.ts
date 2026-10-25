@@ -36,6 +36,7 @@ import {
   autoRepairBlueprintOverlaps,
   detectPathCrossings,
 } from "./voxel_audit";
+import { reviewBlueprintWithCritic } from "./voxel_critic";
 import {
   applyBlueprintAmendment,
   getCreationFootprintRadius,
@@ -113,7 +114,7 @@ interface BuildJobRow {
   ip_hash: string;
   day_key: string;
   status: "queued" | "sculpting" | "done" | "failed";
-  phase: "queued" | "sculpting" | "refining";
+  phase: "queued" | "sculpting" | "reviewing" | "refining";
   round1_ms: number | null;
   has_image: number;
   prompt: string;
@@ -851,7 +852,9 @@ export class WorldDO extends DurableObject<Env> {
   private parseJobRow(r: Record<string, unknown>): BuildJobRow {
     const rawPhase = String(r.phase ?? "queued");
     const phase: BuildJobRow["phase"] =
-      rawPhase === "refining" || rawPhase === "sculpting" ? rawPhase : "queued";
+      rawPhase === "refining" || rawPhase === "reviewing" || rawPhase === "sculpting"
+        ? rawPhase
+        : "queued";
     const hasImg =
       Number(r.has_image) === 1 ||
       (typeof r.image_base64 === "string" &&
@@ -937,8 +940,12 @@ export class WorldDO extends DurableObject<Env> {
 
     if (target.status === "sculpting") {
       const elapsed = Math.max(0, now - (target.started_at ?? now));
-      const activePhase: "sculpting" | "refining" =
-        target.phase === "refining" ? "refining" : "sculpting";
+      const activePhase: "sculpting" | "reviewing" | "refining" =
+        target.phase === "refining"
+          ? "refining"
+          : target.phase === "reviewing"
+            ? "reviewing"
+            : "sculpting";
       const remainingMs =
         typeof target.sim_delay_ms === "number" && target.sim_delay_ms > 0
           ? Math.max(1_500, target.sim_delay_ms - elapsed)
@@ -1954,6 +1961,153 @@ export class WorldDO extends DurableObject<Env> {
     }
   }
 
+  /**
+   * Background 3D Reviewer audit for prompt-backed creations placed prior to the critic loop.
+   * Audits at most 1 unreviewed creation per idle cron tick:
+   * - Good models (`approved` or `score >= 5`) have `criticReview` stamped without modifying voxels.
+   * - Severe geometric misinterpretations (`!approved && score <= 4`, e.g. sliced on wrong axis or
+   *   accidental CSG cylinder ceiling over an open-top halfpipe) are automatically re-sculpted in-place.
+   */
+  private async auditOneUnreviewedCreationWithCritic(): Promise<{
+    auditedId?: string;
+    healedId?: string;
+    note?: string;
+  }> {
+    if (!this.env.GEMINI_API_KEY || this.activeJobPromises.size > 0) {
+      return {};
+    }
+    const sql = this.ctx.storage.sql;
+    const rows = sql
+      .exec(`SELECT id, integrated_level, json FROM creations ORDER BY created_at DESC`)
+      .toArray();
+
+    const unreviewed: WorldCreation[] = [];
+    for (const r of rows) {
+      const c = JSON.parse(String(r.json)) as WorldCreation;
+      if (c.isSeed || !c.creatorPrompt || c.blueprint.criticReview) continue;
+      const tries = Number(this.getMeta(`critic_heal_tries:${c.id}`, "0")) || 0;
+      if (tries >= 2) continue;
+      unreviewed.push(c);
+    }
+
+    if (unreviewed.length === 0) return {};
+
+    const priorityTarget =
+      unreviewed.find((c) => c.id === "c-mvne3zub-216636") ?? unreviewed[0];
+
+    try {
+      const review = await reviewBlueprintWithCritic({
+        blueprint: priorityTarget.blueprint,
+        promptText: priorityTarget.creatorPrompt!,
+        apiKey: this.env.GEMINI_API_KEY,
+        primaryModel: this.env.ARGON_MODEL,
+        fallbackModel: this.env.FALLBACK_MODEL,
+      });
+
+      if (review.approved || review.score >= 5) {
+        const freshRows = sql
+          .exec(`SELECT json FROM creations WHERE id = ?`, priorityTarget.id)
+          .toArray();
+        if (freshRows.length > 0) {
+          const fresh = JSON.parse(String(freshRows[0].json)) as WorldCreation;
+          fresh.blueprint.criticReview = {
+            approved: true,
+            score: review.score,
+            attempts: 1,
+            summary: review.diagnosis,
+            reviewedAt: Date.now(),
+          };
+          sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(fresh), fresh.id);
+        }
+        return {
+          auditedId: priorityTarget.id,
+          note: `3D Reviewer verified "${priorityTarget.name}" (${review.score}/10)`,
+        };
+      }
+
+      const prevTries = Number(this.getMeta(`critic_heal_tries:${priorityTarget.id}`, "0")) || 0;
+      this.setMeta(`critic_heal_tries:${priorityTarget.id}`, String(prevTries + 1));
+
+      const resculpted = await sculptWithArgon(
+        {
+          prompt: priorityTarget.creatorPrompt!,
+          initialCriticHint: `${review.diagnosis}\n${review.rebuildInstructions}`,
+          initialCriticRenderPngBase64: review.contactSheetPngBase64,
+        },
+        this.env.GEMINI_API_KEY,
+        this.env.ARGON_MODEL,
+        this.env.FALLBACK_MODEL,
+      );
+
+      if (!resculpted.ok) {
+        return {
+          auditedId: priorityTarget.id,
+          note: `3D Reviewer flagged "${priorityTarget.name}" (${review.score}/10); retry deferred`,
+        };
+      }
+
+      const freshRows = sql
+        .exec(`SELECT integrated_level, json FROM creations WHERE id = ?`, priorityTarget.id)
+        .toArray();
+      if (freshRows.length === 0) return {};
+
+      const fresh = JSON.parse(String(freshRows[0].json)) as WorldCreation;
+      const nextBp = resculpted.blueprint;
+      if (!nextBp.criticReview) {
+        nextBp.criticReview = {
+          approved: true,
+          score: 8,
+          attempts: 2,
+          summary: "Re-sculpted in-place after 3D Reviewer audit.",
+          reviewedAt: Date.now(),
+        };
+      }
+
+      fresh.blueprint = nextBp;
+      fresh.name = nextBp.name;
+      fresh.description = nextBp.description;
+      if (fresh.behavior.type !== "landmark" || nextBp.category === "building") {
+        fresh.category = nextBp.category;
+      }
+      fresh.scaleClass = nextBp.scaleClass;
+      if (nextBp.liveFeed && !fresh.liveFeed) {
+        fresh.liveFeed = nextBp.liveFeed;
+      }
+
+      sql.exec(
+        `UPDATE creations SET integrated_level = ?, json = ? WHERE id = ?`,
+        fresh.integratedLevel,
+        JSON.stringify(fresh),
+        fresh.id,
+      );
+
+      this.auditAndRepairWorld();
+      const healNote = `3D Reviewer rebuilt "${fresh.name}" to match "${priorityTarget.creatorPrompt}"`;
+      this.setMeta("lastWeaveNote", healNote);
+      this.setMeta("lastWeaveAt", String(Date.now()));
+      this.bumpVersion();
+
+      const refreshed = this.readBaseWorld();
+      this.broadcast({
+        type: "world_updated",
+        note: healNote,
+        world: { ...refreshed, myCreationId: null },
+      });
+
+      return {
+        auditedId: fresh.id,
+        healedId: fresh.id,
+        note: healNote,
+      };
+    } catch (err) {
+      safeLogError("cron_critic_audit", err, [
+        this.env.GEMINI_API_KEY,
+        this.env.CREATOR_HMAC_SECRET,
+      ]);
+      return {};
+    }
+  }
+
   public async runCronWeaver(): Promise<{ ok: boolean; note: string }> {
     void this.pumpBuildQueue();
 
@@ -1970,6 +2124,12 @@ export class WorldDO extends DurableObject<Env> {
     if (!this.env.GEMINI_API_KEY) {
       return { ok: false, note: "Director unavailable" };
     }
+
+    const criticAudit = await this.auditOneUnreviewedCreationWithCritic();
+    if (criticAudit.healedId) {
+      return { ok: true, note: criticAudit.note || "3D Reviewer healed creation" };
+    }
+
     const world = this.readBaseWorld();
     const hasUnintegrated = world.creations.some((c) => c.integratedLevel < 2);
     const hasStuckMobile = world.creations.some((c) => !c.isSeed && needsMobilityAmendment(c));
@@ -1979,8 +2139,9 @@ export class WorldDO extends DurableObject<Env> {
     if (!hasUnintegrated && !hasStuckMobile && !hasNewCreations) {
       return {
         ok: true,
-        note:
-          auditRes.repairedCount > 0
+        note: criticAudit.note
+          ? criticAudit.note
+          : auditRes.repairedCount > 0
             ? `Auto-repaired ${auditRes.repairedCount} overlap(s); no new creations to weave`
             : "Verified 0 voxel overlaps — no new creations since last weave",
       };

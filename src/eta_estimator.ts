@@ -13,7 +13,7 @@
  */
 
 export type BuildComplexityBucket = "compact" | "standard" | "complex";
-export type ActiveBuildPhase = "sculpting" | "refining";
+export type ActiveBuildPhase = "sculpting" | "reviewing" | "refining";
 
 export interface BuildTelemetrySample {
   durationMs: number;
@@ -275,6 +275,12 @@ export function estimateRemainingBuildMs(opts: {
 }): number {
   const clean = sanitizeHistory(opts.history);
   const elapsed = Math.max(0, opts.elapsedMs);
+
+  if (opts.phase === "reviewing") {
+    const r1 = typeof opts.round1Ms === "number" && opts.round1Ms > 0 ? opts.round1Ms : elapsed;
+    const revElapsed = Math.max(0, elapsed - r1);
+    return evaluateLomaxRemainingMs(revElapsed, 9_500, 16_000, 4_000);
+  }
 
   if (opts.phase === "refining") {
     const r1 = typeof opts.round1Ms === "number" && opts.round1Ms > 0 ? opts.round1Ms : elapsed;

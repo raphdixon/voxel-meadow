@@ -365,6 +365,7 @@ function buildEndlessGrassMaterial(uniforms) {
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.uTime = uniforms.uTime;
     shader.uniforms.uFocusXZ = uniforms.uFocusXZ;
+    shader.uniforms.uHorizonRange = uniforms.uHorizonRange;
     shader.uniforms.uZones = uniforms.uZones;
     shader.uniforms.uZoneCount = uniforms.uZoneCount;
     shader.vertexShader = shader.vertexShader
@@ -384,6 +385,7 @@ function buildEndlessGrassMaterial(uniforms) {
         `#include <common>
         uniform float uTime;
         uniform vec2 uFocusXZ;
+        uniform vec2 uHorizonRange;
         uniform vec4 uZones[${MAX_SHADER_ZONES}];
         uniform int uZoneCount;
         varying vec3 vWorldPos;
@@ -508,8 +510,8 @@ function buildEndlessGrassMaterial(uniforms) {
         grassCol *= mix(0.92, 1.05, smoothstep(0.32, 0.70, cloud));
 
         float distFocus = length(wp - uFocusXZ);
-        vec3 horizonMist = srgb2lin(154.0, 206.0, 134.0);
-        grassCol = mix(grassCol, horizonMist, smoothstep(185.0, 480.0, distFocus) * 0.58);
+        vec3 horizonMist = srgb2lin(164.0, 212.0, 142.0);
+        grassCol = mix(grassCol, horizonMist, smoothstep(115.0, 265.0, distFocus) * 0.55);
 
         diffuseColor.rgb = grassCol;`,
       )
@@ -519,9 +521,15 @@ function buildEndlessGrassMaterial(uniforms) {
         if (volcanicGlowMask > 0.01) {
           totalEmissiveRadiance += srgb2lin(255.0, 102.0, 28.0) * (volcanicGlowMask * 0.85);
         }`,
+      )
+      .replace(
+        "#include <opaque_fragment>",
+        `#include <opaque_fragment>
+        float horizonSkyBlend = smoothstep(uHorizonRange.x, uHorizonRange.y, length(vWorldPos.xz - uFocusXZ));
+        gl_FragColor.rgb = mix(gl_FragColor.rgb, srgb2lin(203.0, 228.0, 190.0), horizonSkyBlend);`,
       );
   };
-  mat.customProgramCacheKey = () => "geminisland-voxel-biomes-v3";
+  mat.customProgramCacheKey = () => "geminisland-voxel-biomes-v6";
   return mat;
 }
 
@@ -1188,6 +1196,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   const grassUniforms = {
     uTime: { value: 0 },
     uFocusXZ: { value: new THREE.Vector2(0, 0) },
+    uHorizonRange: { value: new THREE.Vector2(145, 295) },
     uZones: { value: Array.from({ length: MAX_SHADER_ZONES }, () => new THREE.Vector4(0, 0, 0, 0)) },
     uZoneCount: { value: 0 },
   };
@@ -1312,18 +1321,74 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   let highlightedId = null;
   let ogSettledFrames = 0;
 
-  const cam = {
-    tx: 0,
-    tz: -2,
-    goalTx: 0,
-    goalTz: -2,
-    zoom: 1.02,
-    goalZoom: 1.02,
-    az: 0.62,
-    goalAz: 0.62,
-    el: 0.66,
-    goalEl: 0.66,
+  const HOME_TX = 0;
+  const HOME_TZ = -2;
+  const HOME_AZ = 0.62;
+  const HOME_EL = 0.66;
+  const MIN_EL = 0.135;
+  const MAX_EL = 1.24;
+
+  function getHomeZoom() {
+    const w = canvas.clientWidth || window.innerWidth || 1280;
+    const h = Math.max(1, canvas.clientHeight || window.innerHeight || 800);
+    return w / h < 0.78 ? 0.82 : 1.02;
+  }
+
+  function wrapPi(rad) {
+    let a = rad;
+    while (a > Math.PI) a -= Math.PI * 2;
+    while (a < -Math.PI) a += Math.PI * 2;
+    return a;
+  }
+
+  function lowAngleTargetY(el) {
+    return el < 0.32 ? (0.32 - el) * 14.0 : 0;
+  }
+
+  const prefersReducedMotion = Boolean(
+    window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches,
+  );
+  const runIntroOnBoot = !ogMode && !prefersReducedMotion;
+  const initialHomeZoom = getHomeZoom();
+
+  const introSweep = {
+    active: runIntroOnBoot,
+    elapsed: 0,
+    holdSec: 0.16,
+    durationSec: 2.15,
+    fromTx: 2.2,
+    fromTy: 3.1,
+    fromTz: -9.5,
+    fromZoom: 2.45,
+    fromAz: HOME_AZ - 1.85,
+    fromEl: 0.145,
   };
+
+  const cam = {
+    tx: runIntroOnBoot ? introSweep.fromTx : HOME_TX,
+    ty: runIntroOnBoot ? introSweep.fromTy : 0,
+    tz: runIntroOnBoot ? introSweep.fromTz : HOME_TZ,
+    goalTx: HOME_TX,
+    goalTy: 0,
+    goalTz: HOME_TZ,
+    zoom: runIntroOnBoot ? introSweep.fromZoom : initialHomeZoom,
+    goalZoom: initialHomeZoom,
+    az: runIntroOnBoot ? introSweep.fromAz : HOME_AZ,
+    goalAz: HOME_AZ,
+    el: runIntroOnBoot ? introSweep.fromEl : HOME_EL,
+    goalEl: HOME_EL,
+  };
+
+  function cancelIntroSweep() {
+    if (!introSweep.active) return;
+    introSweep.active = false;
+    cam.goalTx = cam.tx;
+    cam.goalTy = lowAngleTargetY(cam.el);
+    cam.goalTz = cam.tz;
+    cam.goalZoom = cam.zoom;
+    cam.goalAz = cam.az;
+    cam.goalEl = cam.el;
+  }
 
   const CLAMP_BOUND = 175;
   function clampTarget() {
@@ -1510,16 +1575,78 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       });
     }
 
-    for (const p of world.paths || []) {
+    const allPaths = world.paths || [];
+    const roadSamples = allPaths
+      .filter((rp) => rp.kind === "road" && rp.points && rp.points.length >= 2)
+      .map((rp, rIdx) => {
+        const rVecs = rp.points.map(([x, z]) => new THREE.Vector3(x, 0, z));
+        const rCurve = new THREE.CatmullRomCurve3(rVecs, Boolean(rp.closed), "centripetal", 0.5);
+        const rLen = Math.max(4, rCurve.getLength());
+        return {
+          id: rp.id,
+          rank: rp.id === "path-main-loop" ? 0 : rp.closed ? 1 : 2 + rIdx,
+          pts: rCurve.getSpacedPoints(Math.min(180, Math.max(28, Math.round(rLen * 1.5)))),
+        };
+      });
+
+    const snapRoadTJunctionEnd = (endVec, selfId) => {
+      let bestCp = null;
+      let bestDist = Infinity;
+      for (const rc of roadSamples) {
+        if (rc.id === selfId) continue;
+        for (let i = 0; i < rc.pts.length - 1; i++) {
+          const a = rc.pts[i];
+          const b = rc.pts[i + 1];
+          const dx = b.x - a.x;
+          const dz = b.z - a.z;
+          const l2 = dx * dx + dz * dz;
+          const t =
+            l2 > 1e-6
+              ? Math.max(0, Math.min(1, ((endVec.x - a.x) * dx + (endVec.z - a.z) * dz) / l2))
+              : 0;
+          const cx = a.x + dx * t;
+          const cz = a.z + dz * t;
+          const d = Math.hypot(endVec.x - cx, endVec.z - cz);
+          if (d < bestDist) {
+            bestDist = d;
+            bestCp = { x: cx, z: cz };
+          }
+        }
+      }
+      if (!bestCp || bestDist > 3.35 || bestDist < 0.05) return null;
+      const ux = (endVec.x - bestCp.x) / bestDist;
+      const uz = (endVec.z - bestCp.z) / bestDist;
+      return new THREE.Vector3(bestCp.x + ux * 0.42, 0, bestCp.z + uz * 0.42);
+    };
+
+    for (let pIdx = 0; pIdx < allPaths.length; pIdx++) {
+      const p = allPaths[pIdx];
       if (!p.points || p.points.length < 2) continue;
       const vecs = p.points.map(([x, z]) => new THREE.Vector3(x, 0, z));
+      let tJunctionStart = false;
+      let tJunctionEnd = false;
+      if (p.kind === "road" && !p.closed) {
+        const extStart = snapRoadTJunctionEnd(vecs[0], p.id);
+        if (extStart) {
+          vecs[0] = extStart;
+          tJunctionStart = true;
+        }
+        const extEnd = snapRoadTJunctionEnd(vecs[vecs.length - 1], p.id);
+        if (extEnd) {
+          vecs[vecs.length - 1] = extEnd;
+          tJunctionEnd = true;
+        }
+      }
       const curve = new THREE.CatmullRomCurve3(vecs, Boolean(p.closed), "centripetal", 0.5);
       const len = Math.max(4, curve.getLength());
       const samples = Math.min(200, Math.max(28, Math.round(len * 1.4)));
 
       if (p.kind === "road") {
+        const isPrimaryRoad = p.id === "path-main-loop" || Boolean(p.closed);
+        const asphaltY = isPrimaryRoad ? 0.091 : Math.max(0.082, 0.088 - Math.min(5, pIdx) * 0.001);
+        const asphaltPoly = isPrimaryRoad ? -2.3 : -1.9;
         pathsGroup.add(buildRibbonMesh(curve, samples, 2.52, 0.052, "#dfd7c5", true, -1));
-        pathsGroup.add(buildRibbonMesh(curve, samples, 2.1, 0.088, "#4b505c", true, -2));
+        pathsGroup.add(buildRibbonMesh(curve, samples, 2.1, asphaltY, "#4b505c", true, asphaltPoly));
 
         const dashCount = Math.floor(len / 3.4);
         const dashGeo = new THREE.BoxGeometry(0.2, 0.026, 1.3);
@@ -1531,6 +1658,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         });
         for (let i = 0; i < dashCount; i++) {
           const u = (i + 0.5) / dashCount;
+          const distFromStart = u * len;
+          const distFromEnd = (1 - u) * len;
+          if ((tJunctionStart && distFromStart < 2.65) || (tJunctionEnd && distFromEnd < 2.65)) {
+            continue;
+          }
           const pt = curve.getPointAt(u);
           const tan = curve.getTangentAt(u);
           const dash = new THREE.Mesh(dashGeo, dashMat);
@@ -1634,7 +1766,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       cz = Math.max(-18, Math.min(18, latest.z * blend - 2));
     }
     const zoom = aspect < 0.75 ? 0.64 : aspect < 1.15 ? 0.82 : 0.94;
+    introSweep.active = false;
     cam.tx = cam.goalTx = cx;
+    cam.ty = cam.goalTy = 0;
     cam.tz = cam.goalTz = cz;
     cam.zoom = cam.goalZoom = zoom;
     cam.az = cam.goalAz = 0.64;
@@ -1750,11 +1884,30 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     }
   }
 
+  let dragMode = "pan";
+
+  function idleCursor() {
+    if (spotState.mode === "picking" || spotState.mode === "staked") return "crosshair";
+    return "grab";
+  }
+
+  function setDragMode(mode) {
+    dragMode = mode === "orbit" ? "orbit" : "pan";
+    if (!pointerGesture && activePointers.size === 0) {
+      canvas.style.cursor = idleCursor();
+    }
+    callbacks.onDragModeChange?.(dragMode);
+  }
+
+  function getDragMode() {
+    return dragMode;
+  }
+
   function panByPixels(dxPx, dyPx) {
     const vh = canvas.clientHeight || window.innerHeight;
     const worldPerPx = (2 * BASE_FRUSTUM) / (cam.zoom * vh);
     const right = dxPx * worldPerPx;
-    const fwd = (dyPx * worldPerPx) / Math.max(0.35, Math.sin(cam.el));
+    const fwd = (dyPx * worldPerPx) / Math.max(0.28, Math.sin(cam.el));
     const cosA = Math.cos(cam.az);
     const sinA = Math.sin(cam.az);
     cam.goalTx += right * cosA + fwd * sinA;
@@ -1765,7 +1918,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   function zoomAt(factor, clientX, clientY) {
     const next = Math.min(3.4, Math.max(0.38, cam.goalZoom * factor));
     const p = screenToGround(clientX, clientY);
-    if (p) {
+    if (p && Math.hypot(p[0] - cam.goalTx, p[1] - cam.goalTz) < 95) {
       const k = 1 - cam.goalZoom / next;
       cam.goalTx += (p[0] - cam.goalTx) * k;
       cam.goalTz += (p[1] - cam.goalTz) * k;
@@ -1774,13 +1927,35 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     cam.goalZoom = next;
   }
 
+  function applyOrbitDelta(dxPx, dyPx) {
+    cam.goalAz -= dxPx * 0.0068;
+    cam.goalEl = Math.max(MIN_EL, Math.min(MAX_EL, cam.goalEl + dyPx * 0.0054));
+    cam.goalTy = lowAngleTargetY(cam.goalEl);
+  }
+
+  function recenterCamera() {
+    cancelIntroSweep();
+    cam.az = HOME_AZ + wrapPi(cam.az - HOME_AZ);
+    cam.goalTx = HOME_TX;
+    cam.goalTy = 0;
+    cam.goalTz = HOME_TZ;
+    cam.goalZoom = getHomeZoom();
+    cam.goalAz = HOME_AZ;
+    cam.goalEl = HOME_EL;
+  }
+
   let lastTrackpadAt = 0;
   canvas.addEventListener(
     "wheel",
     (e) => {
       e.preventDefault();
+      cancelIntroSweep();
       if (e.ctrlKey || e.metaKey) {
         zoomAt(Math.exp(-e.deltaY * 0.0085), e.clientX, e.clientY);
+        return;
+      }
+      if (e.shiftKey) {
+        applyOrbitDelta(e.deltaX, e.deltaY);
         return;
       }
       const now = performance.now();
@@ -1798,14 +1973,48 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   );
 
   let pointerGesture = null;
+  const activePointers = new Map();
+  let multiPrev = null;
+  let hadMultiTouch = false;
+
+  function computeTwoPointerSample() {
+    const iter = activePointers.values();
+    const p1 = iter.next().value;
+    const p2 = iter.next().value;
+    if (!p1 || !p2) return null;
+    const midX = (p1.x + p2.x) * 0.5;
+    const midY = (p1.y + p2.y) * 0.5;
+    const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+    const angle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+    return { p1, p2, midX, midY, dist, angle };
+  }
+
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
   canvas.addEventListener("pointerdown", (e) => {
-    canvas.setPointerCapture(e.pointerId);
-    const isOrbit = e.button === 2 || e.button === 1 || e.altKey;
+    cancelIntroSweep();
+    try {
+      canvas.setPointerCapture(e.pointerId);
+    } catch {
+      // Synthetic pointer events in tests may omit active capture handles
+    }
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY, vx: 0, vy: 0 });
+
+    if (activePointers.size >= 2) {
+      hadMultiTouch = true;
+      pointerGesture = null;
+      multiPrev = computeTwoPointerSample();
+      callbacks.onHoverCreation?.(null, e.clientX, e.clientY, null);
+      return;
+    }
+
+    hadMultiTouch = false;
+    multiPrev = null;
+    const isOrbit = dragMode === "orbit" || e.button === 2 || e.button === 1 || e.altKey;
     pointerGesture = {
       id: e.pointerId,
       kind: isOrbit ? "orbit" : "pan",
+      button: e.button,
       startX: e.clientX,
       startY: e.clientY,
       lastX: e.clientX,
@@ -1815,7 +2024,59 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   });
 
   canvas.addEventListener("pointermove", (e) => {
-    if (spotState.mode === "picking" && !pointerGesture) {
+    if (activePointers.has(e.pointerId)) {
+      const prevPtr = activePointers.get(e.pointerId);
+      const stepX = e.clientX - prevPtr.x;
+      const stepY = e.clientY - prevPtr.y;
+      for (const [id, ptr] of activePointers.entries()) {
+        if (id === e.pointerId) {
+          ptr.x = e.clientX;
+          ptr.y = e.clientY;
+          ptr.vx = ptr.vx * 0.35 + stepX * 0.65;
+          ptr.vy = ptr.vy * 0.35 + stepY * 0.65;
+        } else {
+          ptr.vx *= 0.88;
+          ptr.vy *= 0.88;
+        }
+      }
+    }
+
+    // 2-finger mobile map gesture: pinch-zoom + 2-finger twist (azimuth) + 2-finger vertical drag (tilt) + midpoint pan
+    if (activePointers.size >= 2) {
+      const cur = computeTwoPointerSample();
+      if (cur && multiPrev) {
+        const dMidX = cur.midX - multiPrev.midX;
+        const dMidY = cur.midY - multiPrev.midY;
+        const { p1, p2 } = cur;
+
+        const isParallelVerticalTilt =
+          p1.vy * p2.vy > 0.25 &&
+          Math.abs(p1.vy + p2.vy) > Math.abs(p1.vx + p2.vx) * 1.25 &&
+          Math.abs(p1.vy - p2.vy) < Math.abs(p1.vy + p2.vy) * 0.65;
+
+        if (isParallelVerticalTilt) {
+          cam.goalEl = Math.max(MIN_EL, Math.min(MAX_EL, cam.goalEl + dMidY * 0.0085));
+          cam.goalTy = lowAngleTargetY(cam.goalEl);
+          panByPixels(-dMidX * 0.4, 0);
+        } else {
+          if (multiPrev.dist > 14 && cur.dist > 14) {
+            const ratio = cur.dist / multiPrev.dist;
+            if (Math.abs(ratio - 1) > 0.002) {
+              zoomAt(ratio, cur.midX, cur.midY);
+            }
+          }
+          if (multiPrev.dist > 24 && cur.dist > 24) {
+            const dAngle = wrapPi(cur.angle - multiPrev.angle);
+            cam.goalAz += dAngle;
+          }
+          panByPixels(-dMidX, -dMidY);
+        }
+      }
+      multiPrev = cur;
+      return;
+    }
+
+    if (spotState.mode === "picking" && !pointerGesture && activePointers.size === 0) {
       const g = screenToGround(e.clientX, e.clientY);
       if (g) {
         const snapped = snapToClearMeadowSpot(g[0], g[1], previewPlotRadius);
@@ -1834,7 +2095,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       const hovered = pickCreationAt(e.clientX, e.clientY);
       const reading = hovered && hovered.id !== "__city_sign__" ? liveFeedsById[hovered.id] || null : null;
       callbacks.onHoverCreation?.(hovered ? hovered.data : null, e.clientX, e.clientY, reading);
-      canvas.style.cursor = hovered ? "pointer" : spotState.mode === "staked" ? "crosshair" : "grab";
+      canvas.style.cursor = hovered ? "pointer" : idleCursor();
       return;
     }
 
@@ -1844,25 +2105,58 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     pointerGesture.lastX = e.clientX;
     pointerGesture.lastY = e.clientY;
 
-    if (Math.hypot(e.clientX - pointerGesture.startX, e.clientY - pointerGesture.startY) > 5) {
+    if (Math.hypot(e.clientX - pointerGesture.startX, e.clientY - pointerGesture.startY) > 4.5) {
       pointerGesture.moved = true;
     }
 
+    if (!pointerGesture.moved) return;
+
     if (pointerGesture.kind === "orbit") {
-      cam.goalAz -= dx * 0.0065;
-      cam.goalEl = Math.max(0.34, Math.min(1.22, cam.goalEl + dy * 0.005));
+      applyOrbitDelta(dx, dy);
       canvas.style.cursor = "grabbing";
-    } else if (pointerGesture.moved) {
+    } else {
       panByPixels(-dx, -dy);
       canvas.style.cursor = "grabbing";
     }
   });
 
   const endGesture = (e) => {
-    if (!pointerGesture || pointerGesture.id !== e.pointerId) return;
-    const wasClick = !pointerGesture.moved && pointerGesture.kind === "pan";
+    activePointers.delete(e.pointerId);
+
+    if (activePointers.size >= 2) {
+      multiPrev = computeTwoPointerSample();
+      return;
+    }
+
+    if (activePointers.size === 1) {
+      multiPrev = null;
+      const [remId, remPos] = activePointers.entries().next().value;
+      pointerGesture = {
+        id: remId,
+        kind: dragMode === "orbit" ? "orbit" : "pan",
+        button: 0,
+        startX: remPos.x,
+        startY: remPos.y,
+        lastX: remPos.x,
+        lastY: remPos.y,
+        moved: true,
+      };
+      return;
+    }
+
+    multiPrev = null;
+    const finishedMulti = hadMultiTouch;
+    hadMultiTouch = false;
+
+    if (!pointerGesture || pointerGesture.id !== e.pointerId) {
+      pointerGesture = null;
+      canvas.style.cursor = idleCursor();
+      return;
+    }
+
+    const wasClick = !finishedMulti && !pointerGesture.moved && pointerGesture.button === 0;
     pointerGesture = null;
-    canvas.style.cursor = spotState.mode === "picking" ? "crosshair" : "grab";
+    canvas.style.cursor = idleCursor();
 
     if (wasClick) {
       if (spotState.mode === "picking" || spotState.mode === "staked") {
@@ -1898,15 +2192,32 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
   window.addEventListener("keydown", (e) => {
     if (e.target?.matches?.("input, textarea")) return;
+    if (
+      e.key === "ArrowLeft" ||
+      e.key === "ArrowRight" ||
+      e.key === "ArrowUp" ||
+      e.key === "ArrowDown" ||
+      e.key === "a" ||
+      e.key === "d" ||
+      e.key === "w" ||
+      e.key === "s" ||
+      e.key === "q" ||
+      e.key === "e"
+    ) {
+      cancelIntroSweep();
+    }
     const step = 7 / Math.max(0.5, cam.zoom);
     if (e.key === "ArrowLeft" || e.key === "a") cam.goalTx -= step;
     else if (e.key === "ArrowRight" || e.key === "d") cam.goalTx += step;
     else if (e.key === "ArrowUp" || e.key === "w") cam.goalTz -= step;
     else if (e.key === "ArrowDown" || e.key === "s") cam.goalTz += step;
+    else if (e.key === "q") cam.goalAz -= 0.14;
+    else if (e.key === "e") cam.goalAz += 0.14;
     clampTarget();
   });
 
   function focusOn(x, z, zoom = 1.45) {
+    cancelIntroSweep();
     cam.goalTx = x;
     cam.goalTz = z;
     cam.goalZoom = zoom;
@@ -1978,6 +2289,10 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   let lastNow = performance.now();
+  let bootWaitElapsed = 0;
+  let lastReportedAz = NaN;
+  let lastReportedHome = null;
+
   function animate(now) {
     requestAnimationFrame(animate);
     const dt = Math.min(0.05, Math.max(0.001, (now - lastNow) / 1000));
@@ -1986,26 +2301,89 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
     grassUniforms.uTime.value = t;
 
-    const damp = 1 - Math.exp(-dt * 11);
-    cam.tx += (cam.goalTx - cam.tx) * damp;
-    cam.tz += (cam.goalTz - cam.tz) * damp;
-    cam.zoom += (cam.goalZoom - cam.zoom) * damp;
-    cam.az += (cam.goalAz - cam.az) * damp;
-    cam.el += (cam.goalEl - cam.el) * damp;
+    if (introSweep.active) {
+      if (currentWorld || bootWaitElapsed > 0.45) {
+        introSweep.elapsed += dt;
+      } else {
+        bootWaitElapsed += dt;
+      }
+      const homeZ = getHomeZoom();
+      cam.goalZoom = homeZ;
+      const rawU = Math.max(0, (introSweep.elapsed - introSweep.holdSec) / introSweep.durationSec);
+      if (rawU >= 1) {
+        introSweep.active = false;
+        cam.tx = cam.goalTx = HOME_TX;
+        cam.ty = cam.goalTy = 0;
+        cam.tz = cam.goalTz = HOME_TZ;
+        cam.zoom = cam.goalZoom = homeZ;
+        cam.az = cam.goalAz = HOME_AZ;
+        cam.el = cam.goalEl = HOME_EL;
+      } else {
+        // Quintic smootherstep for silky ground-level takeoff & gentle landing
+        const e = rawU * rawU * rawU * (rawU * (rawU * 6 - 15) + 10);
+        cam.tx = introSweep.fromTx + (HOME_TX - introSweep.fromTx) * e;
+        cam.ty = introSweep.fromTy + (0 - introSweep.fromTy) * e;
+        cam.tz = introSweep.fromTz + (HOME_TZ - introSweep.fromTz) * e;
+        cam.zoom = introSweep.fromZoom + (homeZ - introSweep.fromZoom) * e;
+        cam.az = introSweep.fromAz + (HOME_AZ - introSweep.fromAz) * e;
+        cam.el = introSweep.fromEl + (HOME_EL - introSweep.fromEl) * e;
+      }
+    } else {
+      const damp = 1 - Math.exp(-dt * 11);
+      cam.tx += (cam.goalTx - cam.tx) * damp;
+      cam.ty += (cam.goalTy - cam.ty) * damp;
+      cam.tz += (cam.goalTz - cam.tz) * damp;
+      cam.zoom += (cam.goalZoom - cam.zoom) * damp;
+      cam.az += (cam.goalAz - cam.az) * damp;
+      cam.el += (cam.goalEl - cam.el) * damp;
+    }
 
     const camDist = 240;
     const horiz = Math.cos(cam.el) * camDist;
     camera.position.set(
       cam.tx + Math.sin(cam.az) * horiz,
-      Math.sin(cam.el) * camDist,
+      cam.ty + Math.sin(cam.el) * camDist,
       cam.tz + Math.cos(cam.az) * horiz,
     );
-    camera.lookAt(cam.tx, 0, cam.tz);
+    camera.lookAt(cam.tx, cam.ty, cam.tz);
     camera.zoom = cam.zoom;
     camera.updateProjectionMatrix();
 
+    const azDeltaFromHome = wrapPi(cam.az - HOME_AZ);
+    const isHome =
+      !introSweep.active &&
+      Math.abs(azDeltaFromHome) < 0.03 &&
+      Math.abs(cam.el - HOME_EL) < 0.03 &&
+      Math.abs(cam.zoom - getHomeZoom()) < 0.04 &&
+      Math.hypot(cam.tx - HOME_TX, cam.tz - HOME_TZ) < 1.2;
+
+    if (
+      callbacks.onCameraChange &&
+      (Number.isNaN(lastReportedAz) ||
+        Math.abs(cam.az - lastReportedAz) > 0.004 ||
+        isHome !== lastReportedHome)
+    ) {
+      lastReportedAz = cam.az;
+      lastReportedHome = isHome;
+      callbacks.onCameraChange({
+        az: cam.az,
+        el: cam.el,
+        zoom: cam.zoom,
+        tx: cam.tx,
+        tz: cam.tz,
+        azDeltaFromHome,
+        isHome,
+      });
+    }
+
     groundMesh.position.set(cam.tx, 0, cam.tz);
     grassUniforms.uFocusXZ.value.set(cam.tx, cam.tz);
+    const lowHorizonT = Math.max(0, Math.min(1, (cam.el - 0.14) / 0.24));
+    const lowHorizonSmooth = lowHorizonT * lowHorizonT * (3 - 2 * lowHorizonT);
+    grassUniforms.uHorizonRange.value.set(
+      72 + (145 - 72) * lowHorizonSmooth,
+      142 + (295 - 142) * lowHorizonSmooth,
+    );
     updateTexelSnappedSun(cam.tx, cam.tz);
 
     const allEnts = Array.from(creationEntities.values());
@@ -2083,9 +2461,22 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     setPreviewPrompt,
     focusCreationById,
     focusOn,
+    recenterCamera,
+    setDragMode,
+    getDragMode,
     getCameraTarget: () => ({ x: cam.tx, z: cam.tz, zoom: cam.zoom }),
+    getCameraState: () => ({
+      tx: cam.tx,
+      ty: cam.ty,
+      tz: cam.tz,
+      zoom: cam.zoom,
+      az: cam.az,
+      el: cam.el,
+      dragMode,
+      introActive: introSweep.active,
+    }),
     getPlotRadius: () => plotMarker.getPlotRadius(),
-    isPointerActive: () => Boolean(pointerGesture),
+    isPointerActive: () => Boolean(pointerGesture) || activePointers.size > 0,
     getCreationEntity: (id) => creationEntities.get(id) || null,
   };
 }

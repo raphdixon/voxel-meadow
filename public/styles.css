@@ -49,6 +49,120 @@ body {
   display: none !important;
 }
 
+/* ---------------- Top-Right Camera Controls ---------------- */
+.cam-controls {
+  position: fixed;
+  top: max(14px, env(safe-area-inset-top, 14px));
+  right: max(14px, env(safe-area-inset-right, 14px));
+  z-index: 11;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.cam-mode-group {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.88);
+  box-shadow: var(--shadow-pill);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.cam-mode-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--ink-muted);
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 590;
+  letter-spacing: -0.01em;
+  padding: 6px 12px;
+  min-height: 32px;
+  border-radius: 999px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.cam-mode-btn:hover:not(.is-active) {
+  color: var(--ink);
+}
+
+.cam-mode-btn.is-active {
+  background: var(--ink);
+  color: var(--white);
+}
+
+.cam-recenter-btn {
+  pointer-events: auto;
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.88);
+  background: rgba(255, 255, 255, 0.94);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 590;
+  letter-spacing: -0.01em;
+  padding: 6px 13px 6px 10px;
+  min-height: 38px;
+  border-radius: 999px;
+  box-shadow: var(--shadow-pill);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.cam-recenter-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 12px 30px rgba(15, 28, 18, 0.22);
+}
+
+.cam-recenter-btn:active {
+  transform: translateY(0);
+}
+
+.cam-icon {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+}
+
+.cam-compass-svg {
+  width: 17px;
+  height: 17px;
+}
+
+@media (max-width: 680px) {
+  .cam-controls {
+    top: max(10px, env(safe-area-inset-top, 10px));
+    right: max(10px, env(safe-area-inset-right, 10px));
+    gap: 6px;
+  }
+
+  .cam-mode-btn {
+    padding: 6px 10px;
+    font-size: 0.79rem;
+  }
+
+  .cam-recenter-btn {
+    padding: 6px 11px 6px 9px;
+    font-size: 0.79rem;
+  }
+}
+
 /* ---------------- Bottom Dock & Pills ---------------- */
 .bottom-dock {
   position: fixed;
@@ -394,6 +508,13 @@ body {
   text-align: center;
 }
 
+@media (max-width: 780px) {
+  .weave-toast {
+    top: calc(max(12px, env(safe-area-inset-top, 12px)) + 48px);
+  }
+}
+
+body[data-og-capture="1"] .cam-controls,
 body[data-og-capture="1"] .bottom-dock,
 body[data-og-capture="1"] .hover-card,
 body[data-og-capture="1"] .weave-toast {

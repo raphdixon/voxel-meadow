@@ -40,6 +40,8 @@ export interface BlueprintRepairResult {
 export interface WorldSpatialAuditReport {
   clean: boolean;
   footpathTrimCount: number;
+  pathCrossingsFixed: number;
+  redundantPathsRemoved: number;
   propNudgeCount: number;
   details: string[];
 }
@@ -794,10 +796,407 @@ export function autoRepairBlueprintOverlaps(bp: VoxelBlueprint): BlueprintRepair
   };
 }
 
+const SEED_PATH_IDS = new Set([
+  "path-main-loop",
+  "path-clocktower-spur",
+  "path-bakery-spur",
+  "path-bookshop-spur",
+  "path-green-walk",
+]);
+
+function round1(v: number): number {
+  return Number(v.toFixed(1));
+}
+
+function dedupeSequentialPts(pts: [number, number][], minStep = 0.85): [number, number][] {
+  if (pts.length <= 2) return pts.map(([x, z]) => [round1(x), round1(z)]);
+  const out: [number, number][] = [[round1(pts[0][0]), round1(pts[0][1])]];
+  for (let i = 1; i < pts.length; i++) {
+    const prev = out[out.length - 1];
+    const cur: [number, number] = [round1(pts[i][0]), round1(pts[i][1])];
+    if (Math.hypot(cur[0] - prev[0], cur[1] - prev[1]) >= minStep) {
+      out.push(cur);
+    } else if (i === pts.length - 1 && out.length >= 2) {
+      out[out.length - 1] = cur;
+    } else if (i === pts.length - 1 && out.length === 1) {
+      out.push(cur);
+    }
+  }
+  return out;
+}
+
 /**
- * World-level spatial overlap auditor & auto-repair for footpaths and props:
- * - Prevents footpath flagstones from poking inside building plinths (Z-fighting at ground level).
- * - Separates duplicate/stacked props so two prop meshes never Z-fight on the same spot.
+ * Evaluates a centripetal Catmull-Rom 2D spline (`alpha = 0.5`) matching `THREE.CatmullRomCurve3(..., "centripetal")`.
+ */
+export function sampleCatmullRom2D(
+  pts: [number, number][],
+  closed = false,
+  stepMeters = 0.65,
+): [number, number][] {
+  if (pts.length === 0) return [];
+  if (pts.length === 1) return [[pts[0][0], pts[0][1]]];
+  if (pts.length === 2 && !closed) {
+    const [ax, az] = pts[0];
+    const [bx, bz] = pts[1];
+    const len = Math.hypot(bx - ax, bz - az);
+    const steps = Math.max(2, Math.ceil(len / Math.max(0.25, stepMeters)));
+    const out: [number, number][] = [];
+    for (let i = 0; i <= steps; i++) {
+      const u = i / steps;
+      out.push([ax + (bx - ax) * u, az + (bz - az) * u]);
+    }
+    return out;
+  }
+
+  const n = pts.length;
+  const segCount = closed ? n : n - 1;
+  const getPt = (idx: number): [number, number] => {
+    if (closed) {
+      return pts[((idx % n) + n) % n];
+    }
+    if (idx < 0) {
+      return [pts[0][0] + (pts[0][0] - pts[1][0]), pts[0][1] + (pts[0][1] - pts[1][1])];
+    }
+    if (idx >= n) {
+      return [
+        pts[n - 1][0] + (pts[n - 1][0] - pts[n - 2][0]),
+        pts[n - 1][1] + (pts[n - 1][1] - pts[n - 2][1]),
+      ];
+    }
+    return pts[idx];
+  };
+
+  const out: [number, number][] = [];
+  for (let s = 0; s < segCount; s++) {
+    const p0 = getPt(s - 1);
+    const p1 = getPt(s);
+    const p2 = getPt(s + 1);
+    const p3 = getPt(s + 2);
+
+    const d01 = Math.max(1e-3, Math.sqrt(Math.hypot(p1[0] - p0[0], p1[1] - p0[1])));
+    const d12 = Math.max(1e-3, Math.sqrt(Math.hypot(p2[0] - p1[0], p2[1] - p1[1])));
+    const d23 = Math.max(1e-3, Math.sqrt(Math.hypot(p3[0] - p2[0], p3[1] - p2[1])));
+
+    const t1x = ((p1[0] - p0[0]) / d01 - (p2[0] - p0[0]) / (d01 + d12) + (p2[0] - p1[0]) / d12) * d12;
+    const t1z = ((p1[1] - p0[1]) / d01 - (p2[1] - p0[1]) / (d01 + d12) + (p2[1] - p1[1]) / d12) * d12;
+    const t2x = ((p2[0] - p1[0]) / d12 - (p3[0] - p1[0]) / (d12 + d23) + (p3[0] - p2[0]) / d23) * d12;
+    const t2z = ((p2[1] - p1[1]) / d12 - (p3[1] - p1[1]) / (d12 + d23) + (p3[1] - p2[1]) / d23) * d12;
+
+    const chord = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
+    const subSteps = Math.max(3, Math.min(28, Math.ceil(chord / Math.max(0.25, stepMeters))));
+    const startK = s === 0 ? 0 : 1;
+    for (let k = startK; k <= subSteps; k++) {
+      const u = k / subSteps;
+      const u2 = u * u;
+      const u3 = u2 * u;
+      const h00 = 2 * u3 - 3 * u2 + 1;
+      const h10 = u3 - 2 * u2 + u;
+      const h01 = -2 * u3 + 3 * u2;
+      const h11 = u3 - u2;
+      out.push([
+        h00 * p1[0] + h10 * t1x + h01 * p2[0] + h11 * t2x,
+        h00 * p1[1] + h10 * t1z + h01 * p2[1] + h11 * t2z,
+      ]);
+    }
+  }
+  return out;
+}
+
+function polylineLength2D(pts: [number, number][]): number {
+  let len = 0;
+  for (let i = 1; i < pts.length; i++) {
+    len += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+  }
+  return len;
+}
+
+function segSegHit2D(
+  a1: [number, number],
+  a2: [number, number],
+  b1: [number, number],
+  b2: [number, number],
+): [number, number] | null {
+  const dax = a2[0] - a1[0];
+  const daz = a2[1] - a1[1];
+  const dbx = b2[0] - b1[0];
+  const dbz = b2[1] - b1[1];
+  const denom = dax * dbz - daz * dbx;
+  if (Math.abs(denom) < 1e-8) return null;
+  const ox = b1[0] - a1[0];
+  const oz = b1[1] - a1[1];
+  const t = (ox * dbz - oz * dbx) / denom;
+  const u = (ox * daz - oz * dax) / denom;
+  if (t >= -1e-5 && t <= 1 + 1e-5 && u >= -1e-5 && u <= 1 + 1e-5) {
+    return [a1[0] + dax * t, a1[1] + daz * t];
+  }
+  return null;
+}
+
+/**
+ * 2-opt uncrossing so neither paths nor vehicle route loops ever self-intersect into a figure-8.
+ */
+export function uncrossPolyline2D(pts: [number, number][], closed = false): {
+  points: [number, number][];
+  changed: boolean;
+} {
+  if (pts.length < 4) return { points: pts, changed: false };
+  const out: [number, number][] = pts.map(([x, z]) => [x, z]);
+  const n = out.length;
+  const segCount = closed ? n : n - 1;
+  let changed = false;
+
+  for (let iter = 0; iter < 12; iter++) {
+    let swapped = false;
+    for (let i = 0; i < segCount; i++) {
+      const i2 = (i + 1) % n;
+      for (let j = i + 2; j < segCount; j++) {
+        if (closed && i === 0 && j === segCount - 1) continue;
+        const j2 = (j + 1) % n;
+        const hit = segSegHit2D(out[i], out[i2], out[j], out[j2]);
+        if (hit) {
+          // Reverse vertex order between i+1 and j inclusive
+          let l = i + 1;
+          let r = j;
+          while (l < r) {
+            const tmp = out[l];
+            out[l] = out[r];
+            out[r] = tmp;
+            l++;
+            r--;
+          }
+          swapped = true;
+          changed = true;
+          break;
+        }
+      }
+      if (swapped) break;
+    }
+    if (!swapped) break;
+  }
+  return { points: out, changed };
+}
+
+export function distPointToPolyline2D(
+  px: number,
+  pz: number,
+  curve: [number, number][],
+): {
+  dist: number;
+  closestX: number;
+  closestZ: number;
+  normalX: number;
+  normalZ: number;
+  segIndex: number;
+} {
+  let bestDist = Infinity;
+  let closestX = curve[0]?.[0] ?? px;
+  let closestZ = curve[0]?.[1] ?? pz;
+  let bestSeg = 0;
+  let segTanX = 1;
+  let segTanZ = 0;
+
+  for (let i = 0; i + 1 < curve.length; i++) {
+    const ax = curve[i][0];
+    const az = curve[i][1];
+    const bx = curve[i + 1][0];
+    const bz = curve[i + 1][1];
+    const vx = bx - ax;
+    const vz = bz - az;
+    const lenSq = vx * vx + vz * vz;
+    const t = lenSq > 1e-8 ? Math.max(0, Math.min(1, ((px - ax) * vx + (pz - az) * vz) / lenSq)) : 0;
+    const cx = ax + vx * t;
+    const cz = az + vz * t;
+    const d = Math.hypot(px - cx, pz - cz);
+    if (d < bestDist) {
+      bestDist = d;
+      closestX = cx;
+      closestZ = cz;
+      bestSeg = i;
+      const segLen = Math.sqrt(lenSq);
+      if (segLen > 1e-5) {
+        segTanX = vx / segLen;
+        segTanZ = vz / segLen;
+      }
+    }
+  }
+
+  const dx = px - closestX;
+  const dz = pz - closestZ;
+  let normalX = bestDist > 1e-3 ? dx / bestDist : -segTanZ;
+  let normalZ = bestDist > 1e-3 ? dz / bestDist : segTanX;
+  const nLen = Math.hypot(normalX, normalZ);
+  if (nLen > 1e-5) {
+    normalX /= nLen;
+    normalZ /= nLen;
+  }
+  return { dist: bestDist, closestX, closestZ, normalX, normalZ, segIndex: bestSeg };
+}
+
+function simplifyRDP2D(pts: [number, number][], epsilon: number, maxPoints = 6): [number, number][] {
+  if (pts.length <= 2) return pts.map(([x, z]) => [round1(x), round1(z)]);
+
+  const rdp = (arr: [number, number][], eps: number): [number, number][] => {
+    if (arr.length <= 2) return arr;
+    const [ax, az] = arr[0];
+    const [bx, bz] = arr[arr.length - 1];
+    const vx = bx - ax;
+    const vz = bz - az;
+    const lenSq = vx * vx + vz * vz;
+    let maxD = -1;
+    let maxIdx = 0;
+    for (let i = 1; i < arr.length - 1; i++) {
+      const [px, pz] = arr[i];
+      const t = lenSq > 1e-8 ? Math.max(0, Math.min(1, ((px - ax) * vx + (pz - az) * vz) / lenSq)) : 0;
+      const d = Math.hypot(px - (ax + vx * t), pz - (az + vz * t));
+      if (d > maxD) {
+        maxD = d;
+        maxIdx = i;
+      }
+    }
+    if (maxD > eps && maxIdx > 0) {
+      const left = rdp(arr.slice(0, maxIdx + 1), eps);
+      const right = rdp(arr.slice(maxIdx), eps);
+      return [...left.slice(0, -1), ...right];
+    }
+    return [arr[0], arr[arr.length - 1]];
+  };
+
+  let eps = epsilon;
+  let simplified = rdp(pts, eps);
+  while (simplified.length > maxPoints && eps < 4.0) {
+    eps *= 1.45;
+    simplified = rdp(pts, eps);
+  }
+  return dedupeSequentialPts(simplified, 0.9);
+}
+
+function polylineIntersectsCurveInterior(
+  candSampled: [number, number][],
+  candClosed: boolean,
+  otherSampled: [number, number][],
+  otherClosed: boolean,
+  endpointGrace = 0.95,
+): boolean {
+  const openEndpoints: [number, number][] = [];
+  if (!candClosed && candSampled.length >= 2) {
+    openEndpoints.push(candSampled[0], candSampled[candSampled.length - 1]);
+  }
+  if (!otherClosed && otherSampled.length >= 2) {
+    openEndpoints.push(otherSampled[0], otherSampled[otherSampled.length - 1]);
+  }
+
+  for (let i = 0; i + 1 < candSampled.length; i++) {
+    const a1 = candSampled[i];
+    const a2 = candSampled[i + 1];
+    for (let j = 0; j + 1 < otherSampled.length; j++) {
+      const b1 = otherSampled[j];
+      const b2 = otherSampled[j + 1];
+      const hit = segSegHit2D(a1, a2, b1, b2);
+      if (!hit) continue;
+      const nearOpenEndpoint = openEndpoints.some(
+        (ep) => Math.hypot(hit[0] - ep[0], hit[1] - ep[1]) <= endpointGrace,
+      );
+      if (!nearOpenEndpoint) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Pure 2D geometric crossing detector for roads & trails (evaluates actual Catmull-Rom curves).
+ * Used both by the Argon Director world summary and by `/api/audit` verification.
+ */
+export function detectPathCrossings(paths: WorldPath[]): {
+  count: number;
+  pairs: string[];
+} {
+  const valid = paths.filter((p) => Array.isArray(p.points) && p.points.length >= 2);
+  const sampled = valid.map((p) => ({
+    path: p,
+    curve: sampleCatmullRom2D(p.points, Boolean(p.closed), 0.7),
+  }));
+
+  const pairs: string[] = [];
+
+  // 1. Self-intersections
+  for (const s of sampled) {
+    const pts = s.path.points;
+    if (pts.length >= 4) {
+      const check = uncrossPolyline2D(pts, Boolean(s.path.closed));
+      if (check.changed) {
+        pairs.push(`${s.path.id} (self-crossing)`);
+      }
+    }
+  }
+
+  // 2. Pairwise crossings & road-interior intrusions
+  for (let i = 0; i < sampled.length; i++) {
+    for (let j = i + 1; j < sampled.length; j++) {
+      const A = sampled[i];
+      const B = sampled[j];
+      const aRoad = A.path.kind === "road";
+      const bRoad = B.path.kind === "road";
+
+      if (aRoad && bRoad) {
+        if (
+          polylineIntersectsCurveInterior(
+            A.curve,
+            Boolean(A.path.closed),
+            B.curve,
+            Boolean(B.path.closed),
+            2.15,
+          )
+        ) {
+          pairs.push(`${A.path.id} x ${B.path.id}`);
+        }
+      } else if (aRoad !== bRoad) {
+        const road = aRoad ? A : B;
+        const trail = aRoad ? B : A;
+        let intrudesRoad = false;
+        for (const [tx, tz] of trail.curve) {
+          if (distPointToPolyline2D(tx, tz, road.curve).dist < 1.95) {
+            intrudesRoad = true;
+            break;
+          }
+        }
+        if (
+          intrudesRoad ||
+          polylineIntersectsCurveInterior(
+            trail.curve,
+            Boolean(trail.path.closed),
+            road.curve,
+            Boolean(road.path.closed),
+            0.0,
+          )
+        ) {
+          pairs.push(`${trail.path.id} x ${road.path.id}`);
+        }
+      } else {
+        if (
+          polylineIntersectsCurveInterior(
+            A.curve,
+            Boolean(A.path.closed),
+            B.curve,
+            Boolean(B.path.closed),
+            0.95,
+          )
+        ) {
+          pairs.push(`${A.path.id} x ${B.path.id}`);
+        }
+      }
+    }
+  }
+
+  return { count: pairs.length, pairs };
+}
+
+/**
+ * World-level spatial overlap & planar road/path topology auditor + deterministic auto-repair:
+ * - Eliminates crossing roads & crossing trails (clipping trails cleanly at road stone curbs `2.52m` from road centerlines).
+ * - Prunes stale `initpath-*` placeholders and redundant parallel corridor duplicates.
+ * - Prevents footpath flagstones from poking inside building plinths or pond water.
+ * - Guarantees every stationary landmark remains connected to the road/trail network.
+ * - Separates stacked/overlapping props idempotently.
  */
 export function auditAndRepairWorldSpatial(
   creations: WorldCreation[],
@@ -810,11 +1209,18 @@ export function auditAndRepairWorldSpatial(
 } {
   const details: string[] = [];
   let footpathTrimCount = 0;
+  let pathCrossingsFixed = 0;
+  let redundantPathsRemoved = 0;
   let propNudgeCount = 0;
 
+  const creationsById = new Map(creations.map((c) => [c.id, c]));
   const buildings = creations.filter(
     (c) => c.category === "building" || c.behavior?.type === "landmark",
   );
+  const mobileCreations = creations.filter(
+    (c) => c.category !== "building" && c.behavior?.type !== "landmark",
+  );
+  const ponds = props.filter((p) => p.kind === "pond");
 
   const plinthRadiusOf = (c: WorldCreation): number =>
     getCreationFootprintRadius(
@@ -823,43 +1229,681 @@ export function auditAndRepairWorldSpatial(
       c.blueprint?.stats?.footprintZ ?? 14,
     );
 
-  const repairedPaths: WorldPath[] = paths.map((p) => {
-    if (p.kind === "road" || p.closed || p.points.length < 2) return p;
-    let changed = false;
-    const pts: [number, number][] = p.points.map(([x, z]) => [x, z]);
+  const pushPointClearOfObstacles = (
+    px: number,
+    pz: number,
+    neighbor: [number, number],
+    isRoad: boolean,
+  ): { pt: [number, number]; moved: boolean } => {
+    let x = px;
+    let z = pz;
+    let moved = false;
+    if (isRoad) return { pt: [x, z], moved: false };
 
-    for (let idx = 0; idx < pts.length; idx++) {
-      for (let pass = 0; pass < 2; pass++) {
-        const [px, pz] = pts[idx];
-        for (const b of buildings) {
-          const minR = plinthRadiusOf(b);
-          const dx = px - b.x;
-          const dz = pz - b.z;
-          const d = Math.hypot(dx, dz);
-          if (d < minR) {
-            const neighbor = pts[idx === 0 ? 1 : idx - 1];
-            const ndx = neighbor[0] - b.x;
-            const ndz = neighbor[1] - b.z;
-            const nd = Math.hypot(ndx, ndz);
-            const ux = d > 0.05 ? dx / d : nd > 0.05 ? ndx / nd : Math.sin(b.yaw || 0);
-            const uz = d > 0.05 ? dz / d : nd > 0.05 ? ndz / nd : Math.cos(b.yaw || 0);
-            pts[idx] = [
-              Number((b.x + ux * (minR + 0.35)).toFixed(1)),
-              Number((b.z + uz * (minR + 0.35)).toFixed(1)),
-            ];
-            changed = true;
+    for (let pass = 0; pass < 3; pass++) {
+      let passMoved = false;
+      for (const b of buildings) {
+        const minR = plinthRadiusOf(b);
+        const dx = x - b.x;
+        const dz = z - b.z;
+        const d = Math.hypot(dx, dz);
+        if (d < minR) {
+          const ndx = neighbor[0] - b.x;
+          const ndz = neighbor[1] - b.z;
+          const nd = Math.hypot(ndx, ndz);
+          const ux = d > 0.05 ? dx / d : nd > 0.05 ? ndx / nd : Math.sin(b.yaw || 0);
+          const uz = d > 0.05 ? dz / d : nd > 0.05 ? ndz / nd : Math.cos(b.yaw || 0);
+          x = round1(b.x + ux * (minR + 0.42));
+          z = round1(b.z + uz * (minR + 0.42));
+          moved = true;
+          passMoved = true;
+        }
+      }
+      for (const pond of ponds) {
+        const pr = (pond.radius ?? 6.5) - 0.15;
+        const dx = x - pond.x;
+        const dz = z - pond.z;
+        const d = Math.hypot(dx, dz);
+        if (d < pr) {
+          const ux = d > 0.05 ? dx / d : 1;
+          const uz = d > 0.05 ? dz / d : 0;
+          x = round1(pond.x + ux * ((pond.radius ?? 6.5) + 0.45));
+          z = round1(pond.z + uz * ((pond.radius ?? 6.5) + 0.45));
+          moved = true;
+          passMoved = true;
+        }
+      }
+      if (!passMoved) break;
+    }
+    return { pt: [x, z], moved };
+  };
+
+  // Pre-scan non-init paths to see which creations already have dedicated integrated paths
+  const nonInitPaths = paths.filter(
+    (p) => !p.id.startsWith("initpath-") && !p.id.startsWith("initroad-") && p.points.length >= 2,
+  );
+
+  // Stage 1: Filter out stale initpath-*/initroad-* and orphan mobile-target trails
+  const candidatePool: WorldPath[] = [];
+  for (const p of paths) {
+    if (!Array.isArray(p.points) || p.points.length < 2) continue;
+
+    if (SEED_PATH_IDS.has(p.id)) {
+      candidatePool.push(p);
+      continue;
+    }
+
+    if (p.id.startsWith("initpath-")) {
+      const cid = p.id.slice("initpath-".length);
+      const owner = creationsById.get(cid);
+      if (!owner || owner.behavior?.type !== "landmark") {
+        redundantPathsRemoved++;
+        details.push(`removed stale placeholder trail "${p.id}"`);
+        continue;
+      }
+      const footR = plinthRadiusOf(owner);
+      const hasBetterPath = nonInitPaths.some((other) =>
+        other.points.some(([ox, oz]) => Math.hypot(ox - owner.x, oz - owner.z) <= footR + 6.2),
+      );
+      if (hasBetterPath) {
+        redundantPathsRemoved++;
+        details.push(`removed superseded placeholder trail "${p.id}" for "${owner.name}"`);
+        continue;
+      }
+    }
+
+    if (p.id.startsWith("initroad-")) {
+      const cid = p.id.slice("initroad-".length);
+      const owner = creationsById.get(cid);
+      if (!owner || owner.behavior?.type !== "vehicle_route") {
+        redundantPathsRemoved++;
+        details.push(`removed stale placeholder road "${p.id}"`);
+        continue;
+      }
+      const hasIntegratedRoad = nonInitPaths.some(
+        (other) =>
+          other.points.some(([ox, oz]) => Math.hypot(ox - owner.x, oz - owner.z) <= 10.0) &&
+          owner.integratedLevel >= 2,
+      );
+      if (hasIntegratedRoad) {
+        redundantPathsRemoved++;
+        details.push(`removed superseded placeholder road "${p.id}"`);
+        continue;
+      }
+    }
+
+    if (p.kind !== "road") {
+      const firstPt = p.points[0];
+      const lastPt = p.points[p.points.length - 1];
+      const servesLandmark =
+        buildings.some((b) => {
+          const r = plinthRadiusOf(b) + 6.5;
+          return (
+            Math.hypot(firstPt[0] - b.x, firstPt[1] - b.z) <= r ||
+            Math.hypot(lastPt[0] - b.x, lastPt[1] - b.z) <= r
+          );
+        }) ||
+        ponds.some((pond) => {
+          const r = (pond.radius ?? 6.5) + 4.0;
+          return (
+            Math.hypot(firstPt[0] - pond.x, firstPt[1] - pond.z) <= r ||
+            Math.hypot(lastPt[0] - pond.x, lastPt[1] - pond.z) <= r
+          );
+        });
+      const targetsMobileOnly =
+        !servesLandmark &&
+        mobileCreations.some(
+          (mc) =>
+            Math.hypot(firstPt[0] - mc.x, firstPt[1] - mc.z) < 6.8 ||
+            Math.hypot(lastPt[0] - mc.x, lastPt[1] - mc.z) < 6.8,
+        );
+      if (targetsMobileOnly) {
+        redundantPathsRemoved++;
+        details.push(`removed orphan trail "${p.id}" targeting mobile creation`);
+        continue;
+      }
+    }
+
+    candidatePool.push(p);
+  }
+
+  // Priority order:
+  // 1. Seed main loop ("path-main-loop")
+  // 2. Other seed paths
+  // 3. Roads (longer/established first)
+  // 4. Custom non-init trails (contextual trails before generic footpaths)
+  // 5. Remaining initpath-* spurs
+  const kindRank = (p: WorldPath): number => {
+    if (p.id === "path-main-loop") return 0;
+    if (SEED_PATH_IDS.has(p.id)) return 1;
+    if (p.kind === "road") return 2;
+    if (p.id.startsWith("initpath-")) return 5;
+    if (p.kind === "footpath") return 4;
+    return 3;
+  };
+
+  candidatePool.sort((a, b) => kindRank(a) - kindRank(b));
+
+  interface AcceptedPathEntry {
+    path: WorldPath;
+    curve: [number, number][];
+    isRoad: boolean;
+  }
+  const accepted: AcceptedPathEntry[] = [];
+  const acceptedCurbJunctions: { roadId: string; x: number; z: number; sign: number }[] = [];
+
+  const getRoadCurbJunctions = (
+    curvePts: [number, number][],
+    closed: boolean,
+  ): { roadId: string; x: number; z: number; sign: number }[] => {
+    if (closed || curvePts.length < 2) return [];
+    const out: { roadId: string; x: number; z: number; sign: number }[] = [];
+    const endIndices = [
+      { endIdx: 0, refIdx: Math.min(curvePts.length - 1, 2) },
+      { endIdx: curvePts.length - 1, refIdx: Math.max(0, curvePts.length - 3) },
+    ];
+    for (const { endIdx, refIdx } of endIndices) {
+      const ep = curvePts[endIdx];
+      const ref = curvePts[refIdx];
+      for (const acc of accepted) {
+        if (!acc.isRoad) continue;
+        const h = distPointToPolyline2D(ep[0], ep[1], acc.curve);
+        if (h.dist <= 3.1) {
+          const dot = (ref[0] - h.closestX) * h.normalX + (ref[1] - h.closestZ) * h.normalZ;
+          out.push({
+            roadId: acc.path.id,
+            x: h.closestX,
+            z: h.closestZ,
+            sign: dot >= 0 ? 1 : -1,
+          });
+        }
+      }
+    }
+    return out;
+  };
+
+  const hasOppositeCurbCrossOver = (
+    curvePts: [number, number][],
+    closed: boolean,
+  ): boolean => {
+    const junctions = getRoadCurbJunctions(curvePts, closed);
+    for (const jn of junctions) {
+      if (
+        acceptedCurbJunctions.some(
+          (prev) =>
+            prev.roadId === jn.roadId &&
+            prev.sign === -jn.sign &&
+            Math.hypot(prev.x - jn.x, prev.z - jn.z) < 6.2,
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const isEndpointAnchored = (pt: [number, number]): boolean => {
+    const [x, z] = pt;
+    for (const acc of accepted) {
+      if (distPointToPolyline2D(x, z, acc.curve).dist <= 3.7) return true;
+    }
+    for (const b of buildings) {
+      if (Math.hypot(x - b.x, z - b.z) <= plinthRadiusOf(b) + 5.6) return true;
+    }
+    for (const pr of props) {
+      if (pr.kind === "pond" && Math.hypot(x - pr.x, z - pr.z) <= (pr.radius ?? 6.5) + 3.8) return true;
+      if ((pr.kind === "bus_stop" || pr.kind === "signpost") && Math.hypot(x - pr.x, z - pr.z) <= 4.0) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const landmarkConnectedByAccepted = (b: WorldCreation): boolean => {
+    const reach = plinthRadiusOf(b) + 6.6;
+    for (const acc of accepted) {
+      if (distPointToPolyline2D(b.x, b.z, acc.curve).dist <= reach) return true;
+    }
+    return false;
+  };
+
+  const validateCleanSpline = (
+    ctrlPts: [number, number][],
+    closed: boolean,
+    isRoad: boolean,
+  ): [number, number][] | null => {
+    const curve = sampleCatmullRom2D(ctrlPts, closed, 0.6);
+    if (curve.length < 2) return null;
+    const cum: number[] = [0];
+    for (let i = 1; i < curve.length; i++) {
+      cum.push(cum[i - 1] + Math.hypot(curve[i][0] - curve[i - 1][0], curve[i][1] - curve[i - 1][1]));
+    }
+    const tot = cum[curve.length - 1];
+
+    for (const acc of accepted) {
+      if (isRoad && acc.isRoad) {
+        for (let i = 0; i < curve.length; i++) {
+          const nearEnd = !closed && (cum[i] <= 1.05 || tot - cum[i] <= 1.05);
+          if (distPointToPolyline2D(curve[i][0], curve[i][1], acc.curve).dist < (nearEnd ? 1.92 : 2.22)) {
+            return null;
+          }
+        }
+        if (polylineIntersectsCurveInterior(curve, closed, acc.curve, Boolean(acc.path.closed), 2.15)) {
+          return null;
+        }
+      } else if (isRoad !== acc.isRoad) {
+        for (const [cx, cz] of curve) {
+          if (distPointToPolyline2D(cx, cz, acc.curve).dist < 2.16) return null;
+        }
+        if (polylineIntersectsCurveInterior(curve, closed, acc.curve, Boolean(acc.path.closed), 0.0)) {
+          return null;
+        }
+      } else {
+        for (let i = 0; i < curve.length; i++) {
+          const nearEnd = !closed && (cum[i] <= 1.05 || tot - cum[i] <= 1.05);
+          if (!nearEnd && distPointToPolyline2D(curve[i][0], curve[i][1], acc.curve).dist < 0.85) {
+            return null;
+          }
+        }
+        if (polylineIntersectsCurveInterior(curve, closed, acc.curve, Boolean(acc.path.closed), 0.92)) {
+          return null;
+        }
+      }
+    }
+    return curve;
+  };
+
+  for (const rawPath of candidatePool) {
+    if (SEED_PATH_IDS.has(rawPath.id)) {
+      const curve = sampleCatmullRom2D(rawPath.points, Boolean(rawPath.closed), 0.65);
+      accepted.push({ path: rawPath, curve, isRoad: rawPath.kind === "road" });
+      continue;
+    }
+
+    const isRoad = rawPath.kind === "road";
+    let pts: [number, number][] = rawPath.points.map(([x, z]) => [x, z]);
+    let closed = Boolean(rawPath.closed) && pts.length >= 3;
+    let trimmedPlinth = false;
+
+    // Step A: Uncross any figure-8 self-intersection
+    let selfUncrossed = false;
+    const uncrossed = uncrossPolyline2D(pts, closed);
+    if (uncrossed.changed) {
+      pts = uncrossed.points;
+      selfUncrossed = true;
+      pathCrossingsFixed++;
+      details.push(`uncrossed self-intersecting ${rawPath.kind} "${rawPath.id}"`);
+    }
+
+    // Step B: Trim non-road control points clear of building plinths & pond water
+    if (!isRoad) {
+      for (let idx = 0; idx < pts.length; idx++) {
+        const neighbor = pts[idx === 0 ? 1 : idx - 1];
+        const nudged = pushPointClearOfObstacles(pts[idx][0], pts[idx][1], neighbor, false);
+        if (nudged.moved) {
+          pts[idx] = nudged.pt;
+          trimmedPlinth = true;
+        }
+      }
+      if (trimmedPlinth) {
+        const reUncross = uncrossPolyline2D(pts, closed);
+        if (reUncross.changed) {
+          pts = reUncross.points;
+          selfUncrossed = true;
+        }
+      }
+    }
+
+    // Step C: Sample curve and inspect against already-accepted planar network
+    const sampled = sampleCatmullRom2D(pts, closed, 0.6);
+    if (sampled.length < 2) continue;
+
+    // Check corridor redundancy & central village-green road clutter
+    const checkRedundant = (curvePts: [number, number][], curveClosed: boolean): boolean => {
+      if (accepted.length === 0 || curvePts.length === 0) return false;
+
+      // Never allow non-seed asphalt roads to cut across the central village green inside path-main-loop
+      if (isRoad) {
+        let insideGreen = 0;
+        for (const [sx, sz] of curvePts) {
+          if (Math.hypot(sx, sz) < 21.0) insideGreen++;
+        }
+        if (insideGreen / curvePts.length >= 0.25) {
+          return true;
+        }
+      }
+
+      // Keep if this path uniquely connects an otherwise-unconnected landmark
+      const uniquelyConnectsLandmark = buildings.some((b) => {
+        if (landmarkConnectedByAccepted(b)) return false;
+        const reach = plinthRadiusOf(b) + 6.4;
+        return distPointToPolyline2D(b.x, b.z, curvePts).dist <= reach;
+      });
+
+      // Prevent opposite-curb 4-way visual X-crossovers across an accepted road unless uniquely required by a landmark
+      if (!uniquelyConnectsLandmark && hasOppositeCurbCrossOver(curvePts, curveClosed)) {
+        return true;
+      }
+
+      const proxThresh = isRoad ? 7.6 : 3.7;
+      let closeCount = 0;
+      for (const [sx, sz] of curvePts) {
+        for (const acc of accepted) {
+          if (isRoad && !acc.isRoad) continue;
+          if (distPointToPolyline2D(sx, sz, acc.curve).dist <= proxThresh) {
+            closeCount++;
+            break;
+          }
+        }
+      }
+      const ratio = closeCount / curvePts.length;
+      if (ratio < (isRoad ? 0.62 : 0.6)) return false;
+
+      return !uniquelyConnectsLandmark;
+    };
+
+    // Determine which sampled points are blocked by road interiors or trail crossings
+    const M = sampled.length;
+    const cumArc: number[] = [0];
+    for (let i = 1; i < M; i++) {
+      cumArc.push(
+        cumArc[i - 1] + Math.hypot(sampled[i][0] - sampled[i - 1][0], sampled[i][1] - sampled[i - 1][1]),
+      );
+    }
+    const totalArc = cumArc[M - 1];
+
+    const blocked = new Uint8Array(M);
+    let hasAnyCrossing = false;
+
+    for (let i = 0; i < M; i++) {
+      const [sx, sz] = sampled[i];
+      const nearOwnOpenEnd = !closed && (cumArc[i] <= 1.05 || totalArc - cumArc[i] <= 1.05);
+
+      for (const acc of accepted) {
+        if (acc.isRoad) {
+          const hit = distPointToPolyline2D(sx, sz, acc.curve);
+          if (isRoad) {
+            // Secondary road vs accepted road: block interior overlaps; allow open endpoint T-junctions >= 2.2m
+            if (hit.dist < (nearOwnOpenEnd ? 1.85 : 2.15)) {
+              blocked[i] = 1;
+              hasAnyCrossing = true;
+              break;
+            }
+          } else {
+            // Non-road trail vs accepted road: trails MUST stop outside the stone curb (~2.52m), never < 2.10m!
+            if (hit.dist < 2.10) {
+              blocked[i] = 1;
+              hasAnyCrossing = true;
+              break;
+            }
+          }
+        } else if (isRoad) {
+          // Secondary road vs already-accepted seed trail: keep asphalt >= 2.10m clear of village green walks!
+          const hit = distPointToPolyline2D(sx, sz, acc.curve);
+          if (hit.dist < 2.10) {
+            blocked[i] = 1;
+            hasAnyCrossing = true;
+            break;
+          }
+        } else {
+          // Trail vs accepted trail: block close interior crossings (< 0.80m away from open T-junction ends)
+          const hit = distPointToPolyline2D(sx, sz, acc.curve);
+          if (!nearOwnOpenEnd && hit.dist < 0.80) {
+            blocked[i] = 1;
+            hasAnyCrossing = true;
+            break;
           }
         }
       }
     }
 
-    if (changed) {
-      footpathTrimCount++;
-      details.push(`trimmed footpath "${p.id}" clear of building plinth`);
-      return { ...p, points: pts };
+    // Also mark exact segment-segment crossings (in case a 0.6m step hopped straight across a thin 1.1m trail!)
+    for (let i = 0; i + 1 < M; i++) {
+      const a1 = sampled[i];
+      const a2 = sampled[i + 1];
+      const nearOwnOpenEnd =
+        !closed && (cumArc[i + 1] <= 0.95 || totalArc - cumArc[i] <= 0.95);
+
+      for (const acc of accepted) {
+        for (let j = 0; j + 1 < acc.curve.length; j++) {
+          const hit = segSegHit2D(a1, a2, acc.curve[j], acc.curve[j + 1]);
+          if (!hit) continue;
+          const nearAccOpenEnd =
+            !acc.path.closed &&
+            acc.curve.length >= 2 &&
+            (Math.hypot(hit[0] - acc.curve[0][0], hit[1] - acc.curve[0][1]) <= 0.95 ||
+              Math.hypot(
+                hit[0] - acc.curve[acc.curve.length - 1][0],
+                hit[1] - acc.curve[acc.curve.length - 1][1],
+              ) <= 0.95);
+          if (!isRoad && !acc.isRoad && (nearOwnOpenEnd || nearAccOpenEnd)) continue;
+          blocked[i] = 1;
+          blocked[i + 1] = 1;
+          hasAnyCrossing = true;
+          break;
+        }
+        if (blocked[i] && blocked[i + 1]) break;
+      }
     }
-    return p;
-  });
+
+    if (!hasAnyCrossing) {
+      if (checkRedundant(sampled, closed)) {
+        redundantPathsRemoved++;
+        details.push(`removed redundant parallel ${rawPath.kind} "${rawPath.id}"`);
+        continue;
+      }
+      const nextPath = trimmedPlinth || selfUncrossed ? { ...rawPath, points: pts } : rawPath;
+      if (trimmedPlinth) {
+        footpathTrimCount++;
+        details.push(`trimmed ${rawPath.kind} "${rawPath.id}" clear of building plinth`);
+      }
+      const pathJunctions = getRoadCurbJunctions(sampled, closed);
+      accepted.push({ path: nextPath, curve: sampled, isRoad });
+      acceptedCurbJunctions.push(...pathJunctions);
+      continue;
+    }
+
+    // Step D: Path had 1+ road/trail crossings — split into clean exterior segments snapped to curbs!
+    pathCrossingsFixed++;
+    const runs: { start: number; end: number }[] = [];
+    let runStart = -1;
+    for (let i = 0; i < M; i++) {
+      if (!blocked[i]) {
+        if (runStart === -1) runStart = i;
+      } else if (runStart !== -1) {
+        if (i - 1 >= runStart) runs.push({ start: runStart, end: i - 1 });
+        runStart = -1;
+      }
+    }
+    if (runStart !== -1 && M - 1 >= runStart) {
+      runs.push({ start: runStart, end: M - 1 });
+    }
+    // If originally closed and both first and last samples were unblocked, merge wrap-around run
+    if (closed && runs.length >= 2 && runs[0].start === 0 && runs[runs.length - 1].end === M - 1) {
+      const tail = runs.pop()!;
+      runs[0] = { start: tail.start, end: runs[0].end + M };
+    }
+
+    const snapCutBoundary = (freePt: [number, number], interiorRef: [number, number]): [number, number] => {
+      let bestAcc: AcceptedPathEntry | null = null;
+      let bestHit: ReturnType<typeof distPointToPolyline2D> | null = null;
+      for (const acc of accepted) {
+        const h = distPointToPolyline2D(freePt[0], freePt[1], acc.curve);
+        if (!bestHit || h.dist < bestHit.dist) {
+          bestHit = h;
+          bestAcc = acc;
+        }
+      }
+      if (!bestAcc || !bestHit || bestHit.dist > 4.2) {
+        return [round1(freePt[0]), round1(freePt[1])];
+      }
+      const targetOffset = isRoad || bestAcc.isRoad ? 2.58 : 1.24;
+      // Step strictly along the perpendicular curve normal pointing toward the unblocked interior!
+      const refDx = interiorRef[0] - bestHit.closestX;
+      const refDz = interiorRef[1] - bestHit.closestZ;
+      const dot = refDx * bestHit.normalX + refDz * bestHit.normalZ;
+      const sign = dot >= 0 ? 1 : -1;
+      const nx = bestHit.normalX * sign;
+      const nz = bestHit.normalZ * sign;
+      const rawSnap: [number, number] = [
+        round1(bestHit.closestX + nx * targetOffset),
+        round1(bestHit.closestZ + nz * targetOffset),
+      ];
+      return pushPointClearOfObstacles(rawSnap[0], rawSnap[1], interiorRef, isRoad).pt;
+    };
+
+    let keptPieces = 0;
+    const keptCutEnds: [number, number][] = [];
+    for (let rIdx = 0; rIdx < runs.length; rIdx++) {
+      const r = runs[rIdx];
+      const subSamples: [number, number][] = [];
+      for (let k = r.start; k <= r.end; k++) {
+        subSamples.push(sampled[k % M]);
+      }
+      if (subSamples.length < 2) continue;
+
+      const cutAtStart = r.start > 0 || closed;
+      const cutAtEnd = r.end < M - 1 || closed;
+      const refStart = subSamples[Math.min(subSamples.length - 1, 2)];
+      const refEnd = subSamples[Math.max(0, subSamples.length - 3)];
+
+      if (cutAtStart) {
+        subSamples[0] = snapCutBoundary(subSamples[0], refStart);
+      }
+      if (cutAtEnd) {
+        subSamples[subSamples.length - 1] = snapCutBoundary(
+          subSamples[subSamples.length - 1],
+          refEnd,
+        );
+      }
+
+      const arcLen = polylineLength2D(subSamples);
+      const minArc = isRoad ? 6.0 : 3.2;
+      const connectsUnconnectedLandmark = buildings.some((b) => {
+        if (landmarkConnectedByAccepted(b)) return false;
+        return distPointToPolyline2D(b.x, b.z, subSamples).dist <= plinthRadiusOf(b) + 5.8;
+      });
+      if (arcLen < (connectsUnconnectedLandmark ? 1.85 : minArc)) continue;
+
+      // Prevent opposite-curb visual 4-way X-crossings from the same split path unless uniquely required by a landmark
+      const formsOppositeCurbX =
+        !connectsUnconnectedLandmark &&
+        ((cutAtStart && keptCutEnds.some((ep) => Math.hypot(ep[0] - subSamples[0][0], ep[1] - subSamples[0][1]) < 8.5)) ||
+          (cutAtEnd &&
+            keptCutEnds.some(
+              (ep) =>
+                Math.hypot(
+                  ep[0] - subSamples[subSamples.length - 1][0],
+                  ep[1] - subSamples[subSamples.length - 1][1],
+                ) < 8.5,
+            )));
+      if (formsOppositeCurbX) continue;
+
+      // Drop split fragments with a dangling end in open grass
+      const startOk = isEndpointAnchored(subSamples[0]);
+      const endOk = isEndpointAnchored(subSamples[subSamples.length - 1]);
+      if ((!startOk || !endOk) && !connectsUnconnectedLandmark) continue;
+
+      let ctrlPts = simplifyRDP2D(subSamples, 0.3, isRoad ? 8 : 5);
+      if (ctrlPts.length < 2) continue;
+
+      if (!isRoad) {
+        for (let idx = 0; idx < ctrlPts.length; idx++) {
+          const neighbor = ctrlPts[idx === 0 ? 1 : idx - 1];
+          ctrlPts[idx] = pushPointClearOfObstacles(ctrlPts[idx][0], ctrlPts[idx][1], neighbor, false).pt;
+        }
+        ctrlPts = uncrossPolyline2D(ctrlPts, false).points;
+      }
+
+      // Verify Catmull-Rom spline does not bow back into a road or trail; fallback to straight 2-point chord if needed
+      let verifiedCurve = validateCleanSpline(ctrlPts, false, isRoad);
+      if (!verifiedCurve && ctrlPts.length > 2) {
+        const chord: [number, number][] = [ctrlPts[0], ctrlPts[ctrlPts.length - 1]];
+        verifiedCurve = validateCleanSpline(chord, false, isRoad);
+        if (verifiedCurve) ctrlPts = chord;
+      }
+      if (!verifiedCurve) continue;
+
+      if (checkRedundant(verifiedCurve, false)) continue;
+
+      const pieceId = keptPieces === 0 ? rawPath.id : `${rawPath.id}-s${keptPieces + 1}`;
+      const repairedPiece: WorldPath = {
+        id: pieceId,
+        kind: rawPath.kind,
+        points: ctrlPts,
+      };
+      const pieceJunctions = getRoadCurbJunctions(verifiedCurve, false);
+      accepted.push({ path: repairedPiece, curve: verifiedCurve, isRoad });
+      acceptedCurbJunctions.push(...pieceJunctions);
+      if (cutAtStart) keptCutEnds.push(ctrlPts[0]);
+      if (cutAtEnd) keptCutEnds.push(ctrlPts[ctrlPts.length - 1]);
+      keptPieces++;
+    }
+
+    details.push(
+      keptPieces > 0
+        ? `clipped crossing ${rawPath.kind} "${rawPath.id}" cleanly to road/trail curb (${keptPieces} segment${keptPieces > 1 ? "s" : ""})`
+        : `removed crossing ${rawPath.kind} "${rawPath.id}" over existing corridor`,
+    );
+  }
+
+  // Stage 5: Guarantee every stationary landmark has a clean non-crossing connection spur
+  for (const b of buildings) {
+    if (landmarkConnectedByAccepted(b) || accepted.length === 0) continue;
+
+    const footR = plinthRadiusOf(b);
+    let bestAcc: AcceptedPathEntry | null = null;
+    let bestHit: ReturnType<typeof distPointToPolyline2D> | null = null;
+    for (const acc of accepted) {
+      const h = distPointToPolyline2D(b.x, b.z, acc.curve);
+      if (!bestHit || h.dist < bestHit.dist) {
+        bestHit = h;
+        bestAcc = acc;
+      }
+    }
+    if (!bestAcc || !bestHit || bestHit.dist > 68) continue;
+
+    const dirToNetX = bestHit.closestX - b.x;
+    const dirToNetZ = bestHit.closestZ - b.z;
+    const dirLen = Math.hypot(dirToNetX, dirToNetZ);
+    if (dirLen < footR + 2.2) continue;
+
+    const ux = dirToNetX / dirLen;
+    const uz = dirToNetZ / dirLen;
+    const doorPt: [number, number] = [
+      round1(b.x + ux * (footR + 0.65)),
+      round1(b.z + uz * (footR + 0.65)),
+    ];
+    const curbOffset = bestAcc.isRoad ? 2.54 : 1.16;
+    const curbPt: [number, number] = [
+      round1(bestHit.closestX - ux * curbOffset),
+      round1(bestHit.closestZ - uz * curbOffset),
+    ];
+    if (Math.hypot(curbPt[0] - doorPt[0], curbPt[1] - doorPt[1]) < 1.6) continue;
+
+    const spurPts: [number, number][] = [doorPt, curbPt];
+    const verified = validateCleanSpline(spurPts, false, false);
+    if (verified) {
+      const spurKind =
+        /\b(volcano|lava|magma)\b/i.test(b.name)
+          ? "volcanic_trail"
+          : /\b(waterfall|forest|farm|mill|cabin)\b/i.test(b.name)
+            ? "dirt_trail"
+            : /\b(beach|surf|dock|pond)\b/i.test(b.name)
+              ? "boardwalk"
+              : "cobblestone";
+      const spur: WorldPath = {
+        id: `spur-${b.id}`,
+        kind: spurKind,
+        points: spurPts,
+      };
+      accepted.push({ path: spur, curve: verified, isRoad: false });
+      footpathTrimCount++;
+      details.push(`added clean curb-snapped spur "${spur.id}" for "${b.name}"`);
+    }
+  }
+
+  const repairedPaths = accepted.map((a) => a.path);
 
   const repairedProps: WorldProp[] = [];
   for (const pr of props) {
@@ -868,7 +1912,8 @@ export function auditAndRepairWorldSpatial(
     let moved = false;
 
     if (pr.kind !== "pond") {
-      for (let pass = 0; pass < 3; pass++) {
+      for (let pass = 0; pass < 6; pass++) {
+        let passMoved = false;
         // Keep props outside building plinths
         for (const b of buildings) {
           const minR = plinthRadiusOf(b) + 0.6;
@@ -878,9 +1923,10 @@ export function auditAndRepairWorldSpatial(
           if (d < minR) {
             const ux = d > 0.05 ? dx / d : 1;
             const uz = d > 0.05 ? dz / d : 0;
-            px = Number((b.x + ux * (minR + 0.35)).toFixed(1));
-            pz = Number((b.z + uz * (minR + 0.35)).toFixed(1));
+            px = round1(b.x + ux * (minR + 0.4));
+            pz = round1(b.z + uz * (minR + 0.4));
             moved = true;
+            passMoved = true;
           }
         }
         // Keep props separated from each other so meshes never stack on the same coordinates
@@ -893,11 +1939,13 @@ export function auditAndRepairWorldSpatial(
           if (d < minSep) {
             const ux = d > 0.05 ? dx / d : 0.707;
             const uz = d > 0.05 ? dz / d : 0.707;
-            px = Number((prev.x + ux * (minSep + 0.35)).toFixed(1));
-            pz = Number((prev.z + uz * (minSep + 0.35)).toFixed(1));
+            px = round1(prev.x + ux * (minSep + 0.4));
+            pz = round1(prev.z + uz * (minSep + 0.4));
             moved = true;
+            passMoved = true;
           }
         }
+        if (!passMoved) break;
       }
     }
 
@@ -914,8 +1962,14 @@ export function auditAndRepairWorldSpatial(
     paths: repairedPaths,
     props: repairedProps,
     report: {
-      clean: footpathTrimCount === 0 && propNudgeCount === 0,
+      clean:
+        footpathTrimCount === 0 &&
+        pathCrossingsFixed === 0 &&
+        redundantPathsRemoved === 0 &&
+        propNudgeCount === 0,
       footpathTrimCount,
+      pathCrossingsFixed,
+      redundantPathsRemoved,
       propNudgeCount,
       details,
     },

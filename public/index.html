@@ -72,6 +72,53 @@
     <!-- Endless Animated Sunlit Grass Voxel Canvas -->
     <canvas id="world-canvas" aria-label="Shared animated 3D voxel grass world"></canvas>
 
+    <!-- Camera Controls (Desktop + Mobile: Pan / Orbit toggle + Recentre) -->
+    <div id="cam-controls" class="cam-controls" role="toolbar" aria-label="Camera controls">
+      <div class="cam-mode-group" role="group" aria-label="Camera drag mode">
+        <button
+          type="button"
+          id="cam-pan-btn"
+          class="cam-mode-btn is-active"
+          aria-pressed="true"
+          title="Move camera"
+        >
+          <svg class="cam-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3v18M3 12h18M12 3l-3 3M12 3l3 3M12 21l-3-3M12 21l3-3M3 12l3-3M3 12l3 3M21 12l-3-3M21 12l-3 3" />
+          </svg>
+          <span>Pan</span>
+        </button>
+        <button
+          type="button"
+          id="cam-orbit-btn"
+          class="cam-mode-btn"
+          aria-pressed="false"
+          title="Spin and tilt camera"
+        >
+          <svg class="cam-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+            <polyline points="21 3 21 9 15 9" />
+          </svg>
+          <span>Orbit</span>
+        </button>
+      </div>
+
+      <button
+        type="button"
+        id="recenter-btn"
+        class="cam-recenter-btn"
+        title="Recentre camera"
+      >
+        <svg class="cam-icon cam-compass-svg" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8" stroke-opacity="0.35" />
+          <g id="recenter-compass">
+            <polygon points="12,4.2 14.7,12 9.3,12" fill="#d94e43" />
+            <polygon points="12,19.8 14.7,12 9.3,12" fill="currentColor" fill-opacity="0.55" />
+          </g>
+        </svg>
+        <span>Recentre</span>
+      </button>
+    </div>
+
     <!-- Hover nameplate + optional live API readout -->
     <div id="hover-card" class="hover-card" hidden>
       <div id="hover-name" class="hover-name"></div>

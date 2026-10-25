@@ -34,6 +34,7 @@ import {
   auditAndRepairWorldSpatial,
   auditBlueprintOverlaps,
   autoRepairBlueprintOverlaps,
+  detectPathCrossings,
 } from "./voxel_audit";
 import {
   applyBlueprintAmendment,
@@ -61,6 +62,7 @@ export interface WorldAuditSummary {
   creationsChecked: number;
   blueprintConflicts: number;
   spatialConflicts: number;
+  pathCrossings: number;
   totalAutoRepairs: number;
   lastAuditAt: number;
   lastAuditNote: string;
@@ -506,8 +508,17 @@ export class WorldDO extends DurableObject<Env> {
       Date.now() - 36 * 60 * 60 * 1000,
     );
 
-    // Lightweight startup overlap check (< 3ms, zero LLM calls)
-    this.auditAndRepairWorld();
+    // Lightweight startup overlap & planar road-crossing repair (< 4ms, zero LLM calls)
+    const bootAudit = this.auditAndRepairWorld();
+    const upgradedV10 = sql
+      .exec(`SELECT value FROM meta WHERE key = 'upgrade_v10_planar_roads' LIMIT 1`)
+      .toArray();
+    if (upgradedV10.length === 0) {
+      if (bootAudit.repairedCount > 0) {
+        sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('lastOgCaptureAt', '0')`);
+      }
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v10_planar_roads', '1')`);
+    }
 
     // Resume queue if any jobs are waiting
     const pendingJobs = Number(
@@ -547,6 +558,13 @@ export class WorldDO extends DurableObject<Env> {
 
     const spatial = auditAndRepairWorldSpatial(creations, paths, props);
     if (!spatial.report.clean) {
+      const keptPathIds = new Set(spatial.paths.map((p) => p.id));
+      for (const row of pathRows) {
+        const oldId = String(row.id);
+        if (!keptPathIds.has(oldId)) {
+          sql.exec(`DELETE FROM paths WHERE id = ?`, oldId);
+        }
+      }
       for (const p of spatial.paths) {
         sql.exec(`INSERT OR REPLACE INTO paths (id, json) VALUES (?, ?)`, p.id, JSON.stringify(p));
       }
@@ -590,7 +608,13 @@ export class WorldDO extends DurableObject<Env> {
     }
 
     const spatial = auditAndRepairWorldSpatial(world.creations, world.paths, world.props);
-    const spatialConflicts = spatial.report.footpathTrimCount + spatial.report.propNudgeCount;
+    const crossings = detectPathCrossings(world.paths);
+    const spatialConflicts =
+      spatial.report.footpathTrimCount +
+      spatial.report.pathCrossingsFixed +
+      spatial.report.redundantPathsRemoved +
+      spatial.report.propNudgeCount +
+      crossings.count;
 
     return {
       ok: true,
@@ -598,6 +622,7 @@ export class WorldDO extends DurableObject<Env> {
       creationsChecked: world.creations.length,
       blueprintConflicts,
       spatialConflicts,
+      pathCrossings: crossings.count,
       totalAutoRepairs: Number(this.getMeta("totalAutoRepairs", "0")) || 0,
       lastAuditAt: Number(this.getMeta("lastAuditAt", String(Date.now()))) || Date.now(),
       lastAuditNote: this.getMeta("lastAuditNote", "Verified clean"),
@@ -1633,6 +1658,9 @@ export class WorldDO extends DurableObject<Env> {
           }
         }
       }
+      if ((upd.integratedLevel ?? 0) >= 2 && upd.behavior.type === "landmark" && patch.newPaths.length > 0) {
+        sql.exec(`DELETE FROM paths WHERE id = ?`, `initpath-${upd.creationId}`);
+      }
       if ((upd.integratedLevel ?? 0) >= 2 && (hasCustomRoad || upd.behavior.type === "vehicle_route")) {
         sql.exec(`DELETE FROM paths WHERE id = ?`, `initroad-${upd.creationId}`);
         if (patch.newProps.some((pr) => pr.kind === "bus_stop")) {
@@ -1645,6 +1673,21 @@ export class WorldDO extends DurableObject<Env> {
         JSON.stringify(existing),
         existing.id,
       );
+    }
+
+    if (patch.removePathIds && patch.removePathIds.length > 0) {
+      const protectedSeed = new Set([
+        "path-main-loop",
+        "path-clocktower-spur",
+        "path-bakery-spur",
+        "path-bookshop-spur",
+        "path-green-walk",
+      ]);
+      for (const delPid of patch.removePathIds) {
+        if (!protectedSeed.has(delPid)) {
+          sql.exec(`DELETE FROM paths WHERE id = ?`, delPid);
+        }
+      }
     }
 
     const pathCount = Number(sql.exec(`SELECT COUNT(*) AS c FROM paths`).toArray()[0]?.c ?? 0);

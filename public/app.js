@@ -39,6 +39,11 @@ const hoverFeed = document.getElementById("hover-feed");
 const hoverStatus = document.getElementById("hover-status");
 const weaveToast = document.getElementById("weave-toast");
 
+const camPanBtn = document.getElementById("cam-pan-btn");
+const camOrbitBtn = document.getElementById("cam-orbit-btn");
+const recenterBtn = document.getElementById("recenter-btn");
+const recenterCompass = document.getElementById("recenter-compass");
+
 // UI states: "idle" | "picking" | "composing" | "building" | "ready" | "placed"
 let uiState = "idle";
 let myCreationId = null;
@@ -123,6 +128,18 @@ function stopJobTracking() {
   }
 }
 
+function syncCameraModeUI(mode) {
+  const isOrbit = mode === "orbit";
+  if (camPanBtn) {
+    camPanBtn.classList.toggle("is-active", !isOrbit);
+    camPanBtn.setAttribute("aria-pressed", isOrbit ? "false" : "true");
+  }
+  if (camOrbitBtn) {
+    camOrbitBtn.classList.toggle("is-active", isOrbit);
+    camOrbitBtn.setAttribute("aria-pressed", isOrbit ? "true" : "false");
+  }
+}
+
 const engine = createMeadowWorldEngine(
   worldCanvas,
   {
@@ -163,9 +180,33 @@ const engine = createMeadowWorldEngine(
         chosenSpot = { x, z };
       }
     },
+    onDragModeChange(mode) {
+      syncCameraModeUI(mode);
+    },
+    onCameraChange(camState) {
+      if (recenterCompass && typeof camState?.azDeltaFromHome === "number") {
+        const deg = ((camState.azDeltaFromHome * 180) / Math.PI).toFixed(1);
+        recenterCompass.setAttribute("transform", `rotate(${deg} 12 12)`);
+      }
+    },
   },
   { ogMode: isOgCapture },
 );
+
+window.__geminIslandCam = () => engine.getCameraState();
+
+camPanBtn?.addEventListener("click", () => {
+  engine.setDragMode("pan");
+});
+
+camOrbitBtn?.addEventListener("click", () => {
+  engine.setDragMode("orbit");
+});
+
+recenterBtn?.addEventListener("click", () => {
+  engine.recenterCamera();
+  engine.setDragMode("pan");
+});
 
 function syncDockUI() {
   if (isOgCapture) return;

@@ -154,6 +154,7 @@ export interface SanitizedBuildJobDiagnostic {
   startedAt: number | null;
   finishedAt: number | null;
   modelUsed: string | null;
+  failureKind?: "safety_policy" | "upstream_or_timeout";
   errorMsg?: string | null;
   errorDetail?: string | null;
 }
@@ -965,6 +966,15 @@ export class WorldDO extends DurableObject<Env> {
         startedAt !== null && finishedAt !== null && finishedAt >= startedAt
           ? finishedAt - startedAt
           : null;
+      const rawErrMsg =
+        typeof r.error_msg === "string"
+          ? redactSecrets(r.error_msg, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET])
+          : null;
+      const isSafetyRejection =
+        typeof rawErrMsg === "string" &&
+        /^(I cannot|That creation doesn't fit|Let's keep our shared meadow|Please try creating something family-friendly)/i.test(
+          rawErrMsg.trim(),
+        );
       return {
         jobId: String(r.job_id),
         status,
@@ -979,10 +989,8 @@ export class WorldDO extends DurableObject<Env> {
         modelUsed: typeof r.model_used === "string" ? r.model_used : null,
         ...(status === "failed"
           ? {
-              errorMsg:
-                typeof r.error_msg === "string"
-                  ? redactSecrets(r.error_msg, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET])
-                  : null,
+              failureKind: isSafetyRejection ? "safety_policy" : "upstream_or_timeout",
+              errorMsg: isSafetyRejection ? "Blocked by family-friendly safety filter." : rawErrMsg,
               errorDetail:
                 typeof r.error_detail === "string"
                   ? redactSecrets(r.error_detail, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET])

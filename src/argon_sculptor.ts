@@ -14,6 +14,7 @@ import {
 } from "./voxel_audit";
 import { type CriticReviewResult, reviewBlueprintWithCritic } from "./voxel_critic";
 import { normalizeAndGroundBlueprint } from "./voxel_dsl";
+import { normalizeFactualDescription } from "./town_planner";
 
 export { buildGeminiModelCascade, extractJsonObject };
 
@@ -46,7 +47,7 @@ export type SculptResult =
       modelUsed: string;
       telemetry: SculptTelemetry;
     }
-  | { ok: false; unsafe?: boolean; error: string; errorDetail?: string };
+  | { ok: false; unsafe?: boolean; retryable?: boolean; error: string; errorDetail?: string };
 
 const BLOCKED_PATTERNS = [
   /\b(nazi|swastika|hitler|kkk|child\s*porn|csam|rape|suicide\s*bomb|beheading|pornography|genitalia)\b/i,
@@ -120,7 +121,7 @@ const SCULPTOR_SYSTEM_PROMPT = `You are Master Voxel Sculptor Argon, creating br
      * \`"watercraft"\` — ANYTHING THAT SWIMS OR FLOATS ON WATER: boats, sailboats, ferries, submarines, surfboards, ducks, swans, whales, dolphins, sharks, sea serpents, turtles! NEVER include a \`plinth\`!
      * \`"creature"\` — WALKING, TROTTING, HOPPING, OR LOW-GLIDING LAND CREATURES, ANIMALS, CHARACTERS, DINOSAURS & MOBILE ROBOTS: Use \`sphere\` / \`roundedBox\` for organic torso, head, snout, ears (\`mirrorX: true\`), pixel eyes, NEVER include a \`plinth\`, and put 2 or 4 articulated legs in \`parts\` with \`"kind": "swingX"\` (left \`phase: 0\`, right \`phase: 3.14\`) + wagging tail (\`"kind": "swingY"\`)!
      * \`"building"\` or \`"prop"\` — STATIONARY STRUCTURES, FIXTURES & NATURAL LANDFORMS:
-       - Architectural buildings & stationary sports/park structures (cottages, houses, pubs, shops, towers, windmills, castles, datacentres, mines/quarries, skateboard halfpipes, skateparks, ramps, courts, pools): Use \`"category": "building"\`! NEVER add a \`plinth\` or wide artificial concrete/stone base platform slab — start walls, doorways, porch posts, and foundations flush at \`Y = 0\` facing \`+Z\`, with multi-volume geometry, glowing lights (\`emit: 0.95\`), and 1-2 animated \`parts\`.
+       - Architectural buildings & stationary sports/park structures (cottages, houses, pubs, shops, towers, windmills, castles, datacentres, mines/quarries, skateboard halfpipes, skateparks, ramps, courts, pools): Use \`"category": "building"\`! Build a SINGLE unified building or single tower unless the user explicitly asks for multiple towers/buildings (never default to twin towers!). NEVER add a \`plinth\` or wide artificial concrete/stone base platform slab — start walls, doorways, porch posts, and foundations flush at \`Y = 0\` facing \`+Z\`, with multi-volume geometry, glowing lights (\`emit: 0.95\`), and 1-2 animated \`parts\`.
        - Natural landforms (volcanoes, waterfalls, mountains, cliffs, caves, oasis, giant trees): NEVER include a rectangular \`plinth\` or flat base slab! Sculpt wide organic rock/basalt/earth/moss cliffs (\`cone\` rBottom 18..25, asymmetric \`sphere\` foothills) touching Y = 0 directly, with glowing magma craters/streams (\`emit: 1.8\`) + rising \`bob\` ash/smoke plumes for volcanoes, or towering multi-tiered cyan/white cataracts + flush \`Y = 0\` plunge lagoon on \`+Z\` + \`bob\` mist clouds for waterfalls!
        - CONCAVE & OPEN-TOP STRUCTURES (skateboard halfpipes, quarter-pipes, skate bowls, swimming pools, bathtubs, sports courts, stadiums, amphitheatres, rowboats/canoes): MUST BE 100% OPEN TO THE SKY ABOVE! Build a solid ramp/basin block up to deck height (e.g. \`box\` \`x0:-13, y0:0, z0:-10, x1:13, y1:10, z1:10\`) and SUBTRACT the smooth U-shaped concave trough from above using \`cylinder\` or \`sphere\` with \`"carve": true\` centered AT OR ABOVE deck height (e.g. \`{"op":"cylinder","axis":"x","x0":-14,"x1":14,"cy":10,"cz":0,"radius":7.5,"carve":true}\` leaves two elevated flat decks on \`z=-10..-8\` and \`z=8..10\` with coping/railings and a smooth open-sky U-ramp between them!). NEVER place a solid horizontal \`cylinder\` and only \`clear\` partway up — that leaves a floating barrel roof arching over the ramp!
 
@@ -175,8 +176,8 @@ const SCULPTOR_SYSTEM_PROMPT = `You are Master Voxel Sculptor Argon, creating br
 {
   "safe": true,
   "extractedSubject": "concise phrase of what was extracted/sculpted",
-  "name": "Charming 2-4 Word Title",
-  "description": "Warm, concise 1-sentence visual description (under 125 characters)",
+  "name": "Clear 2-4 Word Object Title",
+  "description": "Plain, objective 1-sentence physical description of the object or building itself (under 110 characters, e.g. 'Two-storey red-brick firehouse with arched engine bays and brass bell cupola.' — NO narrative voice, storytelling, or whimsical scene-setting!)",
   "category": "vehicle" | "creature" | "building" | "prop" | "aircraft" | "watercraft",
   "scaleClass": "tiny" | "small" | "medium" | "large" | "colossal",
   "liveFeed": null,
@@ -226,32 +227,45 @@ export async function sculptWithArgon(
 
   const tStart = Date.now();
   const expectedPrimary = primaryModel || "gemini-4-argon";
-  let first: Awaited<ReturnType<typeof callGeminiArgon>>;
-  try {
-    first = await callGeminiArgon({
-      apiKey,
-      mode: "sculpt",
-      primaryModel,
-      bariumModels,
-      fallbackModel,
-      overrideModels: req.overrideModels,
-      systemPrompt: SCULPTOR_SYSTEM_PROMPT,
-      userText: userDirective,
-      imageBase64: req.imageBase64,
-      imageMimeType: req.imageMimeType,
-      ...(req.initialCriticRenderPngBase64
-        ? { extraImages: [{ mimeType: "image/png", data: req.initialCriticRenderPngBase64 }] }
-        : {}),
-      temperature: 0.42,
-      thinkingBudget: 1024,
-      maxOutputTokens: 12288,
-    });
-  } catch (err) {
-    safeLogError("sculpt_round1_exhausted", err, [apiKey]);
+  let first: Awaited<ReturnType<typeof callGeminiArgon>> | null = null;
+  let lastRound1Err: unknown = null;
+  for (let pass = 0; pass < 2; pass++) {
+    try {
+      first = await callGeminiArgon({
+        apiKey,
+        mode: "sculpt",
+        primaryModel,
+        bariumModels,
+        fallbackModel,
+        overrideModels: req.overrideModels,
+        systemPrompt: SCULPTOR_SYSTEM_PROMPT,
+        userText: userDirective,
+        imageBase64: req.imageBase64,
+        imageMimeType: req.imageMimeType,
+        ...(req.initialCriticRenderPngBase64
+          ? { extraImages: [{ mimeType: "image/png", data: req.initialCriticRenderPngBase64 }] }
+          : {}),
+        temperature: 0.42,
+        thinkingBudget: 1024,
+        maxOutputTokens: 12288,
+      });
+      break;
+    } catch (err) {
+      lastRound1Err = err;
+      safeLogWarn("sculpt_round1_pass_failed", err, [apiKey]);
+      if (pass === 0) {
+        await new Promise((r) => setTimeout(r, 1200));
+      }
+    }
+  }
+
+  if (!first) {
+    safeLogError("sculpt_round1_deferred_retry", lastRound1Err, [apiKey]);
     return {
       ok: false,
-      error: "Argon took a moment too long building that — please try once more.",
-      errorDetail: redactSecrets(err, [apiKey]),
+      retryable: true,
+      error: "Still sculpting — retrying automatically…",
+      errorDetail: redactSecrets(lastRound1Err, [apiKey]),
     };
   }
 
@@ -417,7 +431,12 @@ export async function sculptWithArgon(
   // Pick the strongest verified blueprint across attempts (approved first, then highest critic score, then voxel richness)
   const validCandidates = candidates.filter((c) => c.bp.stats.voxels >= 25);
   if (validCandidates.length === 0) {
-    return { ok: false, error: "Argon couldn't form a clear 3D sculpture from that — try adding a few descriptive words." };
+    return {
+      ok: false,
+      retryable: true,
+      error: "Still sculpting — retrying automatically…",
+      errorDetail: "zero_voxel_candidates",
+    };
   }
 
   validCandidates.sort((a, b) => {
@@ -433,6 +452,7 @@ export async function sculptWithArgon(
   const winner = validCandidates[0];
   const bp: VoxelBlueprint = {
     ...winner.bp,
+    description: normalizeFactualDescription(winner.bp.description),
     ...(winner.critic
       ? {
           criticReview: {

@@ -16,6 +16,7 @@ import {
   SimVox,
   translateOp,
 } from "./voxel_dsl";
+import { computeIntelligentBuildingYaw } from "./town_planner";
 
 export interface PartOverlapReport {
   partIndex: number;
@@ -1282,7 +1283,7 @@ export function inferContextualRoadKind(
     return "boardwalk";
   }
   if (
-    /\b(quarry|mine|mining|ore|refinery|smelter|foundry|factory|plant|warehouse|depot|firehouse|fire\s*station|datacentre|datacenter|steel\s*tower|skyscraper|terminal|airport|spaceport)\b/i.test(
+    /\b(quarry|mine|mining|ore|refinery|smelter|foundry|factory|plant|warehouse|depot|firehouse|fire\s*station|datacentre|datacenter|steel\s*tower|glass\s*tower|office\s*tower|modernist.*tower|skyscraper|terminal|airport|spaceport|launchpad|launch\s*pad|rocket)\b/i.test(
       text,
     )
   ) {
@@ -1329,98 +1330,24 @@ function deterministicHashId(id: string): number {
 }
 
 /**
- * Deterministic organic frontage alignment:
- * Orients stationary buildings and landmarks so their primary entrance (`+Z` or detected door side)
- * faces their approach lane, cottage road, or arterial curb with subtle natural micro-variance (`±1.8°`),
- * eliminating chaotic random yaw angles without locking the world onto a rigid 90° CAD grid.
+ * Intelligent SimCity frontage alignment:
+ * Snaps architectural city and village buildings uniformly to their fronting street block
+ * (`0`, `±π/2`, `π`, or `45°` on diagonal boulevards — zero random jitter), while leaving
+ * quarries, mines, waterfalls, cliffs, islands, and beach hammocks at their natural orientation.
  */
 export function alignLandmarksToFrontage(
   creations: WorldCreation[],
   paths: WorldPath[],
 ): { changedIds: string[] } {
   const changedIds: string[] = [];
-  const sampledPaths = paths
-    .filter((p) => Array.isArray(p.points) && p.points.length >= 2)
-    .map((p) => ({
-      path: p,
-      curve: sampleCatmullRom2D(p.points, Boolean(p.closed), 0.65),
-    }))
-    .filter((entry) => entry.curve.length >= 2);
-
-  if (sampledPaths.length === 0) return { changedIds };
+  if (!paths || paths.length === 0) return { changedIds };
 
   for (const c of creations) {
-    if (c.isSeed) continue;
+    if (c.isSeed || c.isCompanion) continue;
     if (c.category !== "building" && c.behavior?.type !== "landmark") continue;
 
-    const footR = getCreationFootprintRadius(
-      c.scaleClass,
-      c.blueprint?.stats?.footprintX ?? 14,
-      c.blueprint?.stats?.footprintZ ?? 14,
-    );
-
-    let targetPt: [number, number] | null = null;
-    let bestTerminusScore = Infinity;
-
-    // 1. Prefer an open approach spur/lane/road whose endpoint terminates at this landmark's frontage
-    for (const sp of sampledPaths) {
-      if (sp.path.closed) continue;
-      const startPt = sp.curve[0];
-      const endPt = sp.curve[sp.curve.length - 1];
-      const dStart = Math.hypot(startPt[0] - c.x, startPt[1] - c.z);
-      const dEnd = Math.hypot(endPt[0] - c.x, endPt[1] - c.z);
-      const minEndDist = Math.min(dStart, dEnd);
-      if (minEndDist > footR + 5.8) continue;
-
-      const isDedicated =
-        sp.path.id === `spur-${c.id}` ||
-        sp.path.id === `initpath-${c.id}` ||
-        sp.path.id.includes(c.id);
-      const kindBonus =
-        sp.path.kind === "road"
-          ? -1.4
-          : sp.path.kind === "cottage_road" || sp.path.kind === "cobblestone"
-            ? -0.8
-            : 0;
-      const score = minEndDist + (isDedicated ? -4.0 : 0) + kindBonus;
-      if (score < bestTerminusScore) {
-        bestTerminusScore = score;
-        if (dStart <= dEnd) {
-          targetPt = sp.curve[Math.min(sp.curve.length - 1, 4)];
-        } else {
-          targetPt = sp.curve[Math.max(0, sp.curve.length - 5)];
-        }
-      }
-    }
-
-    // 2. Otherwise face the closest passing road / cottage lane / trail
-    if (!targetPt) {
-      let bestPassScore = Infinity;
-      for (const sp of sampledPaths) {
-        const hit = distPointToPolyline2D(c.x, c.z, sp.curve);
-        const kindBonus =
-          sp.path.kind === "road"
-            ? -2.4
-            : sp.path.kind === "cottage_road" || sp.path.kind === "cobblestone"
-              ? -1.6
-              : 0;
-        const score = hit.dist + kindBonus;
-        if (score < bestPassScore) {
-          bestPassScore = score;
-          targetPt = [hit.closestX, hit.closestZ];
-        }
-      }
-    }
-
-    if (!targetPt) continue;
-    const dx = targetPt[0] - c.x;
-    const dz = targetPt[1] - c.z;
-    if (Math.hypot(dx, dz) < 0.25) continue;
-
-    const roadAngle = Math.atan2(dx, dz);
-    const localFront = c.blueprint ? detectBlueprintFrontAngle(c.blueprint) : 0;
-    const microVariance = ((deterministicHashId(c.id) % 17) - 8) * 0.004;
-    const desiredYaw = Math.round(wrapAnglePi(roadAngle - localFront + microVariance) * 100) / 100;
+    const desiredYaw = computeIntelligentBuildingYaw(c, paths);
+    if (desiredYaw === null) continue;
 
     const yawDiff = Math.abs(wrapAnglePi((c.yaw || 0) - desiredYaw));
     const behaviorDiff =
@@ -1430,7 +1357,7 @@ export function alignLandmarksToFrontage(
           : Math.abs(wrapAnglePi(c.behavior.facingYaw - desiredYaw))
         : 0;
 
-    if (yawDiff > 0.06 || behaviorDiff > 0.06) {
+    if (yawDiff > 0.04 || behaviorDiff > 0.04) {
       c.yaw = desiredYaw;
       if (c.behavior?.type === "landmark") {
         c.behavior = { ...c.behavior, facingYaw: desiredYaw };
@@ -1592,17 +1519,17 @@ export function auditAndRepairWorldSpatial(
         }
         return offMainMatches >= (p.closed ? 3 : 1);
       });
-      const servesIndustrialLandmark =
+      const servesDistrictLandmark =
         !p.closed &&
         polylineLength2D(roadCurve) >= 7.5 &&
-        buildings.some(
-          (b) =>
-            inferContextualRoadKind(b) === "road" &&
-            distPointToPolyline2D(b.x, b.z, roadCurve).dist <= plinthRadiusOf(b) + 7.5,
-        );
+        (p.id.startsWith("road-") ||
+          p.id.startsWith("grid-") ||
+          buildings.some(
+            (b) => distPointToPolyline2D(b.x, b.z, roadCurve).dist <= plinthRadiusOf(b) + 7.5,
+          ));
       const keepRoad =
         (isOuterSmoothLoop && usedByActiveVehicle) ||
-        (!p.closed && (usedByActiveVehicle || servesIndustrialLandmark));
+        (!p.closed && (usedByActiveVehicle || servesDistrictLandmark));
       if (!keepRoad) {
         redundantPathsRemoved++;
         details.push(`removed cluttered secondary asphalt road "${p.id}"`);
@@ -1898,11 +1825,11 @@ export function auditAndRepairWorldSpatial(
 
     const totalCurveLen = polylineLength2D(curvePts);
 
-    // Never allow non-seed asphalt roads to cut across the central village green inside path-main-loop
+    // Never allow non-seed asphalt roads to cut across Central Park inside path-main-loop
     if (isRoad) {
       let insideGreen = 0;
       for (const [sx, sz] of curvePts) {
-        if (Math.hypot(sx, sz) < 21.0) insideGreen++;
+        if (Math.abs(sx) < 20.5 && Math.abs(sz) < 16.5) insideGreen++;
       }
       if (insideGreen / curvePts.length >= 0.25) {
         return true;
@@ -1945,11 +1872,11 @@ export function auditAndRepairWorldSpatial(
       return distPointToPolyline2D(b.x, b.z, curvePts).dist <= reach;
     });
 
-    // Keep the central village green inside path-main-loop calm (only short direct landmark curb spurs allowed)
+    // Keep Central Park inside path-main-loop calm (only short direct landmark curb spurs allowed)
     if (!isRoad) {
       let insideCentralGreen = 0;
       for (const [sx, sz] of curvePts) {
-        if ((sx / 21.6) * (sx / 21.6) + (sz / 16.6) * (sz / 16.6) < 1.0) {
+        if (Math.abs(sx) < 21.2 && Math.abs(sz) < 17.2) {
           insideCentralGreen++;
         }
       }
@@ -2355,34 +2282,6 @@ export function auditAndRepairWorldSpatial(
     }
     if (!bestAcc || !bestHit || bestHit.dist > 220) continue;
 
-    // Also check if a landmark whose plinth already meets a trail has an outer plaza edge closer to `b`
-    let bestPlazaAnchor: { x: number; z: number; dist: number; owner: WorldCreation } | null = null;
-    for (const connB of buildings) {
-      if (connB.id === b.id) continue;
-      const connFootR = plinthRadiusOf(connB);
-      const hasDirectPlinthTrail = accepted.some(
-        (acc) =>
-          !acc.isRoad &&
-          distPointToPolyline2D(connB.x, connB.z, acc.curve).dist <= connFootR + 1.6,
-      );
-      if (!hasDirectPlinthTrail) continue;
-      const dxC = b.x - connB.x;
-      const dzC = b.z - connB.z;
-      const centerDist = Math.hypot(dxC, dzC);
-      if (centerDist < footR + connFootR + 2.2) continue;
-      const edgeDist = centerDist - connFootR;
-      if (edgeDist < bestHit.dist - 1.5 && (!bestPlazaAnchor || edgeDist < bestPlazaAnchor.dist)) {
-        const uxC = dxC / centerDist;
-        const uzC = dzC / centerDist;
-        bestPlazaAnchor = {
-          x: round1(connB.x + uxC * (connFootR + 0.72)),
-          z: round1(connB.z + uzC * (connFootR + 0.72)),
-          dist: edgeDist,
-          owner: connB,
-        };
-      }
-    }
-
     const buildSpurCandidatesForAnchor = (
       targetX: number,
       targetZ: number,
@@ -2409,11 +2308,20 @@ export function auditAndRepairWorldSpatial(
       if (span < 1.35) return [];
 
       const sets: [number, number][][] = [];
+      // 1. Prefer straight orthogonal/direct chord first, or clean SimCity 90° L-bend if oblique!
+      sets.push([doorPt, curbPt]);
+      const dxSpan = Math.abs(curbPt[0] - doorPt[0]);
+      const dzSpan = Math.abs(curbPt[1] - doorPt[1]);
+      if (dxSpan >= 2.8 && dzSpan >= 2.8) {
+        const elbowA = pushPointClearOfObstacles(curbPt[0], doorPt[1], doorPt, false).pt;
+        const elbowB = pushPointClearOfObstacles(doorPt[0], curbPt[1], doorPt, false).pt;
+        sets.push([doorPt, elbowA, curbPt]);
+        sets.push([doorPt, elbowB, curbPt]);
+      }
+
       const perpX = -uz;
       const perpZ = ux;
-      if (span <= 18.0) {
-        sets.push([doorPt, curbPt]);
-      } else {
+      if (span > 18.0) {
         const bow = Math.min(3.2, span * 0.05);
         const midGentle = pushPointClearOfObstacles(
           round1((doorPt[0] + curbPt[0]) * 0.5 + perpX * bow),
@@ -2422,7 +2330,6 @@ export function auditAndRepairWorldSpatial(
           false,
         ).pt;
         sets.push([doorPt, midGentle, curbPt]);
-        sets.push([doorPt, curbPt]);
       }
 
       const chordRef: [number, number][] = [doorPt, curbPt];
@@ -2473,16 +2380,10 @@ export function auditAndRepairWorldSpatial(
       return sets;
     };
 
-    const candidateCtrlSets: [number, number][][] = [];
-    if (bestPlazaAnchor) {
-      candidateCtrlSets.push(...buildSpurCandidatesForAnchor(bestPlazaAnchor.x, bestPlazaAnchor.z, 0));
-    }
-    candidateCtrlSets.push(
-      ...buildSpurCandidatesForAnchor(
-        bestHit.closestX,
-        bestHit.closestZ,
-        bestAcc.isRoad ? 2.52 : 0.48,
-      ),
+    const candidateCtrlSets: [number, number][][] = buildSpurCandidatesForAnchor(
+      bestHit.closestX,
+      bestHit.closestZ,
+      bestAcc.isRoad ? 2.52 : 0.48,
     );
 
     let chosenPts: [number, number][] | null = null;

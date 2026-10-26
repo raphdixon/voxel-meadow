@@ -75,6 +75,7 @@ body {
 }
 
 .cam-mode-btn {
+  position: relative;
   appearance: none;
   border: none;
   background: transparent;
@@ -90,7 +91,7 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  transition: background 0.14s ease, color 0.14s ease;
+  transition: background 0.14s ease, color 0.14s ease, transform 0.14s ease;
 }
 
 .cam-mode-btn:hover:not(.is-active) {
@@ -100,6 +101,54 @@ body {
 .cam-mode-btn.is-active {
   background: var(--ink);
   color: var(--white);
+}
+
+.cam-mode-btn.is-demo-click {
+  animation: cam-demo-press 0.52s cubic-bezier(0.22, 1, 0.36, 1);
+  z-index: 2;
+}
+
+.cam-mode-btn.is-demo-click::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 999px;
+  border: 2px solid var(--ink);
+  pointer-events: none;
+  animation: cam-demo-ripple 0.68s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes cam-demo-press {
+  0% {
+    transform: scale(1);
+  }
+  26% {
+    transform: scale(0.86);
+  }
+  62% {
+    transform: scale(1.07);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes cam-demo-ripple {
+  0% {
+    opacity: 0.85;
+    transform: scale(0.94);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.36);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cam-mode-btn.is-demo-click,
+  .cam-mode-btn.is-demo-click::after {
+    animation: none;
+  }
 }
 
 .cam-recenter-btn {

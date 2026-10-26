@@ -193,6 +193,25 @@ function syncCameraModeUI(mode) {
   syncWalkJoystickVisibility();
 }
 
+const demoClickTimers = new WeakMap();
+
+function triggerCameraButtonClickFX(mode) {
+  syncCameraModeUI(mode);
+  const btn = mode === "walk" ? camWalkBtn : mode === "orbit" ? camOrbitBtn : camPanBtn;
+  if (!btn || isOgCapture) return;
+  const prevTimer = demoClickTimers.get(btn);
+  if (prevTimer) clearTimeout(prevTimer);
+  btn.classList.remove("is-demo-click");
+  void btn.offsetWidth;
+  btn.classList.add("is-demo-click");
+  demoClickTimers.set(
+    btn,
+    setTimeout(() => {
+      btn.classList.remove("is-demo-click");
+    }, 740),
+  );
+}
+
 engine = createMeadowWorldEngine(
   worldCanvas,
   {
@@ -208,17 +227,20 @@ engine = createMeadowWorldEngine(
       } else {
         hoverFeed.hidden = true;
       }
-      hoverStatus.textContent = creation.behavior?.statusLine || creation.description || "";
+      hoverStatus.textContent = creation.description || creation.behavior?.statusLine || "";
       hoverCard.style.left = `${clientX}px`;
       hoverCard.style.top = `${clientY}px`;
       hoverCard.hidden = false;
     },
     onSelectCreation(creation, reading) {
       if (!creation || isOgCapture) return;
+      const baseDesc = creation.description || creation.behavior?.statusLine || "";
       const detail = reading?.summary
-        ? `${reading.summary} · ${creation.behavior?.statusLine || creation.description}`
-        : creation.behavior?.statusLine || creation.description;
-      showToast(`${creation.name} — ${detail}`);
+        ? baseDesc
+          ? `${reading.summary} · ${baseDesc}`
+          : reading.summary
+        : baseDesc;
+      showToast(detail ? `${creation.name} — ${detail}` : creation.name);
     },
     onPickGroundSpot(x, z) {
       chosenSpot = { x, z };
@@ -235,6 +257,9 @@ engine = createMeadowWorldEngine(
     },
     onDragModeChange(mode) {
       syncCameraModeUI(mode);
+    },
+    onIntroDemoStep(mode) {
+      triggerCameraButtonClickFX(mode);
     },
     onCameraChange(camState) {
       if (recenterCompass && typeof camState?.azDeltaFromHome === "number") {
@@ -599,7 +624,8 @@ readyGotoBtn.addEventListener("click", () => {
   engine.focusCreationById(myCreationId);
   const mine = worldData?.creations?.find((c) => c.id === myCreationId) || readyCreation;
   if (mine) {
-    showToast(`${mine.name} — ${mine.behavior?.statusLine || mine.description}`, 4600);
+    const desc = mine.description || mine.behavior?.statusLine || "";
+    showToast(desc ? `${mine.name} — ${desc}` : mine.name, 4600);
   }
 });
 
@@ -609,7 +635,8 @@ locateMineBtn.addEventListener("click", () => {
   engine.focusCreationById(myCreationId);
   const mine = worldData?.creations?.find((c) => c.id === myCreationId);
   if (mine) {
-    showToast(`${mine.name} — ${mine.behavior?.statusLine || mine.description}`);
+    const desc = mine.description || mine.behavior?.statusLine || "";
+    showToast(desc ? `${mine.name} — ${desc}` : mine.name);
   }
 });
 

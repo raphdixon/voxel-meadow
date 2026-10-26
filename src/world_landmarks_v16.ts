@@ -18,7 +18,7 @@ export function buildColossalWaterfallBlueprint(): VoxelBlueprint {
     {
       name: "Emerald Cliff Waterfall",
       description:
-        "Towering sunlit mossy granite gorge waterfall cascading down emerald terraces into a crystal plunge lagoon.",
+        "Stepped granite cliff waterfall with alpine spruce trees, mossy ledges, and turquoise plunge pool.",
       category: "prop",
       scaleClass: "colossal",
       liveFeed: { kind: "weather", place: "GeminIsland", lat: -33.87, lon: 151.21 },
@@ -527,4 +527,84 @@ export function buildCompanionVehicleBlueprint(
         customName || "Island Provision Delivery Van",
       );
   }
+}
+
+/**
+ * Sleek architectural single high-rise tower (`"Modernist Glass Tower"`) sitting flush at Y = 0
+ * with a double-height recessed glass lobby colonnade facing `+Z`, curtain-wall steel mullions,
+ * architectural upper setback, rooftop mechanical penthouse, and rotating radar/beacon mast.
+ */
+export function buildSingleModernistTowerBlueprint(): VoxelBlueprint {
+  return normalizeAndGroundBlueprint(
+    {
+      name: "Modernist Glass Tower",
+      description:
+        "Single glass-and-steel high-rise office tower with recessed lobby colonnade and rooftop spire.",
+      category: "building",
+      scaleClass: "large",
+      palette: {
+        steelDark: "#2d343d",
+        steel: "#56616e",
+        steelBright: "#9aa6b4",
+        glassDeep: "#397296",
+        glassCyan: "#6cb8db",
+        glassWarm: "#ffe4a3",
+        lobbyStone: "#cfd5d9",
+        lobbyGold: "#f7ce68",
+        trimWhite: "#eef3f7",
+        beaconRed: "#ff4f45",
+      },
+      ops: [
+        // 1. Flush ground-floor structural core & recessed +Z street-front colonnade (Y = 0..8, zero plinth!)
+        { op: "box", x0: -9, y0: 0, z0: -8, x1: 9, y1: 8, z1: 5, color: "steelDark" },
+        { op: "box", x0: -8, y0: 0, z0: 4, x1: 8, y1: 7, z1: 7, color: "glassWarm", emit: 0.72 },
+        // Structural perimeter columns along the street colonnade (+Z = z=8)
+        { op: "pillars", x0: -9, y0: 0, z0: -8, x1: 9, y1: 8, z1: 8, color: "steelBright" },
+        { op: "box", x0: -5, y0: 0, z0: 6, x1: -4, y1: 8, z1: 8, color: "steelBright", mirrorX: true },
+        // Revolving/glass entrance canopy overhang facing +Z
+        { op: "box", x0: -6, y0: 7, z0: 6, x1: 6, y1: 8, z1: 10, color: "trimWhite" },
+        { op: "arch", cx: 0, y0: 0, cz: 7, halfSpan: 3, height: 6, depth: 1, axis: "z", color: "lobbyStone" },
+
+        // 2. Main curtain-wall office shaft (Y = 8..38)
+        { op: "box", x0: -9, y0: 8, z0: -8, x1: 9, y1: 38, z1: 8, color: "glassDeep" },
+        { op: "pillars", x0: -9, y0: 8, z0: -8, x1: 9, y1: 38, z1: 8, color: "steelBright" },
+        // Vertical steel mullions on front/back and side facades
+        { op: "box", x0: 3, y0: 8, z0: -8, x1: 4, y1: 38, z1: 8, color: "steel", mirrorX: true },
+        { op: "box", x0: -9, y0: 8, z0: 2, x1: 9, y1: 38, z1: 3, color: "steel" },
+        { op: "box", x0: -9, y0: 8, z0: -3, x1: 9, y1: 38, z1: -2, color: "steel" },
+        // Horizontal spandrel floor bands + sunlit cyan/warm lit office windows
+        { op: "box", x0: -9, y0: 14, z0: -8, x1: 9, y1: 15, z1: 8, color: "steelDark" },
+        { op: "box", x0: -9, y0: 20, z0: -8, x1: 9, y1: 21, z1: 8, color: "steelDark" },
+        { op: "box", x0: -9, y0: 26, z0: -8, x1: 9, y1: 27, z1: 8, color: "steelDark" },
+        { op: "box", x0: -9, y0: 32, z0: -8, x1: 9, y1: 33, z1: 8, color: "steelDark" },
+        { op: "box", x0: -9, y0: 37, z0: -8, x1: 9, y1: 39, z1: 8, color: "trimWhite" },
+        // Warm illuminated sky-floor bands
+        { op: "box", x0: -8, y0: 16, z0: -7, x1: 8, y1: 18, z1: 8, color: "glassCyan", emit: 0.35 },
+        { op: "box", x0: -8, y0: 28, z0: -7, x1: 8, y1: 30, z1: 8, color: "glassWarm", emit: 0.55 },
+
+        // 3. Upper architectural setback crown (Y = 39..49)
+        { op: "box", x0: -7, y0: 39, z0: -6, x1: 7, y1: 48, z1: 6, color: "glassCyan", emit: 0.32 },
+        { op: "pillars", x0: -7, y0: 39, z0: -6, x1: 7, y1: 48, z1: 6, color: "steelBright" },
+        { op: "box", x0: -7, y0: 43, z0: -6, x1: 7, y1: 44, z1: 6, color: "steelDark" },
+        { op: "box", x0: -7, y0: 48, z0: -6, x1: 7, y1: 50, z1: 6, color: "trimWhite" },
+
+        // 4. Rooftop mechanical penthouse & spire base (Y = 50..56)
+        { op: "roundedBox", x0: -4, y0: 50, z0: -4, x1: 4, y1: 54, z1: 4, radius: 1.2, color: "steelDark" },
+        { op: "cylinder", axis: "y", cx: 0, y0: 54, y1: 58, cz: 0, radius: 1.1, color: "steelBright" },
+      ],
+      parts: [
+        {
+          name: "rooftop-comms-array",
+          kind: "spinY",
+          speed: 1.1,
+          pivot: [0, 59, 0],
+          ops: [
+            { op: "box", x0: -3, y0: 0, z0: -0.5, x1: 3, y1: 1, z1: 0.5, color: "trimWhite" },
+            { op: "sphere", cx: 0, cy: 1.5, cz: 0, rx: 1.1, ry: 1.1, rz: 1.1, color: "beaconRed", emit: 1.4 },
+          ],
+        },
+      ],
+    },
+    "Modernist Glass Tower",
+  );
 }

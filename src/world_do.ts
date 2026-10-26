@@ -56,7 +56,14 @@ import {
 import {
   buildColossalWaterfallBlueprint,
   buildCompanionVehicleBlueprint,
+  buildSingleModernistTowerBlueprint,
 } from "./world_landmarks_v16";
+import {
+  chooseSimCityPlot,
+  computeIntelligentBuildingYaw,
+  FACTUAL_CREATION_DESCRIPTIONS,
+  normalizeFactualDescription,
+} from "./town_planner";
 
 const MAX_CONCURRENT_SCULPTS = 3;
 const MAX_QUEUE_DEPTH = 40;
@@ -132,6 +139,8 @@ interface BuildJobRow {
   phase: "queued" | "sculpting" | "reviewing" | "refining";
   round1_ms: number | null;
   has_image: number;
+  retry_count: number;
+  next_retry_at: number;
   prompt: string;
   image_base64: string | null;
   image_mime: string | null;
@@ -512,6 +521,12 @@ export class WorldDO extends DurableObject<Env> {
     if (!jobCols.has("error_detail")) {
       sql.exec(`ALTER TABLE build_jobs ADD COLUMN error_detail TEXT`);
     }
+    if (!jobCols.has("retry_count")) {
+      sql.exec(`ALTER TABLE build_jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!jobCols.has("next_retry_at")) {
+      sql.exec(`ALTER TABLE build_jobs ADD COLUMN next_retry_at INTEGER NOT NULL DEFAULT 0`);
+    }
 
     const upgradedV9 = sql.exec(`SELECT value FROM meta WHERE key = 'upgrade_v9_eta_telemetry'`).toArray();
     if (upgradedV9.length === 0) {
@@ -572,6 +587,17 @@ export class WorldDO extends DurableObject<Env> {
     if (upgradedV16.length === 0) {
       this.runUpgradeV16OrganicWorld();
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v16_organic_world', '1')`);
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('lastOgCaptureAt', '0')`);
+    }
+
+    // One-time v17 SimCity town planning upgrade (structured street grid, distant quarry + paved haul highway,
+    // single Modernist Glass Tower, intelligent street-facing building alignment, factual non-narrative descriptions)
+    const upgradedV17 = sql
+      .exec(`SELECT value FROM meta WHERE key = 'upgrade_v17_simcity_world' LIMIT 1`)
+      .toArray();
+    if (upgradedV17.length === 0) {
+      this.runUpgradeV17SimCityWorld();
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v17_simcity_world', '1')`);
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('lastOgCaptureAt', '0')`);
     }
 
@@ -961,6 +987,415 @@ export class WorldDO extends DurableObject<Env> {
     }
   }
 
+  private runUpgradeV17SimCityWorld(): void {
+    const sql = this.ctx.storage.sql;
+    const seed = buildSeedWorld();
+    const seedCreationsById = new Map(seed.creations.map((c) => [c.id, c]));
+
+    // Collision-verified SimCity Town Grid coordinates:
+    // - Downtown & North Tech avenues, East Civic & long diagonal Quarry Haul Highway,
+    //   South Civic Avenue, West Cottage Lanes, Southeast Coastal Boardwalk, South Waterfall Trail.
+    const simCityPlacements: Record<string, { x: number; z: number; fixedYaw?: number }> = {
+      "c-mvne3zub-216636": { x: 15.5, z: 2.0 }, // Sunset Skate Halfpipe (East Park frontage)
+      "c-mvnf2juk-326f62": { x: 9.0, z: -42.0 }, // Modernist Glass Tower (Single tower on North-East Ave)
+      "c-mvm7qli8-4h2k": { x: -30.5, z: -31.0 }, // Hyperion Cloud Datacentre (North-West Ave)
+      "c-mvnepky4-e46ba2": { x: -37.5, z: -58.0 }, // Hyperscale Cloud Datacentre (North-West Tech Block)
+      "c-mvodns66-ce9982": { x: -20.0, z: -94.0 }, // Hynix Data Amphitheater (Spaceport Causeway West)
+      "c-mvoiz95f-8d5336": { x: 11.5, z: -78.0 }, // Wikipedia Print Archive (Spaceport Causeway East)
+      "c-mvn9yxeh-1d5644": { x: 30.5, z: -32.0 }, // Modern Retail Pavilion (North-East Ave)
+      "c-mvojw3k4-4ee278": { x: 29.5, z: -52.0 }, // The Dumb Guy Queue Pub (North-East Ave)
+      "c-mvoi4jxh-b16cfb": { x: 0.0, z: -126.0, fixedYaw: 0 }, // Interstellar Rocket Launchpad (North Frontier)
+      "c-mvoehstp-db1cae": { x: 58.0, z: -28.0 }, // IHOP Pancake Ziggurat (East Boulevard North)
+      "c-mvodkwqc-c9e4a4": { x: 62.0, z: 6.5 }, // Federal Parliament Hall (East Boulevard South)
+      "c-mvnc7tlr-6784e6": { x: 118.0, z: -114.0, fixedYaw: 0 }, // Borealis Mineral Quarry (Distant NE Frontier!)
+      "c-mvoivyhf-8fdd46": { x: 24.5, z: 30.0 }, // Cuervo Fiesta Pavilion (South Civic Ave East)
+      "c-mvns4thf-81f7de": { x: 24.5, z: 46.0 }, // Beacon Hill Firehouse (South Civic Ave East)
+      "c-mvnc3mga-c6ea36": { x: 24.5, z: 64.0 }, // Outback Heritage Pub (South Civic Ave East)
+      "c-mvocxa72-f718f5": { x: 1.5, z: 38.0 }, // The Ovoid Arena (South Civic Ave West)
+      "c-mvnbcub6-d06441": { x: 7.0, z: 56.0 }, // Gadgets y Gizmos Robot Cantina (South Civic Ave West)
+      "c-mvo96y3f-96e304": { x: 88.0, z: 21.0, fixedYaw: 0 }, // Emerald Coastline Vista (SE Coastal Rim)
+      "c-mvofu6xi-9656b7": { x: 62.0, z: 46.0, fixedYaw: 0 }, // Banana Hammock Lounger (SE Sandy Beach)
+      "c-mvnmyyq6-bc000b": { x: 104.0, z: 46.0, fixedYaw: 0 }, // Broadcaster Virtual Island (SE Offshore)
+      "c-mvnbmbqg-48aa8f": { x: -52.0, z: -20.0 }, // Meadow Pickleball Court (West North Lane)
+      "c-mvne5cm4-375d1d": { x: -70.0, z: -22.5 }, // Jdogggg's Grand Mansion (West North Lane)
+      "c-mvocr3dc-a475ca": { x: -98.0, z: -34.0 }, // The Great Meadow Apiary (West North Lane End)
+      "c-mvnlu09c-0cd9f7": { x: -54.0, z: 4.0 }, // Sunlit Honey Cottage (West South Lane)
+      "c-mvoab00r-9b0864": { x: -72.0, z: 2.5 }, // The Spectral Manor (West South Lane)
+      "c-mvn8g9cn-a857de": { x: -88.0, z: 3.5 }, // Old Boot Cottage (West South Lane)
+      "c-mvnd5i04-14bfd5": { x: -56.0, z: 22.0 }, // Sunlit Padel Court (West South Lane South)
+      "c-mvod5t0a-226189": { x: -31.5, z: 36.0 }, // The Grand Burger Shack (Southwest Lane)
+      "c-mvn0lbb4-74136e": { x: -14.0, z: 91.0, fixedYaw: Math.PI }, // Emerald Cliff Waterfall (South Canyon Rim facing North)
+    };
+
+    const creationRows = sql.exec(`SELECT id, json FROM creations ORDER BY created_at ASC`).toArray();
+    const existingIds = new Set<string>();
+
+    for (const row of creationRows) {
+      const cid = String(row.id);
+      existingIds.add(cid);
+      let c = JSON.parse(String(row.json)) as WorldCreation;
+
+      // 1. Update seed creations to clean SimCity downtown loop & factual descriptions
+      if (c.isSeed && seedCreationsById.has(cid)) {
+        const freshSeed = seedCreationsById.get(cid)!;
+        c = {
+          ...freshSeed,
+          createdAt: c.createdAt || freshSeed.createdAt,
+        };
+        sql.exec(`UPDATE creations SET integrated_level = 2, json = ? WHERE id = ?`, JSON.stringify(c), cid);
+        continue;
+      }
+
+      // 2. Replace Twin Towers ("c-mvnf2juk-326f62") with sleek Single Modernist Glass Tower
+      if (cid === "c-mvnf2juk-326f62") {
+        const singleTowerBp = buildSingleModernistTowerBlueprint();
+        c.name = singleTowerBp.name;
+        c.description = singleTowerBp.description;
+        c.category = "building";
+        c.scaleClass = singleTowerBp.scaleClass;
+        c.blueprint = singleTowerBp;
+      }
+
+      // 3. Apply SimCity grid coordinates & natural fixed orientation for non-road-facing features
+      const plot = simCityPlacements[cid];
+      if (plot) {
+        c.x = plot.x;
+        c.z = plot.z;
+        if (typeof plot.fixedYaw === "number") {
+          c.yaw = plot.fixedYaw;
+          if (c.behavior?.type === "landmark") {
+            c.behavior = { ...c.behavior, facingYaw: plot.fixedYaw };
+          }
+        }
+      }
+
+      // 4. Rewrite all narrative descriptions & statusLines into plain, factual object descriptions
+      const factual = FACTUAL_CREATION_DESCRIPTIONS[cid];
+      if (factual) {
+        c.description = factual.description;
+        if (c.blueprint) c.blueprint.description = factual.description;
+        if (c.behavior) {
+          c.behavior = { ...c.behavior, statusLine: factual.statusLine };
+        }
+      } else if (c.isCompanion && /sourdough|honey\s*van|bakery/i.test(c.name)) {
+        const cleanDesc = "Cream-and-teal bakery delivery van with roof cargo rack and wooden crates.";
+        c.description = cleanDesc;
+        if (c.blueprint) c.blueprint.description = cleanDesc;
+        if (c.behavior) {
+          c.behavior = { ...c.behavior, statusLine: "Bakery delivery van on Downtown loop" };
+        }
+      } else {
+        const cleanDesc = normalizeFactualDescription(c.description);
+        c.description = cleanDesc;
+        if (c.blueprint) c.blueprint.description = cleanDesc;
+        if (c.behavior) {
+          c.behavior = { ...c.behavior, statusLine: cleanDesc || c.name };
+        }
+      }
+
+      sql.exec(
+        `UPDATE creations SET integrated_level = ?, json = ? WHERE id = ?`,
+        Math.max(2, c.integratedLevel ?? 2),
+        JSON.stringify(c),
+        cid,
+      );
+    }
+
+    // 5. Reset paths to clean, structured SimCity Grid + Long Quarry Haul Highway + Contextual Lanes
+    const simCityPaths: WorldPath[] = [
+      ...seed.paths,
+      {
+        id: "road-north-grid",
+        kind: "road",
+        points: [
+          [-18, -23.1],
+          [-18, -55],
+          [-13, -60],
+          [0, -60],
+          [13, -60],
+          [18, -55],
+          [18, -23.1],
+        ],
+      },
+      {
+        id: "road-north-spaceport",
+        kind: "road",
+        points: [
+          [0, -62.6],
+          [0, -88],
+          [0, -112.5],
+        ],
+      },
+      {
+        id: "road-quarry-haul",
+        kind: "road",
+        points: [
+          [27.3, -8],
+          [50, -8],
+          [72, -8],
+          [80, -16],
+          [98, -34],
+          [112, -68],
+          [117.5, -100],
+        ],
+      },
+      {
+        id: "road-south-avenue",
+        kind: "road",
+        points: [
+          [16, 23.2],
+          [16, 46],
+          [16, 64],
+        ],
+      },
+      {
+        id: "lane-west-north",
+        kind: "cottage_road",
+        points: [
+          [-27.2, -10],
+          [-54, -10],
+          [-82, -10],
+          [-95, -21.5],
+        ],
+      },
+      {
+        id: "lane-west-south",
+        kind: "cottage_road",
+        points: [
+          [-27.2, 10],
+          [-54, 10],
+          [-74, 10],
+          [-88, 8.8],
+        ],
+      },
+      {
+        id: "lane-southwest",
+        kind: "cottage_road",
+        points: [
+          [-38, 11.4],
+          [-38, 24],
+          [-38, 36],
+          [-35.2, 36],
+        ],
+      },
+      {
+        id: "boardwalk-southeast",
+        kind: "boardwalk",
+        points: [
+          [27.3, 12],
+          [42, 12],
+          [58, 36],
+          [78, 36],
+          [95, 43],
+        ],
+      },
+      {
+        id: "trail-south-waterfall",
+        kind: "dirt_trail",
+        points: [
+          [-14, 23.3],
+          [-14, 50],
+          [-14, 75.5],
+        ],
+      },
+    ];
+
+    sql.exec(`DELETE FROM paths`);
+    for (const p of simCityPaths) {
+      sql.exec(`INSERT OR REPLACE INTO paths (id, json) VALUES (?, ?)`, p.id, JSON.stringify(p));
+    }
+
+    // 6. Refresh seed bus stops/lamps/park props & villagers onto the rectangular Downtown Avenue
+    sql.exec(`DELETE FROM props`);
+    for (const pr of seed.props) {
+      sql.exec(`INSERT OR REPLACE INTO props (id, json) VALUES (?, ?)`, pr.id, JSON.stringify(pr));
+    }
+    const streetFurniture: WorldProp[] = [
+      { id: "prop-grid-lamp-nw", kind: "lamp_post", x: -21.7, z: -37.9, yaw: Math.PI / 2 },
+      { id: "prop-grid-lamp-ne", kind: "lamp_post", x: 21.7, z: -37.9, yaw: -Math.PI / 2 },
+      { id: "prop-grid-lamp-east", kind: "lamp_post", x: 46.0, z: -4.4, yaw: Math.PI },
+      { id: "prop-grid-lamp-south", kind: "lamp_post", x: 19.6, z: 38.0, yaw: -Math.PI / 2 },
+      { id: "prop-grid-sign-quarry", kind: "signpost", x: 29.5, z: -11.6, yaw: 0, label: "Quarry Hwy" },
+      { id: "prop-grid-bench-coast", kind: "bench", x: 74.0, z: 39.2, yaw: Math.PI },
+    ];
+    for (const sf of streetFurniture) {
+      sql.exec(`INSERT OR REPLACE INTO props (id, json) VALUES (?, ?)`, sf.id, JSON.stringify(sf));
+    }
+
+    for (const v of seed.villagers) {
+      sql.exec(`INSERT OR REPLACE INTO villagers (id, json) VALUES (?, ?)`, v.id, JSON.stringify(v));
+    }
+
+    // 7. Update Quarry Dump Truck & Firehouse Pumper onto the full SimCity highways
+    if (existingIds.has("c-mvnc7tlr-6784e6")) {
+      const dumpBp = buildCompanionVehicleBlueprint(
+        "mining_dump_truck",
+        "Borealis Heavy Haul Dump Truck",
+        FACTUAL_CREATION_DESCRIPTIONS["comp-quarry-dump-truck"].description,
+      );
+      const dumpCreation: WorldCreation = {
+        id: "comp-quarry-dump-truck",
+        name: dumpBp.name,
+        description: dumpBp.description,
+        category: "vehicle",
+        scaleClass: "medium",
+        blueprint: dumpBp,
+        x: 117.5,
+        z: -100.0,
+        yaw: -0.2,
+        createdAt: Date.now(),
+        isCompanion: true,
+        companionOfId: "c-mvnc7tlr-6784e6",
+        integratedLevel: 2,
+        behavior: {
+          type: "vehicle_route",
+          loopMode: "pingpong",
+          speed: 6.2,
+          waypoints: [
+            [117.5, -100.0],
+            [112.0, -68.0],
+            [98.0, -34.0],
+            [80.0, -16.0],
+            [72.0, -8.0],
+            [50.0, -8.0],
+            [27.3, -8.0],
+            [24.0, -14.0],
+            [18.0, -20.0],
+            [0.0, -20.0],
+          ],
+          stops: [
+            {
+              id: "stop-quarry-bay",
+              name: "Borealis Quarry Loading Bay",
+              x: 117.5,
+              z: -100.0,
+              dwellSec: 4.2,
+              nearCreationId: "c-mvnc7tlr-6784e6",
+            },
+            {
+              id: "stop-city-ore-exchange",
+              name: "Clocktower Ore Exchange",
+              x: 0.0,
+              z: -20.0,
+              dwellSec: 3.8,
+              nearCreationId: "seed-clocktower-station",
+            },
+          ],
+          statusLine: FACTUAL_CREATION_DESCRIPTIONS["comp-quarry-dump-truck"].statusLine,
+        },
+      };
+      sql.exec(
+        `INSERT OR REPLACE INTO creations (id, created_at, integrated_level, json) VALUES (?, ?, 2, ?)`,
+        dumpCreation.id,
+        dumpCreation.createdAt,
+        JSON.stringify(dumpCreation),
+      );
+    }
+
+    if (existingIds.has("c-mvns4thf-81f7de")) {
+      const pumperBp = buildCompanionVehicleBlueprint(
+        "fire_engine",
+        "Beacon Hill Pumper Engine",
+        FACTUAL_CREATION_DESCRIPTIONS["comp-firehouse-pumper"].description,
+      );
+      const pumperCreation: WorldCreation = {
+        id: "comp-firehouse-pumper",
+        name: pumperBp.name,
+        description: pumperBp.description,
+        category: "vehicle",
+        scaleClass: "medium",
+        blueprint: pumperBp,
+        x: 16.0,
+        z: 46.0,
+        yaw: Math.PI,
+        createdAt: Date.now() + 1,
+        isCompanion: true,
+        companionOfId: "c-mvns4thf-81f7de",
+        integratedLevel: 2,
+        behavior: {
+          type: "vehicle_route",
+          loopMode: "pingpong",
+          speed: 5.8,
+          waypoints: [
+            [16.0, 46.0],
+            [16.0, 23.2],
+            [18.0, 20.0],
+            [0.0, 20.0],
+            [-18.0, 20.0],
+          ],
+          stops: [
+            {
+              id: "stop-firehouse-apron",
+              name: "Beacon Hill Engine Bay",
+              x: 16.0,
+              z: 46.0,
+              dwellSec: 4.5,
+              nearCreationId: "c-mvns4thf-81f7de",
+            },
+            {
+              id: "stop-south-avenue",
+              name: "South Avenue Station",
+              x: 0.0,
+              z: 20.0,
+              dwellSec: 3.6,
+            },
+          ],
+          statusLine: FACTUAL_CREATION_DESCRIPTIONS["comp-firehouse-pumper"].statusLine,
+        },
+      };
+      sql.exec(
+        `INSERT OR REPLACE INTO creations (id, created_at, integrated_level, json) VALUES (?, ?, 2, ?)`,
+        pumperCreation.id,
+        pumperCreation.createdAt,
+        JSON.stringify(pumperCreation),
+      );
+    }
+
+    // 8. Clean district terrain zones matching relocated SimCity landmarks
+    sql.exec(`DELETE FROM terrain_zones`);
+    const districtZones: WorldTerrainZone[] = [
+      ...seed.terrainZones,
+      ...(existingIds.has("c-mvnc7tlr-6784e6")
+        ? [{ id: "zone-quarry-mesa", biome: "desert_mesa" as const, x: 118, z: -114, radius: 22.0 }]
+        : []),
+      ...(existingIds.has("c-mvn0lbb4-74136e")
+        ? [{ id: "zone-waterfall-lagoon", biome: "misty_moss" as const, x: -14, z: 89, radius: 21.0 }]
+        : []),
+      ...(existingIds.has("c-mvoi4jxh-b16cfb")
+        ? [{ id: "zone-spaceport-pad", biome: "stone_plaza" as const, x: 0, z: -126, radius: 17.5 }]
+        : []),
+      ...(existingIds.has("c-mvodkwqc-c9e4a4")
+        ? [{ id: "zone-parliament-plaza", biome: "stone_plaza" as const, x: 62, z: 6.5, radius: 14.5 }]
+        : []),
+      ...(existingIds.has("c-mvns4thf-81f7de")
+        ? [{ id: "zone-firehouse-plaza", biome: "stone_plaza" as const, x: 26.5, z: 46, radius: 10.5 }]
+        : []),
+      ...(existingIds.has("c-mvnf2juk-326f62")
+        ? [{ id: "zone-downtown-north", biome: "stone_plaza" as const, x: 9, z: -42, radius: 11.0 }]
+        : []),
+      ...(existingIds.has("c-mvo96y3f-96e304")
+        ? [{ id: "zone-coastline-shore", biome: "sandy_shore" as const, x: 88, z: 24, radius: 16.5 }]
+        : []),
+      ...(existingIds.has("c-mvofu6xi-9656b7")
+        ? [{ id: "zone-hammock-beach", biome: "sandy_shore" as const, x: 62, z: 44, radius: 10.5 }]
+        : []),
+      ...(existingIds.has("c-mvnmyyq6-bc000b")
+        ? [{ id: "zone-virtual-island", biome: "sandy_shore" as const, x: 104, z: 46, radius: 15.0 }]
+        : []),
+      ...(existingIds.has("c-mvocr3dc-a475ca")
+        ? [{ id: "zone-west-apiary", biome: "autumn_grove" as const, x: -98, z: -34, radius: 18.0 }]
+        : []),
+    ];
+    for (const tz of districtZones) {
+      sql.exec(`INSERT OR REPLACE INTO terrain_zones (id, json) VALUES (?, ?)`, tz.id, JSON.stringify(tz));
+    }
+
+    this.setMeta(
+      "lastWeaveNote",
+      "Town grid organized with North, East, South, and West avenues plus Northeast Quarry Highway.",
+    );
+  }
+
   private auditAndRepairWorld(): { repairedCount: number; repairs: string[] } {
     const sql = this.ctx.storage.sql;
     const repairs: string[] = [];
@@ -1243,6 +1678,16 @@ export class WorldDO extends DurableObject<Env> {
       !snapshot.creations.some((c) => c.id === "comp-quarry-dump-truck")
     ) {
       this.runUpgradeV16OrganicWorld();
+    }
+    if (
+      Array.isArray(snapshot.creations) &&
+      snapshot.creations.some(
+        (c) =>
+          (c.id === "c-mvnf2juk-326f62" && /twin/i.test(c.name)) ||
+          (c.id === "c-mvnc7tlr-6784e6" && c.x < 100),
+      )
+    ) {
+      this.runUpgradeV17SimCityWorld();
     }
     const repairRes = this.auditAndRepairWorld();
     const after = this.readBaseWorld();
@@ -1573,6 +2018,8 @@ export class WorldDO extends DurableObject<Env> {
       phase,
       round1_ms: typeof r.round1_ms === "number" ? r.round1_ms : null,
       has_image: hasImg,
+      retry_count: Number(r.retry_count) || 0,
+      next_retry_at: Number(r.next_retry_at) || 0,
       prompt: String(r.prompt ?? ""),
       image_base64: typeof r.image_base64 === "string" ? r.image_base64 : null,
       image_mime: typeof r.image_mime === "string" ? r.image_mime : null,
@@ -1642,8 +2089,11 @@ export class WorldDO extends DurableObject<Env> {
     const history = this.readTelemetryHistory();
     const targetFeatures = classifyBuildFeatures(target.prompt, target.has_image === 1);
 
-    if (target.status === "sculpting") {
-      const elapsed = Math.max(0, now - (target.started_at ?? now));
+    if (target.status === "sculpting" || (target.status === "queued" && target.retry_count > 0)) {
+      const elapsed =
+        target.status === "queued" && target.retry_count > 0
+          ? 8_000
+          : Math.max(0, now - (target.started_at ?? now));
       const activePhase: "sculpting" | "reviewing" | "refining" =
         target.phase === "refining"
           ? "refining"
@@ -1992,13 +2442,32 @@ export class WorldDO extends DurableObject<Env> {
     const sql = this.ctx.storage.sql;
     let promoted = false;
 
+    // Auto-recover any stale sculpting row (> 150s without an active in-memory worker promise)
+    const nowPump = Date.now();
+    const staleSculptRows = sql
+      .exec(`SELECT job_id FROM build_jobs WHERE status = 'sculpting' AND started_at < ?`, nowPump - 150_000)
+      .toArray();
+    for (const sr of staleSculptRows) {
+      const staleId = String(sr.job_id);
+      if (!this.activeJobPromises.has(staleId)) {
+        sql.exec(
+          `UPDATE build_jobs
+           SET status = 'queued', phase = 'sculpting', retry_count = COALESCE(retry_count, 0) + 1, next_retry_at = 0
+           WHERE job_id = ?`,
+          staleId,
+        );
+      }
+    }
+
     while (this.activeJobPromises.size < MAX_CONCURRENT_SCULPTS) {
+      const nowReady = Date.now();
       const nextRows = sql
         .exec(
           `SELECT * FROM build_jobs
-           WHERE status = 'queued'
+           WHERE status = 'queued' AND COALESCE(next_retry_at, 0) <= ?
            ORDER BY created_at ASC, rowid ASC
            LIMIT 1`,
+          nowReady,
         )
         .toArray();
       if (nextRows.length === 0) break;
@@ -2035,7 +2504,18 @@ export class WorldDO extends DurableObject<Env> {
       sql.exec(`SELECT COUNT(*) AS c FROM integration_queue`).toArray()[0]?.c ?? 0,
     );
     if (this.activeJobPromises.size > 0 || remainingQueued > 0 || remainingIntegrations > 0) {
-      await this.ctx.storage.setAlarm(Date.now() + 1200);
+      const nextRetryRow = sql
+        .exec(
+          `SELECT MIN(COALESCE(next_retry_at, 0)) AS min_at FROM build_jobs WHERE status = 'queued' AND COALESCE(next_retry_at, 0) > ?`,
+          Date.now(),
+        )
+        .toArray()[0];
+      const minRetryAt = Number(nextRetryRow?.min_at) || 0;
+      const alarmAt =
+        minRetryAt > Date.now() && this.activeJobPromises.size === 0 && remainingIntegrations === 0
+          ? Math.max(Date.now() + 400, minRetryAt)
+          : Date.now() + 1200;
+      await this.ctx.storage.setAlarm(alarmAt);
     }
   }
 
@@ -2121,18 +2601,40 @@ export class WorldDO extends DurableObject<Env> {
       );
 
       if (!sculpted.ok) {
+        if (sculpted.unsafe) {
+          sql.exec(
+            `UPDATE build_jobs
+             SET status = 'failed', finished_at = ?, error_msg = ?, error_detail = ?, image_base64 = NULL
+             WHERE job_id = ?`,
+            Date.now(),
+            sculpted.error || "Please try creating something family-friendly.",
+            sculpted.errorDetail
+              ? redactSecrets(sculpted.errorDetail, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET])
+              : null,
+            job.job_id,
+          );
+          this.broadcastQueueTick();
+          return;
+        }
+
+        // Transient timeout / upstream overload: NEVER surface an "Argon took too long" error!
+        // Keep image_base64 intact and re-queue via DO alarm until sculpting succeeds.
+        const nextRetries = (job.retry_count || 0) + 1;
+        const retryDelayMs = Math.min(8_000, 1_500 * nextRetries);
         sql.exec(
           `UPDATE build_jobs
-           SET status = 'failed', finished_at = ?, error_msg = ?, error_detail = ?, image_base64 = NULL
+           SET status = 'queued', phase = 'sculpting', retry_count = ?, next_retry_at = ?, started_at = ?, error_detail = ?
            WHERE job_id = ?`,
+          nextRetries,
+          Date.now() + retryDelayMs,
           Date.now(),
-          sculpted.error || "Could not sculpt creation.",
           sculpted.errorDetail
             ? redactSecrets(sculpted.errorDetail, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET])
             : null,
           job.job_id,
         );
         this.broadcastQueueTick();
+        await this.ctx.storage.setAlarm(Date.now() + retryDelayMs);
         return;
       }
 
@@ -2188,17 +2690,21 @@ export class WorldDO extends DurableObject<Env> {
       this.broadcastQueueTick();
     } catch (err) {
       const redactedDetail = redactSecrets(err, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET]);
-      safeLogError("build_queue_worker", err, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET]);
+      safeLogError("build_queue_worker_retrying", err, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET]);
+      const nextRetries = (job.retry_count || 0) + 1;
+      const retryDelayMs = Math.min(8_000, 1_500 * nextRetries);
       sql.exec(
         `UPDATE build_jobs
-         SET status = 'failed', finished_at = ?, error_msg = ?, error_detail = ?, image_base64 = NULL
+         SET status = 'queued', phase = 'sculpting', retry_count = ?, next_retry_at = ?, started_at = ?, error_detail = ?
          WHERE job_id = ?`,
+        nextRetries,
+        Date.now() + retryDelayMs,
         Date.now(),
-        "Argon took a moment too long building that — please try once more.",
         redactedDetail,
         job.job_id,
       );
       this.broadcastQueueTick();
+      await this.ctx.storage.setAlarm(Date.now() + retryDelayMs);
     }
   }
 
@@ -2268,76 +2774,19 @@ export class WorldDO extends DurableObject<Env> {
     newRadius: number,
     world: Omit<WorldStateSnapshot, "myCreationId">,
     ignoreId?: string,
+    scaleClass: WorldCreation["scaleClass"] = "medium",
+    contextText = "",
   ): [number, number] {
-    if (typeof reqX === "number" && Number.isFinite(reqX) && typeof reqZ === "number" && Number.isFinite(reqZ)) {
-      const cx = Math.max(-135, Math.min(135, reqX));
-      const cz = Math.max(-135, Math.min(135, reqZ));
-      if (this.isSpotClear(cx, cz, category, newRadius, world, ignoreId)) {
-        return [Number(cx.toFixed(1)), Number(cz.toFixed(1))];
-      }
-      // Spiral outward from the visitor's chosen spot so massive volcanoes smoothly claim the nearest spacious clearing
-      const baseAngle = Math.atan2(cz, cx);
-      for (let r = 3.0; r <= 88; r += 2.8) {
-        for (let k = 0; k < 20; k++) {
-          const ang = baseAngle + (k / 20) * Math.PI * 2;
-          const tx = cx + Math.cos(ang) * r;
-          const tz = cz + Math.sin(ang) * r;
-          if (this.isSpotClear(tx, tz, category, newRadius, world, ignoreId)) {
-            return [Number(tx.toFixed(1)), Number(tz.toFixed(1))];
-          }
-        }
-      }
-    }
-
-    // First prefer natural roadside frontage plots along established paved roads, cottage lanes, and cobbles
-    // so new cottages/shops form organic winding neighborhoods rather than isolated scattered dots.
-    if ((category === "building" || category === "prop") && newRadius < 8.5) {
-      const frontagePaths = world.paths.filter(
-        (p) =>
-          (p.kind === "road" || p.kind === "cottage_road" || p.kind === "cobblestone") &&
-          p.points.length >= 2,
-      );
-      for (let pi = 0; pi < frontagePaths.length; pi++) {
-        const p = frontagePaths[(pi + world.creations.length) % frontagePaths.length];
-        const curve = sampleCatmullRom2D(p.points, Boolean(p.closed), 5.5);
-        const halfRoad = p.kind === "road" ? 3.2 : 2.0;
-        const setback = halfRoad + newRadius + 2.6;
-        for (let si = 1; si < curve.length - 1; si++) {
-          const idx = (si * 7 + world.creations.length * 3) % Math.max(1, curve.length - 1);
-          const pt = curve[idx];
-          const nxPt = curve[Math.min(curve.length - 1, idx + 1)];
-          const pvPt = curve[Math.max(0, idx - 1)];
-          const dx = nxPt[0] - pvPt[0];
-          const dz = nxPt[1] - pvPt[1];
-          const segLen = Math.hypot(dx, dz);
-          if (segLen < 0.05) continue;
-          const perpX = -dz / segLen;
-          const perpZ = dx / segLen;
-          for (const side of [1, -1]) {
-            const tx = pt[0] + perpX * setback * side;
-            const tz = pt[1] + perpZ * setback * side;
-            const radial = Math.hypot(tx, tz);
-            if (radial < 26 || radial > 102) continue;
-            if (this.isSpotClear(tx, tz, category, newRadius, world, ignoreId)) {
-              return [Number(tx.toFixed(1)), Number(tz.toFixed(1))];
-            }
-          }
-        }
-      }
-    }
-
-    // Golden-angle spiral around the island perimeter, starting further out for colossal landmarks
-    const startR = newRadius >= 8.5 ? 42 : category === "building" ? 28 : 14;
-    for (let i = 0; i < 260; i++) {
-      const r = startR + Math.sqrt(i) * 5.6;
-      const theta = i * 2.399963;
-      const tx = Math.cos(theta) * r;
-      const tz = Math.sin(theta) * r;
-      if (this.isSpotClear(tx, tz, category, newRadius, world, ignoreId)) {
-        return [Number(tx.toFixed(1)), Number(tz.toFixed(1))];
-      }
-    }
-    return [46, -42];
+    return chooseSimCityPlot({
+      reqX,
+      reqZ,
+      category,
+      scaleClass,
+      newRadius,
+      contextText,
+      world,
+      isSpotClear: (tx, tz) => this.isSpotClear(tx, tz, category, newRadius, world, ignoreId),
+    });
   }
 
   private applyWorldPatch(patch: WorldPatch): void {
@@ -2592,20 +3041,49 @@ export class WorldDO extends DurableObject<Env> {
       bp.stats.footprintZ,
     );
     const worldBefore = this.readBaseWorld();
-    const [x, z] = this.chooseMeadowSpot(input.x, input.z, bp.category, newRadius, worldBefore);
+    const cleanPrompt = sanitizePlainText(input.creatorPrompt, 240, true);
+    const cleanDesc = normalizeFactualDescription(bp.description);
+    bp.description = cleanDesc;
+    const contextText = `${bp.name} ${cleanDesc} ${cleanPrompt}`;
+    const [x, z] = this.chooseMeadowSpot(
+      input.x,
+      input.z,
+      bp.category,
+      newRadius,
+      worldBefore,
+      undefined,
+      bp.scaleClass,
+      contextText,
+    );
+    const now = Date.now();
+    const id = `c-${now.toString(36)}-${crypto.randomUUID().replace(/-/g, "").slice(0, 6)}`;
+    const draftForYaw: WorldCreation = {
+      id,
+      name: bp.name,
+      description: cleanDesc,
+      ...(cleanPrompt ? { creatorPrompt: cleanPrompt } : {}),
+      category: bp.category,
+      scaleClass: bp.scaleClass,
+      x,
+      z,
+      yaw: 0,
+      blueprint: bp,
+      behavior: { type: "landmark", facingYaw: 0, activity: "landmark", statusLine: cleanDesc },
+      integratedLevel: 0,
+      createdAt: now,
+    };
+    const smartInitialYaw = computeIntelligentBuildingYaw(draftForYaw, worldBefore.paths);
     const yaw =
       typeof input.yaw === "number" && Number.isFinite(input.yaw)
         ? input.yaw
-        : Number(Math.atan2(-x, -z).toFixed(2));
+        : smartInitialYaw !== null
+          ? smartInitialYaw
+          : 0;
 
-    const now = Date.now();
-    const id = `c-${now.toString(36)}-${crypto.randomUUID().replace(/-/g, "").slice(0, 6)}`;
-
-    const cleanPrompt = sanitizePlainText(input.creatorPrompt, 240, true);
     const creation: WorldCreation = {
       id,
       name: bp.name,
-      description: bp.description,
+      description: cleanDesc,
       ...(cleanPrompt ? { creatorPrompt: cleanPrompt } : {}),
       category: bp.category,
       scaleClass: bp.scaleClass,
@@ -2617,8 +3095,8 @@ export class WorldDO extends DurableObject<Env> {
       behavior: {
         type: "landmark",
         facingYaw: yaw,
-        activity: "arriving on GeminIsland",
-        statusLine: "Just arrived — Argon is weaving it into GeminIsland...",
+        activity: "landmark",
+        statusLine: cleanDesc || bp.name,
       },
       integratedLevel: 0,
       createdAt: now,

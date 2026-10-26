@@ -1566,6 +1566,17 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     return w / h < 0.78 ? 0.82 : 1.02;
   }
 
+  function getBaseFpFov() {
+    const w = canvas.clientWidth || window.innerWidth || 1280;
+    const h = Math.max(1, canvas.clientHeight || window.innerHeight || 800);
+    return w / h < 0.8 ? 72 : 62;
+  }
+
+  function smootherstep01(raw) {
+    const u = Math.max(0, Math.min(1, raw));
+    return u * u * u * (u * (u * 6 - 15) + 10);
+  }
+
   function wrapPi(rad) {
     let a = rad;
     while (a > Math.PI) a -= Math.PI * 2;
@@ -1586,14 +1597,24 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   const introSweep = {
     active: runIntroOnBoot,
     elapsed: 0,
-    holdSec: 0.16,
-    durationSec: 2.15,
-    fromTx: 2.2,
-    fromTy: 3.1,
-    fromTz: -9.5,
-    fromZoom: 2.45,
-    fromAz: HOME_AZ - 1.85,
-    fromEl: 0.145,
+    holdSec: 0.55,
+    panDurSec: 1.9,
+    orbitDurSec: 3.7,
+    walkDurSec: 2.05,
+    fromTx: CITY_SIGN_POS[0],
+    fromTy: 2.38,
+    fromTz: CITY_SIGN_POS[1],
+    fromZoom: 2.95,
+    fromAz: HOME_AZ - 0.12,
+    fromEl: 0.155,
+    firedPan: false,
+    firedOrbit: false,
+    firedWalk: false,
+    usingFpCam: false,
+    walkX: 10.6,
+    walkZ: -0.6,
+    walkYaw: 0.43,
+    walkPitch: 0.045,
   };
 
   const cam = {
@@ -1611,9 +1632,51 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     goalEl: HOME_EL,
   };
 
-  function cancelIntroSweep() {
+  function cancelIntroSweep(requestedMode = null) {
     if (!introSweep.active) return;
+    const wasFpSwoop = introSweep.usingFpCam;
     introSweep.active = false;
+    introSweep.usingFpCam = false;
+    fpCamera.fov = getBaseFpFov();
+    fpCamera.updateProjectionMatrix();
+
+    if (wasFpSwoop) {
+      if (requestedMode === "pan" || requestedMode === "orbit") {
+        skyDome.visible = false;
+        syncComposerCamera(camera);
+        cam.az = cam.goalAz = HOME_AZ;
+        cam.el = cam.goalEl = HOME_EL;
+        cam.tx = cam.goalTx = HOME_TX;
+        cam.ty = cam.goalTy = 0;
+        cam.tz = cam.goalTz = HOME_TZ;
+        cam.zoom = cam.goalZoom = getHomeZoom();
+      } else {
+        const [rx, rz] = resolveWalkPosition(introSweep.walkX, introSweep.walkZ);
+        fp.x = rx;
+        fp.z = rz;
+        fp.y = FP_EYE_HEIGHT;
+        fp.yaw = fp.goalYaw = introSweep.walkYaw;
+        fp.pitch = fp.goalPitch = introSweep.walkPitch;
+        fp.vx = 0;
+        fp.vz = 0;
+        fp.jumpY = 0;
+        fp.jumpVy = 0;
+        fp.settleT = 1;
+        fp.active = true;
+        dragMode = "walk";
+        skyDome.visible = true;
+        skyDome.position.set(fp.x, 0, fp.z);
+        fpCamera.position.set(fp.x, fp.y, fp.z);
+        fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
+        fpCamera.updateMatrixWorld();
+        syncComposerCamera(fpCamera);
+        canvas.style.cursor = idleCursor();
+        callbacks.onDragModeChange?.("walk");
+      }
+      return;
+    }
+
+    cam.az = HOME_AZ + wrapPi(cam.az - HOME_AZ);
     cam.goalTx = cam.tx;
     cam.goalTy = lowAngleTargetY(cam.el);
     cam.goalTz = cam.tz;
@@ -1745,9 +1808,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       data: {
         id: "__city_sign__",
         name: "GeminIsland Sign",
-        description: `${n} ${n === 1 ? "person has" : "people have"} contributed (${total} creations on the island)`,
+        description: `Timber town signboard displaying ${n} ${n === 1 ? "contributor" : "contributors"} and ${total} creations.`,
         behavior: {
-          statusLine: `${n} ${n === 1 ? "person has" : "people have"} contributed to GeminIsland`,
+          statusLine: `${n} ${n === 1 ? "contributor" : "contributors"} · ${total} creations`,
         },
       },
     };
@@ -2193,6 +2256,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
   function setSpotPickerState(next) {
     const mode = next?.mode || "hidden";
+    if (mode !== "hidden") {
+      cancelIntroSweep("pan");
+    }
     let nx = typeof next?.x === "number" ? next.x : spotState.x;
     let nz = typeof next?.z === "number" ? next.z : spotState.z;
     if (mode === "picking" && typeof next?.x !== "number") {
@@ -2441,6 +2507,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
   function setDragMode(mode) {
     const next = mode === "walk" ? "walk" : mode === "orbit" ? "orbit" : "pan";
+    cancelIntroSweep(next);
     if (next === "walk") {
       dragMode = "walk";
       enterFirstPerson();
@@ -3040,13 +3107,15 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     camera.bottom = -BASE_FRUSTUM;
     camera.updateProjectionMatrix();
     fpCamera.aspect = aspect;
-    fpCamera.fov = aspect < 0.8 ? 72 : 62;
+    if (!introSweep.usingFpCam) {
+      fpCamera.fov = aspect < 0.8 ? 72 : 62;
+    }
     fpCamera.updateProjectionMatrix();
     if (composer) {
       composer.setSize(w, h);
       gtaoPass?.setSize(w, h);
       smaaPass?.setSize(w, h);
-      syncComposerCamera(fp.active ? fpCamera : camera);
+      syncComposerCamera(fp.active || introSweep.usingFpCam ? fpCamera : camera);
     }
     if (ogMode && currentWorld) {
       frameActiveWorldForOg();
@@ -3211,7 +3280,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       grassUniforms.uHorizonRange.value.set(96, 238);
       updateTexelSnappedSun(fp.x + fwdX * 18, fp.z + fwdZ * 18);
     } else {
-      skyDome.visible = false;
+      let handledByFpSwoop = false;
       if (introSweep.active) {
         if (currentWorld || bootWaitElapsed > 0.45) {
           introSweep.elapsed += dt;
@@ -3219,25 +3288,179 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           bootWaitElapsed += dt;
         }
         const homeZ = getHomeZoom();
+        const overviewZoom = homeZ * 0.88;
         cam.goalZoom = homeZ;
-        const rawU = Math.max(0, (introSweep.elapsed - introSweep.holdSec) / introSweep.durationSec);
-        if (rawU >= 1) {
-          introSweep.active = false;
-          cam.tx = cam.goalTx = HOME_TX;
-          cam.ty = cam.goalTy = 0;
-          cam.tz = cam.goalTz = HOME_TZ;
-          cam.zoom = cam.goalZoom = homeZ;
-          cam.az = cam.goalAz = HOME_AZ;
-          cam.el = cam.goalEl = HOME_EL;
-        } else {
-          // Quintic smootherstep for silky ground-level takeoff & gentle landing
-          const e = rawU * rawU * rawU * (rawU * (rawU * 6 - 15) + 10);
+
+        const panStart = introSweep.holdSec;
+        const orbitStart = panStart + introSweep.panDurSec;
+        const walkStart = orbitStart + introSweep.orbitDurSec;
+
+        if (introSweep.elapsed < panStart) {
+          // Stage 0: Hold close on the GeminIsland Contributor Sign
+          cam.tx = introSweep.fromTx;
+          cam.ty = introSweep.fromTy;
+          cam.tz = introSweep.fromTz;
+          cam.zoom = introSweep.fromZoom;
+          cam.az = introSweep.fromAz;
+          cam.el = introSweep.fromEl;
+        } else if (introSweep.elapsed < orbitStart) {
+          // Stage 1: Click "Pan" button & pan/zoom out from the Sign to the SimCity aerial overview
+          if (!introSweep.firedPan) {
+            introSweep.firedPan = true;
+            dragMode = "pan";
+            callbacks.onIntroDemoStep?.("pan");
+          }
+          const e = smootherstep01((introSweep.elapsed - panStart) / introSweep.panDurSec);
           cam.tx = introSweep.fromTx + (HOME_TX - introSweep.fromTx) * e;
           cam.ty = introSweep.fromTy + (0 - introSweep.fromTy) * e;
           cam.tz = introSweep.fromTz + (HOME_TZ - introSweep.fromTz) * e;
-          cam.zoom = introSweep.fromZoom + (homeZ - introSweep.fromZoom) * e;
+          cam.zoom = introSweep.fromZoom + (overviewZoom - introSweep.fromZoom) * e;
           cam.az = introSweep.fromAz + (HOME_AZ - introSweep.fromAz) * e;
           cam.el = introSweep.fromEl + (HOME_EL - introSweep.fromEl) * e;
+        } else if (introSweep.elapsed < walkStart) {
+          // Stage 2: Click "Orbit" button & sweep a full 360° around the town
+          if (!introSweep.firedOrbit) {
+            introSweep.firedOrbit = true;
+            dragMode = "orbit";
+            callbacks.onIntroDemoStep?.("orbit");
+          }
+          const e = smootherstep01((introSweep.elapsed - orbitStart) / introSweep.orbitDurSec);
+          cam.tx = HOME_TX;
+          cam.ty = 0;
+          cam.tz = HOME_TZ;
+          cam.zoom = overviewZoom;
+          cam.az = HOME_AZ + Math.PI * 2 * e;
+          cam.el = HOME_EL - Math.sin(e * Math.PI) * 0.08;
+        } else {
+          // Stage 3: Click "Walk" button & swoop seamlessly into 1st-person street mode
+          if (!introSweep.firedWalk) {
+            introSweep.firedWalk = true;
+            const [wx, wz] = resolveWalkPosition(10.6, -0.6);
+            introSweep.walkX = wx;
+            introSweep.walkZ = wz;
+            introSweep.walkYaw = Math.atan2(-(2.4 - wx), -(-18.5 - wz));
+            introSweep.walkPitch = 0.045;
+            introSweep.usingFpCam = true;
+            dragMode = "walk";
+            callbacks.onIntroDemoStep?.("walk");
+          }
+
+          const rawW = (introSweep.elapsed - walkStart) / introSweep.walkDurSec;
+          if (rawW < 1) {
+            handledByFpSwoop = true;
+            const e = smootherstep01(rawW);
+            const fov0 = 14;
+            const fov1 = getBaseFpFov();
+            const curFov = fov0 + (fov1 - fov0) * (e * e);
+            const lookDist1 = 14.0;
+            const h0 = BASE_FRUSTUM / overviewZoom;
+            const h1 = lookDist1 * Math.tan(THREE.MathUtils.degToRad(fov1 * 0.5));
+            const curH = h0 * Math.pow(h1 / h0, e);
+            const curDist = curH / Math.tan(THREE.MathUtils.degToRad(curFov * 0.5));
+
+            const wYaw = introSweep.walkYaw;
+            const wPitch = introSweep.walkPitch;
+            const fwd1X = -Math.sin(wYaw) * Math.cos(wPitch);
+            const fwd1Y = Math.sin(wPitch);
+            const fwd1Z = -Math.cos(wYaw) * Math.cos(wPitch);
+            const t1X = introSweep.walkX + fwd1X * lookDist1;
+            const t1Y = FP_EYE_HEIGHT + fwd1Y * lookDist1;
+            const t1Z = introSweep.walkZ + fwd1Z * lookDist1;
+
+            const curTx = HOME_TX + (t1X - HOME_TX) * e;
+            const curTy = t1Y * e;
+            const curTz = HOME_TZ + (t1Z - HOME_TZ) * e;
+            const curAz = HOME_AZ + wrapPi(wYaw - HOME_AZ) * e;
+            const curEl = HOME_EL + (-wPitch - HOME_EL) * e;
+
+            const px = curTx + Math.sin(curAz) * Math.cos(curEl) * curDist;
+            const py = curTy + Math.sin(curEl) * curDist;
+            const pz = curTz + Math.cos(curAz) * Math.cos(curEl) * curDist;
+
+            skyDome.visible = true;
+            skyDome.position.set(px, 0, pz);
+            fpCamera.fov = curFov;
+            fpCamera.position.set(px, py, pz);
+            fpCamera.rotation.set(-curEl, curAz, 0);
+            fpCamera.updateProjectionMatrix();
+            fpCamera.updateMatrixWorld();
+            syncComposerCamera(fpCamera);
+
+            focusWorldX = px;
+            focusWorldZ = pz;
+            activeAz = curAz;
+
+            const azDeltaFromHome = wrapPi(curAz - HOME_AZ);
+            if (
+              callbacks.onCameraChange &&
+              (Number.isNaN(lastReportedAz) || Math.abs(curAz - lastReportedAz) > 0.004)
+            ) {
+              lastReportedAz = curAz;
+              lastReportedHome = false;
+              callbacks.onCameraChange({
+                az: curAz,
+                el: -curEl,
+                zoom: 1,
+                tx: px,
+                tz: pz,
+                azDeltaFromHome,
+                isHome: false,
+                fpActive: false,
+              });
+            }
+
+            groundMesh.position.set(px, 0, pz);
+            grassUniforms.uFocusXZ.value.set(px, pz);
+            grassUniforms.uHorizonRange.value.set(96, 238);
+            updateTexelSnappedSun(curTx, curTz);
+          } else {
+            handledByFpSwoop = true;
+            introSweep.active = false;
+            introSweep.usingFpCam = false;
+            const [rx, rz] = resolveWalkPosition(introSweep.walkX, introSweep.walkZ);
+            fp.x = rx;
+            fp.z = rz;
+            fp.y = FP_EYE_HEIGHT;
+            fp.yaw = fp.goalYaw = introSweep.walkYaw;
+            fp.pitch = fp.goalPitch = introSweep.walkPitch;
+            fp.vx = 0;
+            fp.vz = 0;
+            fp.jumpY = 0;
+            fp.jumpVy = 0;
+            fp.settleT = 1;
+            fp.active = true;
+            dragMode = "walk";
+
+            cam.tx = cam.goalTx = HOME_TX;
+            cam.ty = cam.goalTy = 0;
+            cam.tz = cam.goalTz = HOME_TZ;
+            cam.zoom = cam.goalZoom = homeZ;
+            cam.az = cam.goalAz = HOME_AZ;
+            cam.el = cam.goalEl = HOME_EL;
+
+            skyDome.visible = true;
+            skyDome.position.set(fp.x, 0, fp.z);
+            fpCamera.fov = getBaseFpFov();
+            fpCamera.position.set(fp.x, fp.y, fp.z);
+            fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
+            fpCamera.updateProjectionMatrix();
+            fpCamera.updateMatrixWorld();
+            syncComposerCamera(fpCamera);
+            canvas.style.cursor = idleCursor();
+            callbacks.onDragModeChange?.("walk");
+
+            focusWorldX = fp.x;
+            focusWorldZ = fp.z;
+            activeAz = fp.yaw;
+            viewerPos = fp;
+            groundMesh.position.set(fp.x, 0, fp.z);
+            grassUniforms.uFocusXZ.value.set(fp.x, fp.z);
+            grassUniforms.uHorizonRange.value.set(96, 238);
+            updateTexelSnappedSun(
+              fp.x - Math.sin(fp.yaw) * 18,
+              fp.z - Math.cos(fp.yaw) * 18,
+            );
+          }
         }
       } else {
         const damp = 1 - Math.exp(-dt * 11);
@@ -3249,54 +3472,57 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         cam.el += (cam.goalEl - cam.el) * damp;
       }
 
-      const camDist = 240;
-      const horiz = Math.cos(cam.el) * camDist;
-      camera.position.set(
-        cam.tx + Math.sin(cam.az) * horiz,
-        cam.ty + Math.sin(cam.el) * camDist,
-        cam.tz + Math.cos(cam.az) * horiz,
-      );
-      camera.lookAt(cam.tx, cam.ty, cam.tz);
-      camera.zoom = cam.zoom;
-      camera.updateProjectionMatrix();
+      if (!handledByFpSwoop) {
+        skyDome.visible = false;
+        const camDist = 240;
+        const horiz = Math.cos(cam.el) * camDist;
+        camera.position.set(
+          cam.tx + Math.sin(cam.az) * horiz,
+          cam.ty + Math.sin(cam.el) * camDist,
+          cam.tz + Math.cos(cam.az) * horiz,
+        );
+        camera.lookAt(cam.tx, cam.ty, cam.tz);
+        camera.zoom = cam.zoom;
+        camera.updateProjectionMatrix();
 
-      const azDeltaFromHome = wrapPi(cam.az - HOME_AZ);
-      const isHome =
-        !introSweep.active &&
-        Math.abs(azDeltaFromHome) < 0.03 &&
-        Math.abs(cam.el - HOME_EL) < 0.03 &&
-        Math.abs(cam.zoom - getHomeZoom()) < 0.04 &&
-        Math.hypot(cam.tx - HOME_TX, cam.tz - HOME_TZ) < 1.2;
+        const azDeltaFromHome = wrapPi(cam.az - HOME_AZ);
+        const isHome =
+          !introSweep.active &&
+          Math.abs(azDeltaFromHome) < 0.03 &&
+          Math.abs(cam.el - HOME_EL) < 0.03 &&
+          Math.abs(cam.zoom - getHomeZoom()) < 0.04 &&
+          Math.hypot(cam.tx - HOME_TX, cam.tz - HOME_TZ) < 1.2;
 
-      if (
-        callbacks.onCameraChange &&
-        (Number.isNaN(lastReportedAz) ||
-          Math.abs(cam.az - lastReportedAz) > 0.004 ||
-          isHome !== lastReportedHome)
-      ) {
-        lastReportedAz = cam.az;
-        lastReportedHome = isHome;
-        callbacks.onCameraChange({
-          az: cam.az,
-          el: cam.el,
-          zoom: cam.zoom,
-          tx: cam.tx,
-          tz: cam.tz,
-          azDeltaFromHome,
-          isHome,
-          fpActive: false,
-        });
+        if (
+          callbacks.onCameraChange &&
+          (Number.isNaN(lastReportedAz) ||
+            Math.abs(cam.az - lastReportedAz) > 0.004 ||
+            isHome !== lastReportedHome)
+        ) {
+          lastReportedAz = cam.az;
+          lastReportedHome = isHome;
+          callbacks.onCameraChange({
+            az: cam.az,
+            el: cam.el,
+            zoom: cam.zoom,
+            tx: cam.tx,
+            tz: cam.tz,
+            azDeltaFromHome,
+            isHome,
+            fpActive: false,
+          });
+        }
+
+        groundMesh.position.set(cam.tx, 0, cam.tz);
+        grassUniforms.uFocusXZ.value.set(cam.tx, cam.tz);
+        const lowHorizonT = Math.max(0, Math.min(1, (cam.el - 0.14) / 0.24));
+        const lowHorizonSmooth = lowHorizonT * lowHorizonT * (3 - 2 * lowHorizonT);
+        grassUniforms.uHorizonRange.value.set(
+          72 + (145 - 72) * lowHorizonSmooth,
+          142 + (295 - 142) * lowHorizonSmooth,
+        );
+        updateTexelSnappedSun(cam.tx, cam.tz);
       }
-
-      groundMesh.position.set(cam.tx, 0, cam.tz);
-      grassUniforms.uFocusXZ.value.set(cam.tx, cam.tz);
-      const lowHorizonT = Math.max(0, Math.min(1, (cam.el - 0.14) / 0.24));
-      const lowHorizonSmooth = lowHorizonT * lowHorizonT * (3 - 2 * lowHorizonT);
-      grassUniforms.uHorizonRange.value.set(
-        72 + (145 - 72) * lowHorizonSmooth,
-        142 + (295 - 142) * lowHorizonSmooth,
-      );
-      updateTexelSnappedSun(cam.tx, cam.tz);
     }
 
     const allEnts = Array.from(creationEntities.values());
@@ -3356,7 +3582,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     }
 
     if (composer) composer.render();
-    else renderer.render(scene, fp.active ? fpCamera : camera);
+    else renderer.render(scene, fp.active || introSweep.usingFpCam ? fpCamera : camera);
 
     if (ogMode && currentWorld) {
       ogSettledFrames++;

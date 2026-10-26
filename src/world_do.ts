@@ -1514,6 +1514,21 @@ export class WorldDO extends DurableObject<Env> {
     for (const row of creationRows) {
       const cid = String(row.id);
       const parsed = JSON.parse(String(row.json)) as WorldCreation;
+      const copy = FACTUAL_CREATION_DESCRIPTIONS[cid];
+      let copyUpdated = false;
+      if (copy && (parsed.description !== copy.description || parsed.behavior?.statusLine !== copy.statusLine)) {
+        parsed.description = copy.description;
+        if (parsed.blueprint) {
+          parsed.blueprint.description = copy.description;
+        }
+        if (parsed.behavior) {
+          parsed.behavior = {
+            ...parsed.behavior,
+            statusLine: copy.statusLine,
+          };
+        }
+        copyUpdated = true;
+      }
       const audit = auditBlueprintOverlaps(parsed.blueprint);
       if (!audit.clean) {
         const healed = autoRepairBlueprintOverlaps(parsed.blueprint);
@@ -1522,6 +1537,9 @@ export class WorldDO extends DurableObject<Env> {
         repairs.push(
           `${parsed.name} (${cid}): ${healed.repairsApplied.join("; ") || "cleared voxel overlap"}`,
         );
+      } else if (copyUpdated) {
+        sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(parsed), cid);
+        repairs.push(`${parsed.name} (${cid}): synced purpose description`);
       }
       creations.push(parsed);
     }

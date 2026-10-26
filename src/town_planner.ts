@@ -529,8 +529,12 @@ export const FACTUAL_CREATION_DESCRIPTIONS: Record<string, { description: string
     statusLine: "Sci-fi puzzle labyrinth on the northern frontier",
   },
   "c-mvoqwq7n-086aec": {
-    description: "Electric pickup truck cruising around the northern datacentre and civic avenue grid.",
-    statusLine: "Cruising the northern tech boulevard",
+    description: "Electric pickup truck cruising the island's outer neighborhood lanes.",
+    statusLine: "Cruising the western neighborhood lanes",
+  },
+  "c-mvormrg7-af85ff": {
+    description: "Coastal reef lagoon and lighthouse cove guiding boats along the southern shore.",
+    statusLine: "Lighthouse cove guiding boats along the southern reef",
   },
 };
 

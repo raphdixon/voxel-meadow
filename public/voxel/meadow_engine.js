@@ -867,6 +867,10 @@ class CreationSimEntity {
 
     this.wanderIdx = 0;
     this.wanderPause = (index * 1.3) % 2.5;
+    this.wanderStuckSec = 0;
+    this.wanderCheckX = this.x;
+    this.wanderCheckZ = this.z;
+    this.wanderAvoidSide = index % 2 === 0 ? 1 : -1;
     this.hopPhase = 0;
 
     this.orbitAngle = (index * 1.9) % (Math.PI * 2);
@@ -1111,6 +1115,7 @@ class CreationSimEntity {
     } else if (b?.type === "wander") {
       const isGlide = b.style === "glide";
       const glideBaseY = b.hoverHeight || 1.9;
+      const selfPad = Math.min(3.8, Math.max(0.85, (this.footprintRadius || 1.5) * 0.48));
       const targets =
         b.targets && b.targets.length
           ? b.targets
@@ -1123,49 +1128,167 @@ class CreationSimEntity {
         this.wanderPause -= dt;
         this.y = isGlide ? glideBaseY + Math.sin(t * 2.2 + this.index) * 0.22 : 0;
         this.moveFactor = isGlide ? 0.5 : 0;
+        this.wanderStuckSec = 0;
+        this.wanderCheckX = this.x;
+        this.wanderCheckZ = this.z;
       } else {
+        // Auto-skip any target that sits inside a pond or stationary building/landmark footprint
+        for (let skipTry = 0; skipTry < targets.length; skipTry++) {
+          const cand = targets[this.wanderIdx % targets.length];
+          let blocked = false;
+          if (!isGlide) {
+            for (const pond of ponds) {
+              const pr = (pond.radius || 6.4) + selfPad * 0.6 + 0.8;
+              if (Math.hypot(cand[0] - pond.x, cand[1] - pond.z) < pr + 0.55) {
+                blocked = true;
+                break;
+              }
+            }
+          }
+          if (!blocked) {
+            for (const other of allEntities) {
+              if (other === this) continue;
+              if (other.data.category !== "building" && other.data.behavior?.type !== "landmark") continue;
+              const br = (other.footprintRadius || 4.0) + selfPad + 0.95;
+              if (Math.hypot(cand[0] - other.x, cand[1] - other.z) < br + 0.55) {
+                blocked = true;
+                break;
+              }
+            }
+          }
+          if (!blocked) break;
+          this.wanderIdx = (this.wanderIdx + 1) % targets.length;
+        }
+
         const tgt = targets[this.wanderIdx % targets.length];
         const dx = tgt[0] - this.x;
         const dz = tgt[1] - this.z;
         const dist = Math.hypot(dx, dz);
-        if (dist < 0.55) {
+        const reachTol = Math.max(0.65, selfPad * 0.35);
+        if (dist < reachTol) {
           this.wanderIdx = (this.wanderIdx + 1) % targets.length;
           this.wanderPause = isGlide ? 0.6 : 1.5 + (this.wanderIdx % 2) * 0.8;
+          this.wanderStuckSec = 0;
+          this.wanderCheckX = this.x;
+          this.wanderCheckZ = this.z;
           this.y = isGlide ? glideBaseY + Math.sin(t * 2.2 + this.index) * 0.22 : 0;
         } else {
-          const stepLen = Math.min(dist, (b.speed || 2.8) * dt);
-          this.x += (dx / dist) * stepLen;
-          this.z += (dz / dist) * stepLen;
+          const prevX = this.x;
+          const prevZ = this.z;
+          const ux = dx / dist;
+          const uz = dz / dist;
+
+          // Proactive tangential steering around blocking buildings, quarries, and ponds
+          let steerX = ux;
+          let steerZ = uz;
+          const lookAhead = Math.min(dist, Math.max(6.0, selfPad * 2.4 + 4.5));
+
+          const applyAvoidance = (obsX, obsZ, clearR) => {
+            const ox = obsX - this.x;
+            const oz = obsZ - this.z;
+            const od = Math.hypot(ox, oz);
+            if (od < 0.01 || od > lookAhead + clearR) return;
+            const fwd = ox * ux + oz * uz;
+            const lat = ox * -uz + oz * ux;
+            const corridor = clearR + 1.5;
+            if (fwd > -clearR * 0.35 && Math.abs(lat) < corridor) {
+              // Pick passing side: steer away from obstacle center, or inward from world edge if near dead-center
+              let side;
+              if (Math.abs(lat) > 0.45) {
+                side = lat > 0 ? -1 : 1;
+              } else {
+                const leftCandX = obsX + -uz * clearR;
+                const leftCandZ = obsZ + ux * clearR;
+                const rightCandX = obsX - -uz * clearR;
+                const rightCandZ = obsZ - ux * clearR;
+                const leftDistCenter = Math.hypot(leftCandX, leftCandZ);
+                const rightDistCenter = Math.hypot(rightCandX, rightCandZ);
+                side =
+                  Math.abs(leftDistCenter - rightDistCenter) > 4.0
+                    ? leftDistCenter < rightDistCenter
+                      ? 1
+                      : -1
+                    : this.wanderAvoidSide;
+              }
+              const urgency = Math.max(
+                0,
+                Math.min(1.6, ((corridor - Math.abs(lat)) / corridor) * (1.25 - Math.max(0, od - clearR) / lookAhead)),
+              );
+              steerX += -uz * side * urgency * 1.45;
+              steerZ += ux * side * urgency * 1.45;
+            }
+          };
 
           if (!isGlide) {
             for (const pond of ponds) {
-              const pr = (pond.radius || 6.4) + 0.9;
-              const pdx = this.x - pond.x;
-              const pdz = this.z - pond.z;
-              const pd = Math.hypot(pdx, pdz);
-              if (pd < pr && pd > 0.01) {
-                this.x = pond.x + (pdx / pd) * pr;
-                this.z = pond.z + (pdz / pd) * pr;
-              }
+              applyAvoidance(pond.x, pond.z, (pond.radius || 6.4) + selfPad * 0.6 + 0.8);
             }
           }
           for (const other of allEntities) {
             if (other === this) continue;
             if (other.data.category !== "building" && other.data.behavior?.type !== "landmark") continue;
-            const br = (other.footprintRadius || 4.0) + 1.1;
-            const bdx = this.x - other.x;
-            const bdz = this.z - other.z;
-            const bd = Math.hypot(bdx, bdz);
-            if (bd < br && bd > 0.01) {
-              this.x = other.x + (bdx / bd) * br;
-              this.z = other.z + (bdz / bd) * br;
+            applyAvoidance(other.x, other.z, (other.footprintRadius || 4.0) + selfPad + 0.95);
+          }
+
+          const steerLen = Math.hypot(steerX, steerZ) || 1;
+          steerX /= steerLen;
+          steerZ /= steerLen;
+
+          const speed = b.speed || 2.8;
+          const stepLen = Math.min(dist, speed * dt);
+          this.x += steerX * stepLen;
+          this.z += steerZ * stepLen;
+
+          // Two-pass hard non-penetration resolution
+          for (let pass = 0; pass < 2; pass++) {
+            if (!isGlide) {
+              for (const pond of ponds) {
+                const pr = (pond.radius || 6.4) + selfPad * 0.6 + 0.8;
+                const pdx = this.x - pond.x;
+                const pdz = this.z - pond.z;
+                const pd = Math.hypot(pdx, pdz);
+                if (pd < pr && pd > 0.01) {
+                  this.x = pond.x + (pdx / pd) * pr;
+                  this.z = pond.z + (pdz / pd) * pr;
+                }
+              }
+            }
+            for (const other of allEntities) {
+              if (other === this) continue;
+              if (other.data.category !== "building" && other.data.behavior?.type !== "landmark") continue;
+              const br = (other.footprintRadius || 4.0) + selfPad + 0.95;
+              const bdx = this.x - other.x;
+              const bdz = this.z - other.z;
+              const bd = Math.hypot(bdx, bdz);
+              if (bd < br && bd > 0.01) {
+                this.x = other.x + (bdx / bd) * br;
+                this.z = other.z + (bdz / bd) * br;
+              }
+            }
+          }
+          this.x = Math.max(-142, Math.min(142, this.x));
+          this.z = Math.max(-142, Math.min(142, this.z));
+
+          // Progress watchdog: never march in place if boxed in by multiple obstacles
+          this.wanderStuckSec += dt;
+          if (this.wanderStuckSec >= 1.6) {
+            const netMoved = Math.hypot(this.x - this.wanderCheckX, this.z - this.wanderCheckZ);
+            this.wanderCheckX = this.x;
+            this.wanderCheckZ = this.z;
+            this.wanderStuckSec = 0;
+            if (netMoved < Math.max(0.55, speed * 0.28)) {
+              this.wanderAvoidSide *= -1;
+              this.wanderIdx = (this.wanderIdx + 1) % targets.length;
             }
           }
 
-          this.wheelAngle += stepLen / 0.45;
+          const actualDx = this.x - prevX;
+          const actualDz = this.z - prevZ;
+          const actualMove = Math.hypot(actualDx, actualDz);
+          this.wheelAngle += actualMove / 0.45;
           this.moveFactor = 1.0;
 
-          const desiredYaw = Math.atan2(dx, dz);
+          const desiredYaw = actualMove > 0.0004 ? Math.atan2(actualDx, actualDz) : Math.atan2(dx, dz);
           let dyaw = desiredYaw - this.yaw;
           while (dyaw > Math.PI) dyaw -= Math.PI * 2;
           while (dyaw < -Math.PI) dyaw += Math.PI * 2;
@@ -1638,6 +1761,8 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     introSweep.active = false;
     introSweep.usingFpCam = false;
     fpCamera.fov = getBaseFpFov();
+    fpCamera.near = 0.14;
+    fpCamera.far = 520;
     fpCamera.updateProjectionMatrix();
 
     if (wasFpSwoop) {
@@ -3378,16 +3503,20 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
             const pz = curTz + Math.cos(curAz) * Math.cos(curEl) * curDist;
 
             skyDome.visible = true;
-            skyDome.position.set(px, 0, pz);
+            skyDome.position.set(px, Math.max(0, py - FP_EYE_HEIGHT), pz);
             fpCamera.fov = curFov;
+            fpCamera.near = 0.14 + (18.0 - 0.14) * ((1 - e) * (1 - e));
+            fpCamera.far = 520 + 420 * (1 - e);
             fpCamera.position.set(px, py, pz);
             fpCamera.rotation.set(-curEl, curAz, 0);
             fpCamera.updateProjectionMatrix();
             fpCamera.updateMatrixWorld();
             syncComposerCamera(fpCamera);
 
-            focusWorldX = px;
-            focusWorldZ = pz;
+            const groundFocusX = HOME_TX + (introSweep.walkX - HOME_TX) * e;
+            const groundFocusZ = HOME_TZ + (introSweep.walkZ - HOME_TZ) * e;
+            focusWorldX = groundFocusX;
+            focusWorldZ = groundFocusZ;
             activeAz = curAz;
 
             const azDeltaFromHome = wrapPi(curAz - HOME_AZ);
@@ -3401,18 +3530,26 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
                 az: curAz,
                 el: -curEl,
                 zoom: 1,
-                tx: px,
-                tz: pz,
+                tx: groundFocusX,
+                tz: groundFocusZ,
                 azDeltaFromHome,
                 isHome: false,
                 fpActive: false,
               });
             }
 
-            groundMesh.position.set(px, 0, pz);
-            grassUniforms.uFocusXZ.value.set(px, pz);
-            grassUniforms.uHorizonRange.value.set(96, 238);
-            updateTexelSnappedSun(curTx, curTz);
+            groundMesh.position.set(groundFocusX, 0, groundFocusZ);
+            grassUniforms.uFocusXZ.value.set(groundFocusX, groundFocusZ);
+            grassUniforms.uHorizonRange.value.set(
+              145 + (96 - 145) * e,
+              295 + (238 - 295) * e,
+            );
+            const sunGoalX = introSweep.walkX - Math.sin(wYaw) * 18;
+            const sunGoalZ = introSweep.walkZ - Math.cos(wYaw) * 18;
+            updateTexelSnappedSun(
+              HOME_TX + (sunGoalX - HOME_TX) * e,
+              HOME_TZ + (sunGoalZ - HOME_TZ) * e,
+            );
           } else {
             handledByFpSwoop = true;
             introSweep.active = false;
@@ -3441,6 +3578,8 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
             skyDome.visible = true;
             skyDome.position.set(fp.x, 0, fp.z);
             fpCamera.fov = getBaseFpFov();
+            fpCamera.near = 0.14;
+            fpCamera.far = 520;
             fpCamera.position.set(fp.x, fp.y, fp.z);
             fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
             fpCamera.updateProjectionMatrix();

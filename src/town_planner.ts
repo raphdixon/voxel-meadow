@@ -3,10 +3,11 @@ import type {
   ScaleClass,
   WorldCreation,
   WorldPath,
+  WorldProp,
   WorldStateSnapshot,
 } from "./types";
 import { distPointToPolyline2D, sampleCatmullRom2D } from "./voxel_audit";
-import { detectBlueprintFrontAngle } from "./voxel_dsl";
+import { detectBlueprintFrontAngle, getCreationFootprintRadius } from "./voxel_dsl";
 
 export type TownPlanningRole =
   | "mobile"
@@ -487,4 +488,220 @@ export function normalizeFactualDescription(raw: string): string {
   );
   // Capitalize first letter cleanly
   return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/**
+ * Clean outer-meadow patrol anchors for Aegis Perimeter Titan (`c-mvogm9ja-6cd891`),
+ * circling the town while staying well clear of Borealis Mineral Quarry (`[118, -114]`),
+ * Interstellar Rocket Launchpad (`[0, -126]`), Emerald Cliff Waterfall (`[-14, 91]`),
+ * and outer neighborhood landmarks.
+ */
+export const PERIMETER_TITAN_SEED_LOOP: [number, number][] = [
+  [52, 118],
+  [-58, 76],
+  [-116, -8],
+  [-56, -112],
+  [44, -108],
+  [98, -92],
+  [116, -36],
+  [122, 24],
+];
+
+interface WanderObstacleCircle {
+  id: string;
+  x: number;
+  z: number;
+  clearR: number;
+}
+
+function clampCoord(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function closestOnSegment2D(
+  ax: number,
+  az: number,
+  bx: number,
+  bz: number,
+  cx: number,
+  cz: number,
+): { dist: number; t: number } {
+  const dx = bx - ax;
+  const dz = bz - az;
+  const len2 = dx * dx + dz * dz;
+  const t = len2 > 1e-6 ? clampCoord(((cx - ax) * dx + (cz - az) * dz) / len2, 0, 1) : 0;
+  const px = ax + dx * t;
+  const pz = az + dz * t;
+  return { dist: Math.hypot(cx - px, cz - pz), t };
+}
+
+function buildWanderObstacles(
+  walker: Pick<WorldCreation, "id" | "scaleClass" | "blueprint">,
+  style: string | undefined,
+  creations: WorldCreation[],
+  props: WorldProp[],
+): WanderObstacleCircle[] {
+  const selfR = getCreationFootprintRadius(
+    walker.scaleClass,
+    walker.blueprint?.stats?.footprintX ?? 14,
+    walker.blueprint?.stats?.footprintZ ?? 14,
+  );
+  const selfPad = Math.min(3.8, Math.max(0.85, selfR * 0.48));
+  const isGlide = style === "glide";
+  const obs: WanderObstacleCircle[] = [];
+
+  for (const c of creations) {
+    if (c.id === walker.id) continue;
+    if (c.category !== "building" && c.behavior?.type !== "landmark") continue;
+    const r = getCreationFootprintRadius(
+      c.scaleClass,
+      c.blueprint?.stats?.footprintX ?? 14,
+      c.blueprint?.stats?.footprintZ ?? 14,
+    );
+    obs.push({ id: c.id, x: c.x, z: c.z, clearR: r + selfPad + 2.2 });
+  }
+  if (!isGlide) {
+    for (const p of props) {
+      if (p.kind !== "pond") continue;
+      const r = p.radius ?? 6.4;
+      obs.push({ id: p.id, x: p.x, z: p.z, clearR: r + selfPad * 0.6 + 1.6 });
+    }
+  }
+  obs.push({ id: "city-sign", x: 10.5, z: 4.5, clearR: 2.8 + selfPad * 0.4 });
+  return obs;
+}
+
+export function nudgeWanderPointClearOfWorld(
+  px: number,
+  pz: number,
+  walker: Pick<WorldCreation, "id" | "scaleClass" | "blueprint">,
+  style: string | undefined,
+  creations: WorldCreation[],
+  props: WorldProp[],
+  bound = 136,
+): [number, number] {
+  const obs = buildWanderObstacles(walker, style, creations, props);
+  return nudgePointClearInternal(px, pz, obs, bound);
+}
+
+function nudgePointClearInternal(
+  px: number,
+  pz: number,
+  obs: WanderObstacleCircle[],
+  bound = 136,
+): [number, number] {
+  let x = clampCoord(px, -bound, bound);
+  let z = clampCoord(pz, -bound, bound);
+  for (let pass = 0; pass < 8; pass++) {
+    let moved = false;
+    for (const o of obs) {
+      const dx = x - o.x;
+      const dz = z - o.z;
+      const d = Math.hypot(dx, dz);
+      if (d < o.clearR - 0.05) {
+        let ux = d > 0.05 ? dx / d : o.x > 0 ? -1 : 1;
+        let uz = d > 0.05 ? dz / d : o.z > 0 ? -1 : 1;
+        let nx = o.x + ux * (o.clearR + 0.45);
+        let nz = o.z + uz * (o.clearR + 0.45);
+        if (Math.abs(nx) > bound - 1 || Math.abs(nz) > bound - 1) {
+          const toCenterLen = Math.hypot(-o.x, -o.z) || 1;
+          ux = -o.x / toCenterLen;
+          uz = -o.z / toCenterLen;
+          nx = o.x + ux * (o.clearR + 0.8);
+          nz = o.z + uz * (o.clearR + 0.8);
+        }
+        x = clampCoord(nx, -bound, bound);
+        z = clampCoord(nz, -bound, bound);
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  return [Number(x.toFixed(1)), Number(z.toFixed(1))];
+}
+
+/**
+ * Ensures every wander waypoint AND every straight-line walk segment between consecutive
+ * waypoints clears stationary buildings, quarries, waterfalls, and ponds (taking the walker's
+ * own scaleClass footprint into account), inserting clean detour waypoints around obstacles.
+ */
+export function sanitizeWanderTargetsForWorld(
+  walker: Pick<WorldCreation, "id" | "scaleClass" | "blueprint" | "x" | "z">,
+  style: string | undefined,
+  rawTargets: [number, number][],
+  creations: WorldCreation[],
+  props: WorldProp[],
+): [number, number][] {
+  const obs = buildWanderObstacles(walker, style, creations, props);
+  const seed =
+    rawTargets.length >= 2
+      ? rawTargets
+      : ([
+          [walker.x + 12, walker.z + 8],
+          [walker.x - 11, walker.z + 9],
+          [walker.x + 4, walker.z - 14],
+        ] as [number, number][]);
+
+  let pts = seed.map(([tx, tz]) => nudgePointClearInternal(tx, tz, obs));
+
+  for (let pass = 0; pass < 4 && pts.length < 18; pass++) {
+    const nextPts: [number, number][] = [];
+    let inserted = false;
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i];
+      const b = pts[(i + 1) % pts.length];
+      nextPts.push(a);
+      if (nextPts.length >= 18) continue;
+
+      let worst: WanderObstacleCircle | null = null;
+      let worstPen = 0;
+      for (const o of obs) {
+        const hit = closestOnSegment2D(a[0], a[1], b[0], b[1], o.x, o.z);
+        const req = o.clearR - 0.7;
+        if (hit.t > 0.03 && hit.t < 0.97 && hit.dist < req) {
+          const pen = req - hit.dist;
+          if (pen > worstPen) {
+            worstPen = pen;
+            worst = o;
+          }
+        }
+      }
+
+      if (worst) {
+        const sdx = b[0] - a[0];
+        const sdz = b[1] - a[1];
+        const slen = Math.hypot(sdx, sdz) || 1;
+        const px1 = -sdz / slen;
+        const pz1 = sdx / slen;
+        const cand1 = nudgePointClearInternal(
+          worst.x + px1 * (worst.clearR + 1.9),
+          worst.z + pz1 * (worst.clearR + 1.9),
+          obs,
+        );
+        const cand2 = nudgePointClearInternal(
+          worst.x - px1 * (worst.clearR + 1.9),
+          worst.z - pz1 * (worst.clearR + 1.9),
+          obs,
+        );
+        const score = (c: [number, number]): number => {
+          const dPath = Math.hypot(c[0] - a[0], c[1] - a[1]) + Math.hypot(b[0] - c[0], b[1] - c[1]);
+          let penalty = 0;
+          for (const other of obs) {
+            const h1 = closestOnSegment2D(a[0], a[1], c[0], c[1], other.x, other.z);
+            const h2 = closestOnSegment2D(c[0], c[1], b[0], b[1], other.x, other.z);
+            if (h1.dist < other.clearR - 0.7) penalty += 500;
+            if (h2.dist < other.clearR - 0.7) penalty += 500;
+          }
+          return dPath + penalty;
+        };
+        const chosen = score(cand1) <= score(cand2) ? cand1 : cand2;
+        nextPts.push(chosen);
+        inserted = true;
+      }
+    }
+    pts = nextPts;
+    if (!inserted) break;
+  }
+
+  return pts;
 }

@@ -63,6 +63,9 @@ import {
   computeIntelligentBuildingYaw,
   FACTUAL_CREATION_DESCRIPTIONS,
   normalizeFactualDescription,
+  nudgeWanderPointClearOfWorld,
+  PERIMETER_TITAN_SEED_LOOP,
+  sanitizeWanderTargetsForWorld,
 } from "./town_planner";
 
 const MAX_CONCURRENT_SCULPTS = 3;
@@ -599,6 +602,16 @@ export class WorldDO extends DurableObject<Env> {
       this.runUpgradeV17SimCityWorld();
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v17_simcity_world', '1')`);
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('lastOgCaptureAt', '0')`);
+    }
+
+    // One-time v18 wander clearance upgrade (routes Aegis Perimeter Titan and all wander creatures
+    // cleanly around relocated Borealis Mineral Quarry, waterfalls, ponds, and buildings)
+    const upgradedV18 = sql
+      .exec(`SELECT value FROM meta WHERE key = 'upgrade_v18_wander_clearance' LIMIT 1`)
+      .toArray();
+    if (upgradedV18.length === 0) {
+      this.runUpgradeV18WanderClearance();
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v18_wander_clearance', '1')`);
     }
 
     // Lightweight startup overlap & planar road-crossing repair (< 4ms, zero LLM calls)
@@ -1396,6 +1409,49 @@ export class WorldDO extends DurableObject<Env> {
     );
   }
 
+  private runUpgradeV18WanderClearance(): void {
+    const sql = this.ctx.storage.sql;
+    const creationRows = sql.exec(`SELECT id, json FROM creations ORDER BY created_at ASC`).toArray();
+    const creations = creationRows.map((r) => JSON.parse(String(r.json)) as WorldCreation);
+    const propRows = sql.exec(`SELECT id, json FROM props`).toArray();
+    const props = propRows.map((r) => JSON.parse(String(r.json)) as WorldProp);
+
+    for (const c of creations) {
+      if (c.behavior?.type !== "wander") continue;
+      const baseTargets =
+        c.id === "c-mvogm9ja-6cd891"
+          ? PERIMETER_TITAN_SEED_LOOP
+          : Array.isArray(c.behavior.targets) && c.behavior.targets.length >= 2
+            ? c.behavior.targets
+            : [];
+      const cleanTargets = sanitizeWanderTargetsForWorld(
+        c,
+        c.behavior.style,
+        baseTargets,
+        creations,
+        props,
+      );
+      const [cleanHomeX, cleanHomeZ] = nudgeWanderPointClearOfWorld(
+        c.id === "c-mvogm9ja-6cd891" ? cleanTargets[0][0] : (c.behavior.homeX ?? c.x),
+        c.id === "c-mvogm9ja-6cd891" ? cleanTargets[0][1] : (c.behavior.homeZ ?? c.z),
+        c,
+        c.behavior.style,
+        creations,
+        props,
+      );
+      c.x = cleanHomeX;
+      c.z = cleanHomeZ;
+      c.behavior = {
+        ...c.behavior,
+        homeX: cleanHomeX,
+        homeZ: cleanHomeZ,
+        targets: cleanTargets,
+      };
+      sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(c), c.id);
+    }
+    this.bumpVersion();
+  }
+
   private auditAndRepairWorld(): { repairedCount: number; repairs: string[] } {
     const sql = this.ctx.storage.sql;
     const repairs: string[] = [];
@@ -1538,6 +1594,52 @@ export class WorldDO extends DurableObject<Env> {
         if (!target) continue;
         sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(target), cid);
         repairs.push(`aligned "${target.name}" (${cid}) frontage to approach road`);
+      }
+    }
+
+    // Sanitize all wander creatures & robots so neither waypoints nor straight walk segments
+    // intersect stationary buildings, quarries, waterfalls, or ponds
+    for (const c of creations) {
+      if (c.behavior?.type !== "wander") continue;
+      const existingTargets = Array.isArray(c.behavior.targets) ? c.behavior.targets : [];
+      const sanitizedTargets = sanitizeWanderTargetsForWorld(
+        c,
+        c.behavior.style,
+        existingTargets,
+        creations,
+        spatial.props,
+      );
+      const [cleanHomeX, cleanHomeZ] = nudgeWanderPointClearOfWorld(
+        c.behavior.homeX ?? c.x,
+        c.behavior.homeZ ?? c.z,
+        c,
+        c.behavior.style,
+        creations,
+        spatial.props,
+      );
+      const [cleanX, cleanZ] = nudgeWanderPointClearOfWorld(
+        c.x,
+        c.z,
+        c,
+        c.behavior.style,
+        creations,
+        spatial.props,
+      );
+      const targetsChanged = JSON.stringify(existingTargets) !== JSON.stringify(sanitizedTargets);
+      const posChanged =
+        Math.hypot(cleanHomeX - (c.behavior.homeX ?? c.x), cleanHomeZ - (c.behavior.homeZ ?? c.z)) > 0.15 ||
+        Math.hypot(cleanX - c.x, cleanZ - c.z) > 0.15;
+      if (targetsChanged || posChanged) {
+        c.x = cleanX;
+        c.z = cleanZ;
+        c.behavior = {
+          ...c.behavior,
+          homeX: cleanHomeX,
+          homeZ: cleanHomeZ,
+          targets: sanitizedTargets,
+        };
+        sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(c), c.id);
+        repairs.push(`routed wanderer "${c.name}" (${c.id}) cleanly around obstacles`);
       }
     }
 
@@ -1688,6 +1790,18 @@ export class WorldDO extends DurableObject<Env> {
       )
     ) {
       this.runUpgradeV17SimCityWorld();
+    }
+    if (
+      Array.isArray(snapshot.creations) &&
+      snapshot.creations.some(
+        (c) =>
+          c.id === "c-mvogm9ja-6cd891" &&
+          c.behavior?.type === "wander" &&
+          Array.isArray(c.behavior.targets) &&
+          c.behavior.targets.some(([tx, tz]) => Math.hypot(tx - 118, tz - -114) < 20),
+      )
+    ) {
+      this.runUpgradeV18WanderClearance();
     }
     const repairRes = this.auditAndRepairWorld();
     const after = this.readBaseWorld();

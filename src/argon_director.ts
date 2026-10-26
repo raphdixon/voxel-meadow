@@ -32,6 +32,8 @@ import {
 import {
   computeIntelligentBuildingYaw,
   normalizeFactualDescription,
+  nudgeWanderPointClearOfWorld,
+  sanitizeWanderTargetsForWorld,
   shouldCreationFaceRoad,
   snapAngleToSimCityGrid,
 } from "./town_planner";
@@ -346,6 +348,7 @@ function buildScenicFlightWaypoints(
 function buildMeadowWanderTargets(
   target: WorldCreation,
   world: Omit<WorldStateSnapshot, "myCreationId">,
+  style?: string,
 ): [number, number][] {
   const pts: [number, number][] = [
     nudgeClearOfBuildings(target.x + 4, target.z + 3, world.creations, target.id, 5.2),
@@ -369,7 +372,13 @@ function buildMeadowWanderTargets(
       nudgeClearOfBuildings(target.x + 12, target.z - 14, world.creations, target.id, 5.2),
     );
   }
-  return pts.slice(0, 5);
+  return sanitizeWanderTargetsForWorld(
+    target,
+    style,
+    pts.slice(0, 5),
+    world.creations,
+    world.props,
+  );
 }
 
 /**
@@ -586,7 +595,16 @@ export function buildInitialIntegration(
     const combinedText = `${target.name} ${target.description} ${target.creatorPrompt ?? ""}`;
     const isGlider = GLIDER_SUBJECT_RE.test(combinedText);
     const isHopper = !isGlider && /frog|toad|bunny|rabbit|hare|kangaroo|wallaby|chick|slime|blob/i.test(combinedText);
-    const wanderTargets = buildMeadowWanderTargets(target, world);
+    const wStyle = isGlider ? "glide" : isHopper ? "hop" : "trot";
+    const wanderTargets = buildMeadowWanderTargets(target, world, wStyle);
+    const [cleanHomeX, cleanHomeZ] = nudgeWanderPointClearOfWorld(
+      target.x,
+      target.z,
+      target,
+      wStyle,
+      world.creations,
+      world.props,
+    );
     updatedBehaviors.push({
       creationId: target.id,
       category: "creature",
@@ -595,10 +613,10 @@ export function buildInitialIntegration(
       ...(initialAmendment ? { blueprintAmendment: initialAmendment } : {}),
       behavior: {
         type: "wander",
-        style: isGlider ? "glide" : isHopper ? "hop" : "trot",
+        style: wStyle,
         speed: isGlider ? 3.4 : 2.9,
-        homeX: target.x,
-        homeZ: target.z,
+        homeX: cleanHomeX,
+        homeZ: cleanHomeZ,
         radius: 26,
         ...(isGlider ? { hoverHeight: 1.9 } : {}),
         targets: wanderTargets,
@@ -1100,18 +1118,30 @@ export function sanitizeWorldPatch(
         bRaw.style === "hop" || bRaw.style === "trot" || bRaw.style === "glide"
           ? bRaw.style
           : "walk";
-      const targets: [number, number][] = [];
-      for (const pt of Array.isArray(bRaw.targets) ? bRaw.targets.slice(0, 8) : []) {
+      const rawTargets: [number, number][] = [];
+      for (const pt of Array.isArray(bRaw.targets) ? bRaw.targets.slice(0, 12) : []) {
         if (Array.isArray(pt) && pt.length >= 2) {
-          targets.push(nudgeClearOfBuildings(num(pt[0], target.x), num(pt[1], target.z), world.creations, creationId, 4.8));
+          rawTargets.push([num(pt[0], target.x), num(pt[1], target.z)]);
         }
       }
+      const targets =
+        rawTargets.length > 0
+          ? sanitizeWanderTargetsForWorld(target, style, rawTargets, world.creations, world.props)
+          : [];
+      const [cleanHomeX, cleanHomeZ] = nudgeWanderPointClearOfWorld(
+        clamp(num(bRaw.homeX, target.x), -136, 136),
+        clamp(num(bRaw.homeZ, target.z), -136, 136),
+        target,
+        style,
+        world.creations,
+        world.props,
+      );
       behavior = {
         type: "wander",
         style,
         speed: clamp(num(bRaw.speed, style === "glide" ? 3.4 : 2.8), 1.2, 5.5),
-        homeX: clamp(num(bRaw.homeX, target.x), -150, 150),
-        homeZ: clamp(num(bRaw.homeZ, target.z), -150, 150),
+        homeX: cleanHomeX,
+        homeZ: cleanHomeZ,
         radius: clamp(num(bRaw.radius, 18), 5, 55),
         ...(style === "glide" ? { hoverHeight: clamp(num(bRaw.hoverHeight, 1.9), 0.8, 4.5) } : {}),
         ...(targets.length ? { targets } : {}),

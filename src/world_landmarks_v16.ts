@@ -18,7 +18,7 @@ export function buildColossalWaterfallBlueprint(): VoxelBlueprint {
     {
       name: "Emerald Cliff Waterfall",
       description:
-        "Stepped granite cliff waterfall with alpine spruce trees, mossy ledges, and turquoise plunge pool.",
+        "Southern canyon waterfall feeding fresh mountain water into the island's streams.",
       category: "prop",
       scaleClass: "colossal",
       liveFeed: { kind: "weather", place: "GeminIsland", lat: -33.87, lon: 151.21 },
@@ -194,7 +194,7 @@ export function buildCompanionVehicleBlueprint(
           name: customName || "Borealis Heavy Haul Dump Truck",
           description:
             customDescription ||
-            "Heavy yellow quarry haul truck carrying sparkling rare-earth mineral ore from the mine to the city.",
+            "Mining dump truck hauling extracted mineral ore from the quarry toward town.",
           category: "vehicle",
           scaleClass: "medium",
           palette: {
@@ -282,7 +282,7 @@ export function buildCompanionVehicleBlueprint(
           name: customName || "Beacon Hill Pumper Engine",
           description:
             customDescription ||
-            "Gleaming crimson fire pumper engine with chrome bumpers, rooftop extension ladder, and emergency beacons.",
+            "Municipal fire engine patrolling neighborhood avenues from the firehouse.",
           category: "vehicle",
           scaleClass: "medium",
           palette: {
@@ -361,7 +361,7 @@ export function buildCompanionVehicleBlueprint(
           name: customName || "Cloverfield Harvest Tractor",
           description:
             customDescription ||
-            "Meadow-green harvest tractor hauling fresh produce crates from the countryside into the village.",
+            "Utility tractor hauling farm supplies and gear along the outer country lanes.",
           category: "vehicle",
           scaleClass: "small",
           palette: {
@@ -417,7 +417,7 @@ export function buildCompanionVehicleBlueprint(
           name: customName || "Meadow Electric Shuttle",
           description:
             customDescription ||
-            "Quiet sunlit sky-blue electric shuttle linking outer neighborhood landmarks with the village core.",
+            "Electric passenger shuttle linking outer district landmarks with town transit.",
           category: "vehicle",
           scaleClass: "medium",
           palette: {
@@ -475,7 +475,7 @@ export function buildCompanionVehicleBlueprint(
           name: customName || "Island Provision Delivery Van",
           description:
             customDescription ||
-            "Warm cream & teal delivery van ferrying fresh goods and parcels between village shops and cottages.",
+            "Neighborhood delivery van ferrying local goods and food between shops and homes.",
           category: "vehicle",
           scaleClass: "medium",
           palette: {
@@ -539,7 +539,7 @@ export function buildSingleModernistTowerBlueprint(): VoxelBlueprint {
     {
       name: "Modernist Glass Tower",
       description:
-        "Single glass-and-steel high-rise office tower with recessed lobby colonnade and rooftop spire.",
+        "Downtown office tower anchoring the city's commercial district.",
       category: "building",
       scaleClass: "large",
       palette: {

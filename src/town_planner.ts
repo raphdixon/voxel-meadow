@@ -1,5 +1,7 @@
 import type {
   CreationCategory,
+  PathKind,
+  RouteStop,
   ScaleClass,
   WorldCreation,
   WorldPath,
@@ -293,185 +295,242 @@ export function chooseSimCityPlot(opts: {
 }
 
 /**
- * Plain, factual, objective 1-sentence physical descriptions (zero narrative prose)
- * for all seed and established creations on GeminIsland.
+ * Identity + purpose descriptions ("what it is, and what its role or intention is")
+ * for all seed and established creations on GeminIsland — avoiding redundant visual
+ * geometry/material inventories since viewers can already see the 3D model.
  */
 export const FACTUAL_CREATION_DESCRIPTIONS: Record<string, { description: string; statusLine: string }> = {
   "seed-school-bus": {
-    description: "Yellow village school bus with black trim, stop sign arm, and twin headlights.",
-    statusLine: "Downtown avenue bus loop",
+    description: "Town school bus picking up and dropping off commuters around the central loop.",
+    statusLine: "Town bus circling the central commuter loop",
   },
   "seed-windmill-bakery": {
-    description: "Stone windmill bakery with four rotating timber sails, brick oven, and striped awning.",
-    statusLine: "Windmill bakery on West Lane",
+    description: "Neighborhood windmill bakery grinding grain and baking fresh bread for the west village.",
+    statusLine: "Neighborhood bakery grinding grain and baking bread",
   },
   "seed-clocktower-station": {
-    description: "Limestone and copper clocktower with illuminated dials and covered timber waiting porch.",
-    statusLine: "North Avenue transit station",
+    description: "Central transit station and town clock where neighborhood bus and shuttle routes meet.",
+    statusLine: "Central transit hub where town bus and shuttle lines meet",
   },
   "seed-matcha-bookshop": {
-    description: "Two-storey sage-green timber bookshop with bay windows and rooftop planter boxes.",
-    statusLine: "Corner bookshop on East Avenue",
+    description: "Corner bookshop and cafe where townsfolk stop to browse books over tea.",
+    statusLine: "Corner bookshop and tea room for neighborhood readers",
   },
   "seed-meadow-pup": {
-    description: "Golden retriever puppy with red collar and articulated legs.",
-    statusLine: "Golden retriever puppy",
+    description: "Town dog trotting around the central green to greet passersby.",
+    statusLine: "Town dog trotting around the central green",
   },
   "seed-pond-duck": {
-    description: "Mallard duck with green head feathers, brown wings, and orange bill.",
-    statusLine: "Central Pond mallard",
+    description: "Resident mallard swimming laps around Clover Pond in the center of town.",
+    statusLine: "Resident mallard swimming laps on Clover Pond",
   },
   "c-mvm7qli8-4h2k": {
-    description: "Modular server building with cyan rack windows, rooftop chillers, and spinning HVAC fans.",
-    statusLine: "Modular cloud datacentre",
+    description: "Cloud computing facility running server workloads for the northern tech district.",
+    statusLine: "Cloud datacentre running regional compute workloads",
   },
   "c-mvmvo1vh-47fbad": {
-    description: "Winged green voxel dragon with articulated wings, horns, and segmented tail.",
-    statusLine: "Flying green dragon",
+    description: "Meadow dragon soaring overhead between the mountain waterfall and town landmarks.",
+    statusLine: "Meadow dragon patrolling the skies above the island",
   },
   "c-mvn0lbb4-74136e": {
-    description: "Stepped granite cliff waterfall with alpine spruce trees, mossy ledges, and turquoise plunge pool.",
-    statusLine: "Multi-tiered granite waterfall",
+    description: "Southern canyon waterfall feeding fresh mountain water into the island's streams.",
+    statusLine: "Canyon waterfall feeding the island's streams",
   },
   "c-mvn8g9cn-a857de": {
-    description: "Two-storey leather-boot-shaped house with timber windows, front porch, and brick chimney.",
-    statusLine: "Boot-shaped residential cottage",
+    description: "Giant boot turned into a family home, inspired by the old woman who lived in a shoe.",
+    statusLine: "Boot-shaped family home on the western lane",
   },
   "c-mvn9yxeh-1d5644": {
-    description: "Contemporary stone-and-glass retail building with sunshade louvers and rooftop HVAC units.",
-    statusLine: "Stone and glass retail building",
+    description: "Downtown appliance showroom displaying kitchen machines and home goods.",
+    statusLine: "Downtown kitchen appliance showroom",
   },
   "c-mvnbcub6-d06441": {
-    description: "Compact neon-trimmed cantina building with rooftop sombrero sign and counter window.",
-    statusLine: "Roadside cantina building",
+    description: "Roadside burrito shop serving Mexican food and spare parts to local robots.",
+    statusLine: "Burrito cantina built for local robots",
   },
   "c-mvnbmbqg-48aa8f": {
-    description: "Outdoor hardcourt pickleball court with painted boundary lines, center net, and player bench.",
-    statusLine: "Outdoor pickleball court",
+    description: "Neighborhood court for pickup pickleball matches along the western cottage lane.",
+    statusLine: "Community court for pickup pickleball games",
   },
   "c-mvnc3mga-c6ea36": {
-    description: "Two-storey brick country pub with wrap-around corrugated iron verandas and rooftop sign.",
-    statusLine: "Two-storey brick pub",
+    description: "Country pub on South Avenue serving cold drinks to locals and travelers.",
+    statusLine: "Australian country pub on South Avenue",
   },
   "c-mvnc7tlr-6784e6": {
-    description: "Terraced open-pit mineral quarry with dark rock walls, boom crane, and equipment shed.",
-    statusLine: "Northeast open-pit mineral quarry",
+    description: "Open-pit mine in the northeast hills extracting rare-earth minerals for the city.",
+    statusLine: "Rare-earth mineral quarry supplying the city",
   },
   "c-mvnd5i04-14bfd5": {
-    description: "Enclosed turf padel court with glass back walls, mesh fencing, and corner floodlights.",
-    statusLine: "Enclosed turf padel court",
+    description: "Enclosed neighborhood court built for doubles padel matches.",
+    statusLine: "Neighborhood court for doubles padel matches",
   },
   "c-mvne3zub-216636": {
-    description: "Wooden vert skateboard halfpipe with elevated side decks, steel coping rails, and floodlights.",
-    statusLine: "Wooden skateboard halfpipe",
+    description: "Public skateboard halfpipe on the central green for practicing vert tricks.",
+    statusLine: "Public skate ramp on the central green",
   },
   "c-mvne5cm4-375d1d": {
-    description: "Classical two-storey stone mansion with fluted front columns and gilded rooftop domes.",
-    statusLine: "Classical stone mansion",
+    description: "Private country estate overlooking the western neighborhood lanes.",
+    statusLine: "Private residence in the western district",
   },
   "c-mvnengyt-a5d341": {
-    description: "Yellow twin-engine jet airliner with swept wings, red cheek decals, and tail stabilizer.",
-    statusLine: "Twin-engine jet airliner",
+    description: "Pikachu-themed passenger jet flying sightseeing circuits above the island.",
+    statusLine: "Passenger jet flying scenic circuits overhead",
   },
   "c-mvnepky4-e46ba2": {
-    description: "Large industrial datacentre hall with steel wall panels, cooling towers, and rooftop satellite dish.",
-    statusLine: "Hyperscale datacentre facility",
+    description: "High-capacity regional datacentre powering heavy compute and AI workloads.",
+    statusLine: "Hyperscale datacentre powering regional compute",
   },
   "c-mvnf2juk-326f62": {
-    description: "Single glass-and-steel high-rise office tower with recessed lobby colonnade and rooftop spire.",
-    statusLine: "Glass and steel office tower",
+    description: "Downtown office tower anchoring the city's commercial district.",
+    statusLine: "Commercial office tower in the downtown core",
   },
   "c-mvng01tx-c070df": {
-    description: "Grey rhinoceros sitting inside a white porcelain clawfoot bathtub filled with foam.",
-    statusLine: "Rhinoceros in clawfoot bathtub",
+    description: "Rhinoceros taking its bubble bath on a stroll through the southern neighborhoods.",
+    statusLine: "Rhinoceros roaming town in its bubble bath",
   },
   "c-mvnlor0y-0ebcf9": {
-    description: "Twin-engine swept-wing fighter jet in grey livery with angled tailplane.",
-    statusLine: "Swept-wing jet aircraft",
+    description: "Supersonic fighter jet flying high-speed patrol passes over the island.",
+    statusLine: "Fighter jet flying patrol passes overhead",
   },
   "c-mvnlu09c-0cd9f7": {
-    description: "Timber-framed stucco cottage with pitched roof, window flower boxes, and stone chimney.",
-    statusLine: "Timber-framed stucco cottage",
+    description: "Quiet country cottage tucked along the western residential lane.",
+    statusLine: "Country home on the western cottage lane",
   },
   "c-mvnmyyq6-bc000b": {
-    description: "Small coastal island with tiered broadcast pavilion, striped lighthouse, and radio mast.",
-    statusLine: "Coastal lighthouse and broadcast island",
+    description: "Offshore public-broadcaster island recreated as a throwback to 2007 virtual worlds.",
+    statusLine: "Public-broadcaster island outpost offshore",
   },
   "c-mvns4thf-81f7de": {
-    description: "Red-brick municipal fire station with arched apparatus bays and brass bell cupola.",
-    statusLine: "Municipal brick fire station",
+    description: "Municipal fire station housing the town's emergency response crew and pumper truck.",
+    statusLine: "Town fire station serving the southern district",
   },
   "c-mvo96y3f-96e304": {
-    description: "Coastal rock outcrop with pine trees, sea stacks, and shallow turquoise tide pools.",
-    statusLine: "Coastal rock outcrop and tide pools",
+    description: "Rocky eastern headland overlooking tide pools and the open sea.",
+    statusLine: "Eastern coastal lookout and tide pools",
   },
   "c-mvoab00r-9b0864": {
-    description: "Three-storey dark Victorian Gothic house with steep gabled roofs, iron cresting, and lit windows.",
-    statusLine: "Victorian Gothic manor house",
+    description: "Haunted Victorian house keeping watch over the far western lane.",
+    statusLine: "Haunted house on the western edge of town",
   },
   "c-mvobfiiw-3fb48e": {
-    description: "Pastel pink-and-cream ice cream van with rooftop soft-serve cone sign and serving window.",
-    statusLine: "Ice cream van on town loop",
+    description: "Neighborhood ice cream truck circling town to serve cold treats at park stops.",
+    statusLine: "Ice cream van serving treats around the central green",
   },
   "c-mvocr3dc-a475ca": {
-    description: "Large domed golden beehive structure with tiered comb rings and arched entrance.",
-    statusLine: "Domed golden beehive apiary",
+    description: "Giant communal beehive producing honey at the western edge of the meadow.",
+    statusLine: "Meadow apiary producing honey for the bakery",
   },
   "c-mvocxa72-f718f5": {
-    description: "Domed elliptical stadium wrapped in horizontal LED light bands.",
-    statusLine: "Elliptical LED arena",
+    description: "Immersive egg-shaped concert venue hosting panoramic shows on South Avenue.",
+    statusLine: "Panoramic concert arena on South Avenue",
   },
   "c-mvod5t0a-226189": {
-    description: "Burger-shaped roadside food stand with sesame-bun roof, counter window, and rooftop sign.",
-    statusLine: "Burger-shaped food stand",
+    description: "Roadside burger stand serving grilled burgers on the southwest lane.",
+    statusLine: "Neighborhood roadside burger stand",
   },
   "c-mvodkwqc-c9e4a4": {
-    description: "Modernist white stone assembly building with curved wings, forecourt, and central flag spire.",
-    statusLine: "Modernist parliament building",
+    description: "Civic assembly hall where representatives meet to debate town affairs.",
+    statusLine: "Civic parliament hall for town government",
   },
   "c-mvodns66-ce9982": {
-    description: "Open-air stepped stone amphitheatre with covered concert stage and overhead lighting rig.",
-    statusLine: "Open-air stone amphitheatre",
+    description: "Open-air concert amphitheatre hosting live rock shows beside the northern datacentre campus.",
+    statusLine: "Outdoor rock concert venue in the north district",
   },
   "c-mvoehstp-db1cae": {
-    description: "Tiered circular pancake-stack diner building topped with a blue A-frame roof.",
-    statusLine: "Tiered pancake diner building",
+    description: "Monumental pancake house serving breakfast stacks to the eastern district.",
+    statusLine: "Ziggurat diner serving breakfast all day",
   },
   "c-mvofq9cw-f479a6": {
-    description: "Oversized voxel bare foot sculpture with five toes and striped ankle cuff.",
-    statusLine: "Voxel foot sculpture",
+    description: "Giant bare foot hopping around the town streets on its own.",
+    statusLine: "Giant foot hopping through the neighborhood",
   },
   "c-mvofu6xi-9656b7": {
-    description: "Woven rope hammock slung between two palm trees on a sandy patch.",
-    statusLine: "Beach palm hammock",
+    description: "Person in a banana suit relaxing in a beachside hammock.",
+    statusLine: "Beachside hammock for afternoon lounging",
   },
   "c-mvogm9ja-6cd891": {
-    description: "Tall bipedal armored mecha robot with chest core and shoulder radar array.",
-    statusLine: "Bipedal armored mecha robot",
+    description: "Giant defense mecha circling the outer perimeter to protect everyone inside the town.",
+    statusLine: "Perimeter defense robot guarding the town",
   },
   "c-mvoi4jxh-b16cfb": {
-    description: "Heavy-lift three-core rocket standing beside a steel launch umbilical tower.",
-    statusLine: "Three-core rocket launch complex",
+    description: "Northern spaceport complex preparing heavy-lift rockets for orbital launch.",
+    statusLine: "Orbital rocket launch complex in the far north",
   },
   "c-mvoivyhf-8fdd46": {
-    description: "Open-sided timber pavilion with central bottle display, oak barrels, and string lights.",
-    statusLine: "Open-sided timber tasting pavilion",
+    description: "Outdoor tasting pavilion hosting tequila flights and neighborhood gatherings.",
+    statusLine: "Outdoor tequila tasting bar on South Avenue",
   },
   "c-mvoiz95f-8d5336": {
-    description: "Neoclassical stone library building with columned portico and rooftop puzzle-globe sculpture.",
-    statusLine: "Neoclassical library archive",
+    description: "Public library storing printed volumes of Wikipedia as an offline backup of human knowledge.",
+    statusLine: "Offline print archive of human knowledge",
   },
   "c-mvojw3k4-4ee278": {
-    description: "Two-storey brick corner pub with illuminated marquee sign, rope stanchions, and rooftop patio.",
-    statusLine: "Two-storey brick corner pub",
+    description: "Corner bar where regulars queue up so everyone gets to feel like the smartest guy in the room.",
+    statusLine: "Neighborhood pub celebrating everyday regulars",
+  },
+  "comp-4bcf04f9": {
+    description: "Delivery van running fresh honey and bread between the western apiary and bakery.",
+    statusLine: "West lane honey and bread delivery run",
+  },
+  "c-mvolsq8o-c1a835": {
+    description: "Electric guitar monument broadcasting music across the southwest meadow.",
+    statusLine: "Musical guitar monument in the southwest meadow",
+  },
+  "c-mvom998k-8e5580": {
+    description: "Drive-thru Mexican restaurant feeding quarry crews and highway drivers in the northeast.",
+    statusLine: "Drive-thru taqueria on the northeast quarry highway",
+  },
+  "comp-f2ce5ebd": {
+    description: "Catering delivery van shuttling burritos between the northeast taquerias and east town.",
+    statusLine: "Northeast highway burrito delivery run",
+  },
+  "c-mvomg46x-e654f2": {
+    description: "Isolated cabin on the western frontier where a lone philosopher retreats to ponder reality.",
+    statusLine: "Solitary philosopher's study cabin in the far west",
   },
   "comp-quarry-dump-truck": {
-    description: "Articulated yellow mining dump truck loaded with raw mineral ore.",
-    statusLine: "Quarry-to-city ore haul truck",
+    description: "Heavy mining truck hauling raw mineral ore from the northeast quarry toward town.",
+    statusLine: "Hauling mineral ore down the northeast quarry highway",
   },
   "comp-firehouse-pumper": {
-    description: "Red municipal fire engine with roof ladder, hose reel, and emergency light bar.",
-    statusLine: "Municipal fire engine",
+    description: "Municipal fire engine patrolling South Avenue from Beacon Hill Firehouse.",
+    statusLine: "Patrolling South Avenue from the firehouse",
+  },
+  "c-mvoo26uh-4e0810": {
+    description: "Spherical entertainment venue broadcasting giant animated expressions across the northeast skyline.",
+    statusLine: "Immersive sphere arena overlooking the northeast",
+  },
+  "c-mvoobup6-14b5ed": {
+    description: "Specialty hardware shop supplying shovels and digging gear on the quarry highway.",
+    statusLine: "Hardware shop supplying shovels and digging tools",
+  },
+  "c-mvoogwn8-0f4801": {
+    description: "Giant letter L monument standing as a landmark in the southwest meadow.",
+    statusLine: "Southwest meadow letter L landmark",
+  },
+  "c-mvopczh6-c9c3cb": {
+    description: "Vertical-axis wind turbine generating renewable power on the southeastern ridge.",
+    statusLine: "Southeastern wind turbine generating clean power",
+  },
+  "comp-6c0884bc": {
+    description: "Utility tractor hauling maintenance gear between the southeast wind turbine and South Avenue.",
+    statusLine: "Wind farm maintenance run in the southeast",
+  },
+  "c-mvopnujw-13af09": {
+    description: "Highway taqueria serving burritos and tacos along the northeast quarry road.",
+    statusLine: "Mexican taqueria serving highway travelers",
+  },
+  "comp-3227ab04": {
+    description: "Crew shuttle ferrying engineers between the northern rocket launchpad and datacentre campus.",
+    statusLine: "Shuttle linking the rocket launchpad and north tech campus",
+  },
+  "c-mvoq55fb-008e1b": {
+    description: "Sprawling puzzle-box facility inspired by the film Cube, filled with shifting interconnected rooms.",
+    statusLine: "Sci-fi puzzle labyrinth on the northern frontier",
+  },
+  "c-mvoqwq7n-086aec": {
+    description: "Electric pickup truck cruising around the northern datacentre and civic avenue grid.",
+    statusLine: "Cruising the northern tech boulevard",
   },
 };
 
@@ -704,4 +763,423 @@ export function sanitizeWanderTargetsForWorld(
   }
 
   return pts;
+}
+
+export interface CorridorLoadSummary {
+  pathId: string;
+  kind: PathKind;
+  closed: boolean;
+  lengthM: number;
+  capacity: number;
+  vehicleIds: string[];
+  overloaded: boolean;
+}
+
+export interface WorldTrafficCongestionReport {
+  congested: boolean;
+  corridors: CorridorLoadSummary[];
+  overloadedCorridors: CorridorLoadSummary[];
+  pingPongLoopIntrusionIds: string[];
+  longDwellVehicleIds: string[];
+  summaryText: string;
+}
+
+function polylineLength2D(pts: [number, number][], closed: boolean): number {
+  if (pts.length < 2) return 0;
+  let total = 0;
+  for (let i = 0; i < pts.length - 1; i++) {
+    total += Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]);
+  }
+  if (closed && pts.length >= 3) {
+    total += Math.hypot(pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]);
+  }
+  return total;
+}
+
+function dedupeConsecutiveWaypoints(pts: [number, number][], minStep = 1.2): [number, number][] {
+  const out: [number, number][] = [];
+  for (const [x, z] of pts) {
+    const rounded: [number, number] = [Number(x.toFixed(2)), Number(z.toFixed(2))];
+    const prev = out[out.length - 1];
+    if (!prev || Math.hypot(rounded[0] - prev[0], rounded[1] - prev[1]) >= minStep) {
+      out.push(rounded);
+    }
+  }
+  return out;
+}
+
+function sanitizeStopsAlongWaypoints(
+  rawStops: RouteStop[] | undefined,
+  waypoints: [number, number][],
+  closed: boolean,
+  vehicleId: string,
+): RouteStop[] {
+  const curve = sampleCatmullRom2D(waypoints, closed, 0.75);
+  const kept: RouteStop[] = [];
+  for (const st of rawStops ?? []) {
+    const hit = distPointToPolyline2D(st.x, st.z, curve);
+    if (hit.dist > 8.5) continue;
+    const sx = Number(hit.closestX.toFixed(1));
+    const sz = Number(hit.closestZ.toFixed(1));
+    if (kept.some((o) => Math.hypot(o.x - sx, o.z - sz) < 14.0)) continue;
+    kept.push({
+      ...st,
+      x: sx,
+      z: sz,
+      dwellSec: Number(Math.min(2.2, Math.max(1.4, st.dwellSec || 1.8)).toFixed(1)),
+    });
+    if (kept.length >= 3) break;
+  }
+  if (kept.length >= 2) return kept;
+
+  const startPt = waypoints[0];
+  const endPt = closed
+    ? waypoints[Math.floor(waypoints.length / 2)]
+    : waypoints[waypoints.length - 1];
+  return [
+    {
+      id: `stop-${vehicleId}-a`,
+      name: kept[0]?.name || "Route Terminal A",
+      x: Number(startPt[0].toFixed(1)),
+      z: Number(startPt[1].toFixed(1)),
+      dwellSec: 1.8,
+      ...(kept[0]?.nearCreationId ? { nearCreationId: kept[0].nearCreationId } : {}),
+    },
+    {
+      id: `stop-${vehicleId}-b`,
+      name: kept[1]?.name || "Route Terminal B",
+      x: Number(endPt[0].toFixed(1)),
+      z: Number(endPt[1].toFixed(1)),
+      dwellSec: 1.8,
+      ...(kept[1]?.nearCreationId ? { nearCreationId: kept[1].nearCreationId } : {}),
+    },
+  ];
+}
+
+/**
+ * Inspects every drivable road/lane corridor and every `vehicle_route` creation to detect
+ * downtown ring-road bottlenecks, regional ping-pong overlap on `path-main-loop`, and
+ * excessive stop dwell times so the orchestrator can continuously rebalance traffic.
+ */
+export function analyzeWorldTrafficCongestion(
+  creations: WorldCreation[],
+  paths: WorldPath[],
+): WorldTrafficCongestionReport {
+  const drivablePaths = paths
+    .filter((p) => (p.kind === "road" || p.kind === "cottage_road") && p.points.length >= 2)
+    .map((p) => {
+      const curve = sampleCatmullRom2D(p.points, Boolean(p.closed), 0.75);
+      const lengthM = Number(polylineLength2D(curve, Boolean(p.closed)).toFixed(1));
+      return { path: p, curve, lengthM };
+    })
+    .filter((rc) => rc.lengthM >= 26 || rc.path.id === "path-main-loop");
+
+  const mainLoop = drivablePaths.find((rc) => rc.path.id === "path-main-loop");
+  const vehicles = creations.filter((c) => c.behavior?.type === "vehicle_route");
+
+  const corridorLoads = new Map<string, string[]>();
+  for (const rc of drivablePaths) corridorLoads.set(rc.path.id, []);
+
+  const pingPongLoopIntrusionIds: string[] = [];
+  const longDwellVehicleIds: string[] = [];
+
+  for (const v of vehicles) {
+    if (v.behavior.type !== "vehicle_route") continue;
+    const wps = v.behavior.waypoints ?? [];
+    if (wps.length < 2) continue;
+
+    if (
+      (v.behavior.stops ?? []).some((s) => (s.dwellSec ?? 0) > 2.6) ||
+      (v.behavior.stops ?? []).length > 3
+    ) {
+      longDwellVehicleIds.push(v.id);
+    }
+
+    if (mainLoop && v.behavior.loopMode === "pingpong") {
+      const ringHits = wps.filter(
+        ([wx, wz]) => distPointToPolyline2D(wx, wz, mainLoop.curve).dist <= 2.2,
+      ).length;
+      if (ringHits >= 2) {
+        pingPongLoopIntrusionIds.push(v.id);
+      }
+    }
+
+    // Assign vehicle load to each corridor where >= 30% (or >= 3) of its waypoints run
+    for (const rc of drivablePaths) {
+      const onCorridor = wps.filter(
+        ([wx, wz]) => distPointToPolyline2D(wx, wz, rc.curve).dist <= 3.5,
+      ).length;
+      if (onCorridor >= 3 || onCorridor / wps.length >= 0.35) {
+        corridorLoads.get(rc.path.id)!.push(v.id);
+      }
+    }
+  }
+
+  const corridors: CorridorLoadSummary[] = drivablePaths.map((rc) => {
+    const vehicleIds = corridorLoads.get(rc.path.id) ?? [];
+    const capacity =
+      rc.path.id === "path-main-loop"
+        ? 2
+        : rc.lengthM >= 95
+          ? 2
+          : rc.path.kind === "road"
+            ? 2
+            : 2;
+    return {
+      pathId: rc.path.id,
+      kind: rc.path.kind,
+      closed: Boolean(rc.path.closed),
+      lengthM: rc.lengthM,
+      capacity,
+      vehicleIds,
+      overloaded: vehicleIds.length > capacity,
+    };
+  });
+
+  const overloadedCorridors = corridors.filter((c) => c.overloaded);
+  const congested =
+    overloadedCorridors.length > 0 ||
+    pingPongLoopIntrusionIds.length > 0 ||
+    longDwellVehicleIds.length > 0;
+
+  const summaryParts: string[] = [];
+  if (overloadedCorridors.length > 0) {
+    summaryParts.push(
+      `Overloaded corridors: ${overloadedCorridors.map((c) => `${c.pathId} (${c.vehicleIds.length}/${c.capacity})`).join(", ")}`,
+    );
+  }
+  if (pingPongLoopIntrusionIds.length > 0) {
+    summaryParts.push(
+      `Regional ping-pong vehicles intruding onto path-main-loop: ${pingPongLoopIntrusionIds.join(", ")}`,
+    );
+  }
+  if (longDwellVehicleIds.length > 0) {
+    summaryParts.push(`Vehicles with excessive stop dwell/count: ${longDwellVehicleIds.join(", ")}`);
+  }
+
+  return {
+    congested,
+    corridors,
+    overloadedCorridors,
+    pingPongLoopIntrusionIds,
+    longDwellVehicleIds,
+    summaryText: summaryParts.length > 0 ? summaryParts.join(" | ") : "All corridors within traffic capacity",
+  };
+}
+
+/**
+ * Picks the best under-capacity drivable corridor near `(targetX, targetZ)` when assigning
+ * a newly placed or re-routed vehicle so new cars don't all pile onto `path-main-loop`.
+ */
+export function chooseLeastCongestedRoad(
+  targetX: number,
+  targetZ: number,
+  preferredKind: PathKind,
+  creations: WorldCreation[],
+  paths: WorldPath[],
+  excludeVehicleId?: string,
+): WorldPath | null {
+  const filteredCreations = excludeVehicleId
+    ? creations.filter((c) => c.id !== excludeVehicleId)
+    : creations;
+  const report = analyzeWorldTrafficCongestion(filteredCreations, paths);
+  const loadById = new Map(report.corridors.map((c) => [c.pathId, c]));
+
+  const candidates = paths.filter((p) => {
+    const info = loadById.get(p.id);
+    return Boolean(info);
+  });
+  if (candidates.length === 0) return null;
+
+  let best: WorldPath | null = null;
+  let bestScore = Infinity;
+  for (const p of candidates) {
+    const info = loadById.get(p.id)!;
+    const curve = sampleCatmullRom2D(p.points, Boolean(p.closed), 0.75);
+    const d = distPointToPolyline2D(targetX, targetZ, curve).dist;
+    const loadRatio = info.vehicleIds.length / Math.max(1, info.capacity);
+    const overloadPenalty = info.vehicleIds.length >= info.capacity ? 240 + info.vehicleIds.length * 90 : loadRatio * 55;
+    const kindPenalty = p.kind === preferredKind ? 0 : 18;
+    const score = d * 0.65 + overloadPenalty + kindPenalty;
+    if (score < bestScore) {
+      bestScore = score;
+      best = p;
+    }
+  }
+  return best;
+}
+
+/**
+ * Deterministic SimCity Traffic Orchestrator pass:
+ * 1. Trims regional `pingpong` haul/shuttle routes so they terminate cleanly at their outer
+ *    district ring junction instead of driving around `path-main-loop`.
+ * 2. Rebalances any corridor exceeding capacity (`> 2` vehicles) by moving excess non-seed
+ *    vehicles onto underutilized district avenues/boulevards.
+ * 3. Deduplicates waypoints, spaces stops >= 14m apart, caps `dwellSec <= 2.2s`, and staggers
+ *    speeds on shared roads so vehicles flow continuously without bunching.
+ */
+export function decongestWorldTraffic(
+  creations: WorldCreation[],
+  paths: WorldPath[],
+): { changedIds: string[]; notes: string[] } {
+  const changedIds = new Set<string>();
+  const notes: string[] = [];
+
+  const drivable = paths
+    .filter((p) => (p.kind === "road" || p.kind === "cottage_road") && p.points.length >= 2)
+    .map((p) => {
+      const curve = sampleCatmullRom2D(p.points, Boolean(p.closed), 0.75);
+      const lengthM = polylineLength2D(curve, Boolean(p.closed));
+      return { path: p, curve, lengthM };
+    })
+    .filter((rc) => rc.lengthM >= 26 || rc.path.id === "path-main-loop");
+
+  const mainLoop = drivable.find((rc) => rc.path.id === "path-main-loop");
+  if (!mainLoop) return { changedIds: [], notes: [] };
+
+  // Step 1: Trim regional/cross-town ping-pong routes off `path-main-loop`
+  for (const c of creations) {
+    if (c.behavior?.type !== "vehicle_route") continue;
+    let wps = dedupeConsecutiveWaypoints(c.behavior.waypoints ?? []);
+    if (wps.length < 2) continue;
+
+    const origJson = JSON.stringify({
+      loopMode: c.behavior.loopMode,
+      speed: c.behavior.speed,
+      waypoints: c.behavior.waypoints,
+      stops: c.behavior.stops,
+    });
+
+    if (c.behavior.loopMode === "pingpong") {
+      const onRingFlags = wps.map(
+        ([wx, wz]) => distPointToPolyline2D(wx, wz, mainLoop.curve).dist <= 2.2,
+      );
+      const ringCount = onRingFlags.filter(Boolean).length;
+
+      if (ringCount >= 1) {
+        const startsOffRing = !onRingFlags[0];
+        const endsOffRing = !onRingFlags[onRingFlags.length - 1];
+        const firstRingIdx = onRingFlags.findIndex(Boolean);
+
+        if (startsOffRing && !endsOffRing) {
+          // Regional haul/patrol entering town: stop cleanly at the T-junction curb just outside `path-main-loop`
+          const offRingPrefix = wps.slice(0, firstRingIdx);
+          if (offRingPrefix.length >= 2 && polylineLength2D(offRingPrefix, false) >= 16) {
+            wps = offRingPrefix;
+          } else if (firstRingIdx >= 1) {
+            wps = wps.slice(0, firstRingIdx + 1);
+          }
+        } else if (!startsOffRing && endsOffRing) {
+          let lastRingIdx = 0;
+          for (let i = 0; i < onRingFlags.length; i++) {
+            if (onRingFlags[i]) lastRingIdx = i;
+            else break;
+          }
+          const offRingSuffix = wps.slice(lastRingIdx + 1);
+          if (offRingSuffix.length >= 2 && polylineLength2D(offRingSuffix, false) >= 16) {
+            wps = offRingSuffix;
+          } else {
+            wps = wps.slice(lastRingIdx);
+          }
+        } else if (startsOffRing && endsOffRing && ringCount >= 2) {
+          const offRingPrefix = wps.slice(0, firstRingIdx);
+          if (c.isCompanion && offRingPrefix.length >= 2 && polylineLength2D(offRingPrefix, false) >= 55) {
+            wps = offRingPrefix;
+          } else {
+            const alt = chooseLeastCongestedRoad(
+              c.x,
+              c.z,
+              "road",
+              creations,
+              paths.filter((p) => p.id !== "path-main-loop"),
+              c.id,
+            );
+            if (alt && alt.points.length >= 3) {
+              wps = dedupeConsecutiveWaypoints(alt.points);
+            } else if (offRingPrefix.length >= 2) {
+              wps = offRingPrefix;
+            }
+          }
+        }
+      }
+    }
+
+    const closed = c.behavior.loopMode !== "pingpong";
+    const cleanStops = sanitizeStopsAlongWaypoints(c.behavior.stops, wps, closed, c.id);
+
+    const nextBehavior = {
+      ...c.behavior,
+      waypoints: wps,
+      stops: cleanStops,
+    };
+    const nextJson = JSON.stringify({
+      loopMode: nextBehavior.loopMode,
+      speed: nextBehavior.speed,
+      waypoints: nextBehavior.waypoints,
+      stops: nextBehavior.stops,
+    });
+    if (origJson !== nextJson) {
+      c.behavior = nextBehavior;
+      c.x = wps[0][0];
+      c.z = wps[0][1];
+      changedIds.add(c.id);
+      notes.push(`trimmed "${c.name}" (${c.id}) route & stops for smooth traffic flow`);
+    }
+  }
+
+  // Step 2: Enforce corridor capacity (max 2 vehicles per corridor) & stagger speeds
+  const report = analyzeWorldTrafficCongestion(creations, paths);
+  for (const overloaded of report.overloadedCorridors) {
+    const movableIds = overloaded.vehicleIds.filter((vid) => {
+      const vc = creations.find((x) => x.id === vid);
+      return vc && !vc.isSeed;
+    });
+    const excessCount = overloaded.vehicleIds.length - overloaded.capacity;
+    for (let i = 0; i < excessCount && i < movableIds.length; i++) {
+      const vid = movableIds[movableIds.length - 1 - i];
+      const vc = creations.find((x) => x.id === vid);
+      if (!vc || vc.behavior?.type !== "vehicle_route") continue;
+
+      const altRoad = chooseLeastCongestedRoad(
+        vc.x,
+        vc.z,
+        overloaded.kind,
+        creations,
+        paths.filter((p) => p.id !== overloaded.pathId),
+        vc.id,
+      );
+      if (!altRoad || altRoad.points.length < 2) continue;
+
+      const isClosed = Boolean(altRoad.closed) && altRoad.points.length >= 4;
+      const newWps = dedupeConsecutiveWaypoints(altRoad.points);
+      const newStops = sanitizeStopsAlongWaypoints(vc.behavior.stops, newWps, isClosed, vc.id);
+      vc.behavior = {
+        ...vc.behavior,
+        loopMode: isClosed ? "loop" : "pingpong",
+        waypoints: newWps,
+        stops: newStops,
+      };
+      vc.x = newWps[0][0];
+      vc.z = newWps[0][1];
+      changedIds.add(vc.id);
+      notes.push(`rerouted "${vc.name}" (${vc.id}) from congested ${overloaded.pathId} onto ${altRoad.id}`);
+    }
+  }
+
+  // Step 3: Stagger speeds slightly among vehicles sharing any corridor so they don't platoon
+  const postReport = analyzeWorldTrafficCongestion(creations, paths);
+  for (const corr of postReport.corridors) {
+    if (corr.vehicleIds.length < 2) continue;
+    corr.vehicleIds.forEach((vid, slotIdx) => {
+      const vc = creations.find((x) => x.id === vid);
+      if (!vc || vc.behavior?.type !== "vehicle_route" || vc.isSeed) return;
+      const desiredSpeed = Number((5.5 + (slotIdx % 3) * 0.55).toFixed(2));
+      if (Math.abs((vc.behavior.speed || 5.8) - desiredSpeed) > 0.35) {
+        vc.behavior = { ...vc.behavior, speed: desiredSpeed };
+        changedIds.add(vc.id);
+      }
+    });
+  }
+
+  return { changedIds: [...changedIds], notes };
 }

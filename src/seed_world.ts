@@ -15,7 +15,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
   // chrome bumpers, headlights/taillights, stop sign arm, and 2 rolling wheel axles.
   const busBlueprint = normalizeAndGroundBlueprint({
     name: "Sunnyvale School Bus",
-    description: "Yellow village school bus with black trim, stop sign arm, and twin headlights.",
+    description: "Town school bus picking up and dropping off commuters around the central loop.",
     category: "vehicle",
     scaleClass: "medium",
     palette: {
@@ -101,7 +101,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
   // 2. Hearthstone Windmill Bakery
   const bakeryBlueprint = normalizeAndGroundBlueprint({
     name: "Hearthstone Windmill Bakery",
-    description: "Stone windmill bakery with four rotating timber sails, brick oven, and striped awning.",
+    description: "Neighborhood windmill bakery grinding grain and baking fresh bread for the west village.",
     category: "building",
     scaleClass: "large",
     palette: {
@@ -168,7 +168,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
   // 3. Clocktower Village Station
   const clocktowerBlueprint = normalizeAndGroundBlueprint({
     name: "Clocktower Village Station",
-    description: "Limestone and copper clocktower with illuminated dials and covered timber waiting porch.",
+    description: "Central transit station and town clock where neighborhood bus and shuttle routes meet.",
     category: "building",
     scaleClass: "large",
     palette: {
@@ -232,7 +232,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
   // 4. Matcha Corner Bookshop
   const bookshopBlueprint = normalizeAndGroundBlueprint({
     name: "Matcha Corner Bookshop",
-    description: "Two-storey sage-green timber bookshop with bay windows and rooftop planter boxes.",
+    description: "Corner bookshop and cafe where townsfolk stop to browse books over tea.",
     category: "building",
     scaleClass: "medium",
     palette: {
@@ -282,7 +282,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
   // 5. Meadow Golden Retriever Puppy
   const puppyBlueprint = normalizeAndGroundBlueprint({
     name: "Clover the Golden Pup",
-    description: "Golden retriever puppy with red collar and articulated legs.",
+    description: "Town dog trotting around the central green to greet passersby.",
     category: "creature",
     scaleClass: "small",
     palette: {
@@ -367,7 +367,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
   // 6. Lilypad Mallard Duckling on Clover Pond
   const duckBlueprint = normalizeAndGroundBlueprint({
     name: "Sunny Pond Mallard",
-    description: "Mallard duck with green head feathers, brown wings, and orange bill.",
+    description: "Resident mallard swimming laps around Clover Pond in the center of town.",
     category: "watercraft",
     scaleClass: "small",
     palette: {
@@ -443,7 +443,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
             name: "Clocktower Station",
             x: 0,
             z: -20,
-            dwellSec: 4.2,
+            dwellSec: 2.0,
             nearCreationId: "seed-clocktower-station",
           },
           {
@@ -451,7 +451,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
             name: "Bookshop Corner",
             x: 24,
             z: 8,
-            dwellSec: 4.0,
+            dwellSec: 2.0,
             nearCreationId: "seed-matcha-bookshop",
           },
           {
@@ -459,11 +459,11 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
             name: "Windmill Bakery",
             x: -24,
             z: -2,
-            dwellSec: 4.2,
+            dwellSec: 2.0,
             nearCreationId: "seed-windmill-bakery",
           },
         ],
-        statusLine: "Downtown avenue bus loop",
+        statusLine: "Town bus circling the central commuter loop",
       },
       integratedLevel: 2,
       createdAt: now - 300_000,
@@ -484,7 +484,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
         type: "landmark",
         facingYaw: Math.PI / 2,
         activity: "windmill bakery",
-        statusLine: "Windmill bakery on West Avenue",
+        statusLine: "Neighborhood bakery grinding grain and baking fresh bread",
       },
       integratedLevel: 2,
       createdAt: now - 280_000,
@@ -505,7 +505,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
         type: "landmark",
         facingYaw: 0,
         activity: "transit clocktower",
-        statusLine: "North Avenue transit station",
+        statusLine: "Central transit hub where town bus and shuttle lines meet",
       },
       integratedLevel: 2,
       createdAt: now - 260_000,
@@ -525,7 +525,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
         type: "landmark",
         facingYaw: -Math.PI / 2,
         activity: "bookshop and cafe",
-        statusLine: "Corner bookshop on East Avenue",
+        statusLine: "Corner bookshop and tea room for neighborhood readers",
       },
       integratedLevel: 2,
       createdAt: now - 240_000,
@@ -554,7 +554,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
           [13, -5],
           [4, -8],
         ],
-        statusLine: "Golden retriever puppy",
+        statusLine: "Town dog trotting around the central green",
       },
       integratedLevel: 2,
       createdAt: now - 220_000,
@@ -576,7 +576,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
         pondX: -7,
         pondZ: 3,
         radius: 4.2,
-        statusLine: "Central Pond mallard",
+        statusLine: "Resident mallard swimming laps on Clover Pond",
       },
       integratedLevel: 2,
       createdAt: now - 200_000,

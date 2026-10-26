@@ -852,11 +852,13 @@ class CreationSimEntity {
     this.routeClosed = true;
     this.routeDir = 1;
     this.routeLength = 1;
-    this.routeDist = (index * 13.7) % 40;
+    this.routeDist = (index * 37.3) % 120;
     this.stopArcPositions = [];
     this.dwellingStop = null;
     this.dwellTimer = 0;
     this.lastStoppedId = null;
+    this.currentLaneOffset = 0.92;
+    this.yieldTimer = 0;
     this.doorX = this.x;
     this.doorZ = this.z;
 
@@ -1012,15 +1014,21 @@ class CreationSimEntity {
     let rollZ = 0;
 
     if (b?.type === "vehicle_route" && this.routeCurve) {
+      let targetLane = 0.92;
       if (this.dwellingStop) {
+        const isTurnStop =
+          this.dwellingStop.id === "__turn_end__" || this.dwellingStop.id === "__turn_start__";
+        targetLane = isTurnStop ? 0.92 : 1.68;
         this.dwellTimer -= dt;
         this.moveFactor = 0;
+        this.yieldTimer = 0;
         if (this.dwellTimer <= 0) {
           this.lastStoppedId = this.dwellingStop.id;
           this.dwellingStop = null;
         }
       } else {
         let speedScale = 1.0;
+        let pullingOver = false;
         for (const sp of this.stopArcPositions) {
           let ahead = this.routeClosed
             ? sp.distOnCurve - this.routeDist
@@ -1033,12 +1041,13 @@ class CreationSimEntity {
           if (Math.abs(ahead) > 4.2 && this.lastStoppedId === sp.stop.id) {
             this.lastStoppedId = null;
           }
-          if (sp.stop.id !== this.lastStoppedId && ahead >= -0.4 && ahead < 6.0) {
-            speedScale = Math.max(0.22, ahead / 6.0);
+          if (sp.stop.id !== this.lastStoppedId && ahead >= -0.4 && ahead < 5.0) {
+            pullingOver = true;
+            speedScale = Math.max(0.28, ahead / 5.0);
             if (ahead <= 0.45) {
               this.routeDist = sp.distOnCurve;
               this.dwellingStop = sp.stop;
-              this.dwellTimer = sp.stop.dwellSec || 4.0;
+              this.dwellTimer = Math.min(2.2, sp.stop.dwellSec || 1.8);
               if (!this.routeClosed) {
                 if (this.routeDir > 0 && sp.distOnCurve >= this.routeLength - 2.2) {
                   this.routeDir = -1;
@@ -1051,21 +1060,61 @@ class CreationSimEntity {
             }
           }
         }
+        if (pullingOver) {
+          targetLane = 1.65;
+        }
 
         if (speedScale > 0) {
           const fwdX = Math.sin(this.yaw);
           const fwdZ = Math.cos(this.yaw);
+          const curRightX = -Math.cos(this.yaw);
+          const curRightZ = Math.sin(this.yaw);
+          let yielding = false;
+
           for (const other of allEntities) {
             if (other === this || other.data.behavior?.type !== "vehicle_route") continue;
             const dx = other.x - this.x;
             const dz = other.z - this.z;
             const dist = Math.hypot(dx, dz);
-            if (dist < 8.2 && dist > 0.01) {
-              const dot = (dx * fwdX + dz * fwdZ) / dist;
-              if (dot > 0.35 || (dot > -0.15 && this.id > other.id)) {
-                speedScale = Math.min(speedScale, Math.max(0, (dist - 5.4) / 2.8));
+            if (dist >= 9.5 || dist < 0.01) continue;
+
+            const otherFwdX = Math.sin(other.yaw);
+            const otherFwdZ = Math.cos(other.yaw);
+            const headingDot = fwdX * otherFwdX + fwdZ * otherFwdZ;
+            const aheadDist = dx * fwdX + dz * fwdZ;
+            const latDist = Math.abs(dx * curRightX + dz * curRightZ);
+
+            // Oncoming traffic in the opposite lane (`headingDot < -0.25`) passes freely!
+            if (headingDot > 0.45) {
+              if (other.dwellingStop) {
+                // Overtake curb-parked vehicles smoothly instead of queuing behind them
+                if (aheadDist > -2.5 && aheadDist < 9.0 && !pullingOver) {
+                  targetLane = 0.24;
+                  speedScale = Math.min(speedScale, 0.85);
+                }
+              } else if (aheadDist > 0 && aheadDist < 7.6 && latDist < 1.3) {
+                speedScale = Math.min(speedScale, Math.max(0.08, (aheadDist - 4.2) / 3.4));
+              }
+            } else if (
+              headingDot >= -0.25 &&
+              !other.dwellingStop &&
+              other.moveFactor > 0.15 &&
+              aheadDist > 0.4 &&
+              aheadDist < 5.4 &&
+              dist < 5.6 &&
+              this.id > other.id
+            ) {
+              if (this.yieldTimer < 1.6) {
+                speedScale = Math.min(speedScale, Math.max(0.05, (dist - 3.8) / 1.8));
+                yielding = true;
               }
             }
+          }
+
+          if (yielding) {
+            this.yieldTimer += dt;
+          } else {
+            this.yieldTimer = Math.max(0, this.yieldTimer - dt * 2.0);
           }
         }
 
@@ -1078,15 +1127,19 @@ class CreationSimEntity {
             this.routeDist = this.routeLength - 0.12;
             this.routeDir = -1;
             const termStop = this.stopArcPositions.find((s) => s.distOnCurve >= this.routeLength - 3.0);
-            this.dwellingStop = termStop ? termStop.stop : { id: "__turn_end__", dwellSec: 3.0 };
-            this.dwellTimer = this.dwellingStop.dwellSec || 3.0;
+            this.dwellingStop = termStop
+              ? { ...termStop.stop, dwellSec: Math.min(2.0, termStop.stop.dwellSec || 1.6) }
+              : { id: "__turn_end__", dwellSec: 1.0 };
+            this.dwellTimer = this.dwellingStop.dwellSec || 1.0;
             speedScale = 0;
           } else if (this.routeDir < 0 && this.routeDist <= 0.12) {
             this.routeDist = 0.12;
             this.routeDir = 1;
             const startStop = this.stopArcPositions.find((s) => s.distOnCurve <= 3.0);
-            this.dwellingStop = startStop ? startStop.stop : { id: "__turn_start__", dwellSec: 3.0 };
-            this.dwellTimer = this.dwellingStop.dwellSec || 3.0;
+            this.dwellingStop = startStop
+              ? { ...startStop.stop, dwellSec: Math.min(2.0, startStop.stop.dwellSec || 1.6) }
+              : { id: "__turn_start__", dwellSec: 1.0 };
+            this.dwellTimer = this.dwellingStop.dwellSec || 1.0;
             speedScale = 0;
           }
         }
@@ -1102,9 +1155,10 @@ class CreationSimEntity {
       const dirSign = this.routeClosed ? 1 : this.routeDir;
       this.yaw = Math.atan2(tan.x * dirSign, tan.z * dirSign);
 
+      this.currentLaneOffset += (targetLane - this.currentLaneOffset) * Math.min(1, dt * 5.2);
       const rightX = -Math.cos(this.yaw);
       const rightZ = Math.sin(this.yaw);
-      const laneOffset = this.routeClosed ? 0 : 0.46;
+      const laneOffset = this.currentLaneOffset;
       this.x = pos.x + rightX * laneOffset;
       this.z = pos.z + rightZ * laneOffset;
       this.y = 0.092;

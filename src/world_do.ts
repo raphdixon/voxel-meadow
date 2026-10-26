@@ -59,8 +59,11 @@ import {
   buildSingleModernistTowerBlueprint,
 } from "./world_landmarks_v16";
 import {
+  analyzeWorldTrafficCongestion,
+  chooseLeastCongestedRoad,
   chooseSimCityPlot,
   computeIntelligentBuildingYaw,
+  decongestWorldTraffic,
   FACTUAL_CREATION_DESCRIPTIONS,
   normalizeFactualDescription,
   nudgeWanderPointClearOfWorld,
@@ -612,6 +615,15 @@ export class WorldDO extends DurableObject<Env> {
     if (upgradedV18.length === 0) {
       this.runUpgradeV18WanderClearance();
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v18_wander_clearance', '1')`);
+    }
+
+    // One-time v19 traffic decongestion & identity-purpose descriptions upgrade
+    const upgradedV19 = sql
+      .exec(`SELECT value FROM meta WHERE key = 'upgrade_v19_traffic_and_intent' LIMIT 1`)
+      .toArray();
+    if (upgradedV19.length === 0) {
+      this.runUpgradeV19TrafficAndIntent();
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v19_traffic_and_intent', '1')`);
     }
 
     // Lightweight startup overlap & planar road-crossing repair (< 4ms, zero LLM calls)
@@ -1452,6 +1464,46 @@ export class WorldDO extends DurableObject<Env> {
     this.bumpVersion();
   }
 
+  private runUpgradeV19TrafficAndIntent(): void {
+    const sql = this.ctx.storage.sql;
+    const creationRows = sql.exec(`SELECT id, json FROM creations ORDER BY created_at ASC`).toArray();
+    const creations = creationRows.map((r) => JSON.parse(String(r.json)) as WorldCreation);
+    const pathRows = sql.exec(`SELECT id, json FROM paths`).toArray();
+    const paths = pathRows.map((r) => JSON.parse(String(r.json)) as WorldPath);
+
+    const changed = new Set<string>();
+    for (const c of creations) {
+      const copy = FACTUAL_CREATION_DESCRIPTIONS[c.id];
+      if (!copy) continue;
+      c.description = copy.description;
+      if (c.blueprint) {
+        c.blueprint.description = copy.description;
+      }
+      if (c.behavior) {
+        c.behavior = {
+          ...c.behavior,
+          statusLine: copy.statusLine,
+        };
+      }
+      changed.add(c.id);
+    }
+
+    const decong = decongestWorldTraffic(creations, paths);
+    for (const cid of decong.changedIds) {
+      changed.add(cid);
+    }
+
+    for (const c of creations) {
+      if (!changed.has(c.id)) continue;
+      sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(c), c.id);
+    }
+    this.setMeta(
+      "lastWeaveNote",
+      "Orchestrator rebalanced district vehicle traffic and updated creation purpose descriptions.",
+    );
+    this.bumpVersion();
+  }
+
   private auditAndRepairWorld(): { repairedCount: number; repairs: string[] } {
     const sql = this.ctx.storage.sql;
     const repairs: string[] = [];
@@ -1533,8 +1585,16 @@ export class WorldDO extends DurableObject<Env> {
               ),
           );
         if (hasOffRoadWaypoint) {
-          const basePts = mainLoopEntry.path.points;
-          const shift = (myVehSlot * Math.floor(basePts.length / 2)) % basePts.length;
+          const chosenRoad =
+            chooseLeastCongestedRoad(c.x, c.z, "road", creations, spatial.paths, c.id) ??
+            mainLoopEntry.path;
+          const chosenEntry =
+            acceptedDriveCurves.find((r) => r.path.id === chosenRoad.id) ?? mainLoopEntry;
+          const isClosedRoad = Boolean(chosenRoad.closed) && chosenRoad.points.length >= 4;
+          const basePts = chosenRoad.points;
+          const shift = isClosedRoad
+            ? (myVehSlot * Math.floor(basePts.length / 2)) % basePts.length
+            : 0;
           const alignedWps: [number, number][] = basePts.map((_, idx) => {
             const p = basePts[(idx + shift) % basePts.length];
             return [p[0], p[1]];
@@ -1542,48 +1602,63 @@ export class WorldDO extends DurableObject<Env> {
           const rawStops = c.behavior.stops ?? [];
           const alignedStops = rawStops
             .map((st) => {
-              const h = distPointToPolyline2D(st.x, st.z, mainLoopEntry.curve);
+              const h = distPointToPolyline2D(st.x, st.z, chosenEntry.curve);
               return {
                 ...st,
                 x: Math.round(h.closestX * 10) / 10,
                 z: Math.round(h.closestZ * 10) / 10,
+                dwellSec: Math.min(2.2, Math.max(1.4, st.dwellSec || 1.8)),
               };
             })
             .filter(
               (st, idx, arr) =>
-                arr.findIndex((o) => Math.hypot(o.x - st.x, o.z - st.z) < 6.0) === idx,
+                arr.findIndex((o) => Math.hypot(o.x - st.x, o.z - st.z) < 14.0) === idx,
             )
-            .slice(0, 5);
+            .slice(0, 3);
+          const stopEnd = isClosedRoad
+            ? basePts[Math.floor(basePts.length / 2)]
+            : basePts[basePts.length - 1];
           c.x = alignedWps[0][0];
           c.z = alignedWps[0][1];
           c.behavior = {
             ...c.behavior,
-            loopMode: "loop",
+            loopMode: isClosedRoad ? "loop" : "pingpong",
             waypoints: alignedWps,
             stops:
               alignedStops.length >= 2
                 ? alignedStops
                 : [
                     {
-                      id: `stop-${c.id}-north`,
-                      name: "Clocktower Station",
-                      x: basePts[1][0],
-                      z: basePts[1][1],
-                      dwellSec: 4.0,
+                      id: `stop-${c.id}-a`,
+                      name: "Route Stop A",
+                      x: basePts[0][0],
+                      z: basePts[0][1],
+                      dwellSec: 1.8,
                     },
                     {
-                      id: `stop-${c.id}-south`,
-                      name: "Clover Pond South",
-                      x: basePts[5 % basePts.length][0],
-                      z: basePts[5 % basePts.length][1],
-                      dwellSec: 4.0,
+                      id: `stop-${c.id}-b`,
+                      name: "Route Stop B",
+                      x: stopEnd[0],
+                      z: stopEnd[1],
+                      dwellSec: 1.8,
                     },
                   ],
           };
           sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(c), c.id);
-          repairs.push(`aligned vehicle "${c.name}" (${c.id}) cleanly onto village ring road`);
+          repairs.push(`aligned vehicle "${c.name}" (${c.id}) cleanly onto ${chosenRoad.id}`);
         }
       }
+    }
+
+    // Continuously rebalance traffic load across district corridors so cars never jam up downtown
+    const decong = decongestWorldTraffic(creations, spatial.paths);
+    if (decong.changedIds.length > 0) {
+      for (const cid of decong.changedIds) {
+        const target = creations.find((c) => c.id === cid);
+        if (!target) continue;
+        sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(target), cid);
+      }
+      repairs.push(...decong.notes);
     }
 
     // Align non-seed stationary buildings & landmarks to face their approach road/lane naturally
@@ -1796,12 +1871,10 @@ export class WorldDO extends DurableObject<Env> {
       snapshot.creations.some(
         (c) =>
           c.id === "c-mvogm9ja-6cd891" &&
-          c.behavior?.type === "wander" &&
-          Array.isArray(c.behavior.targets) &&
-          c.behavior.targets.some(([tx, tz]) => Math.hypot(tx - 118, tz - -114) < 20),
+          !/protect|perimeter|guard/i.test(c.description || ""),
       )
     ) {
-      this.runUpgradeV18WanderClearance();
+      this.runUpgradeV19TrafficAndIntent();
     }
     const repairRes = this.auditAndRepairWorld();
     const after = this.readBaseWorld();
@@ -2931,6 +3004,10 @@ export class WorldDO extends DurableObject<Env> {
         existing.category = upd.category;
         existing.blueprint.category = upd.category;
       }
+      if (typeof upd.description === "string" && upd.description.trim().length > 0) {
+        existing.description = upd.description.trim();
+        existing.blueprint.description = upd.description.trim();
+      }
 
       existing.behavior = upd.behavior;
       if (typeof upd.yaw === "number" && Number.isFinite(upd.yaw)) {
@@ -3543,10 +3620,14 @@ export class WorldDO extends DurableObject<Env> {
     const hasStuckMobile = world.creations.some(
       (c) => !c.isSeed && !c.isCompanion && needsMobilityAmendment(c),
     );
+    const hasTrafficCongestion = analyzeWorldTrafficCongestion(
+      world.creations,
+      world.paths,
+    ).congested;
     const lastWeaveCount = Number(this.getMeta("lastWeaveCount", "0")) || 0;
     const hasNewCreations = world.creations.length > lastWeaveCount;
 
-    if (!hasUnintegrated && !hasStuckMobile && !hasNewCreations) {
+    if (!hasUnintegrated && !hasStuckMobile && !hasTrafficCongestion && !hasNewCreations) {
       return {
         ok: true,
         note: criticAudit.note

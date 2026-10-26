@@ -177,7 +177,7 @@ const SCULPTOR_SYSTEM_PROMPT = `You are Master Voxel Sculptor Argon, creating br
   "safe": true,
   "extractedSubject": "concise phrase of what was extracted/sculpted",
   "name": "Clear 2-4 Word Object Title",
-  "description": "Plain, objective 1-sentence physical description of the object or building itself (under 110 characters, e.g. 'Two-storey red-brick firehouse with arched engine bays and brass bell cupola.' — NO narrative voice, storytelling, or whimsical scene-setting!)",
+  "description": "Concise 1-sentence statement (under 115 characters) of WHAT this thing is and WHAT its purpose, role, or intention is in the town (e.g. 'Giant defense mecha circling the outer perimeter to protect everyone inside.' or 'Open-pit rare-earth mine extracting minerals for the city.'). NEVER describe visual appearance, colors, wall materials, or architecture ('tall black walls', 'two-storey red-brick with arched windows') — viewers can already see how it looks!",
   "category": "vehicle" | "creature" | "building" | "prop" | "aircraft" | "watercraft",
   "scaleClass": "tiny" | "small" | "medium" | "large" | "colossal",
   "liveFeed": null,

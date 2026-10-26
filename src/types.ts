@@ -134,6 +134,7 @@ export type CreationBehavior =
       speed: number;
       waypoints: [number, number][];
       stops: RouteStop[];
+      loopMode?: "loop" | "pingpong";
       statusLine: string;
     }
   | {
@@ -196,10 +197,13 @@ export interface WorldCreation {
   integratedLevel: number;
   createdAt: number;
   isSeed?: boolean;
+  isCompanion?: boolean;
+  companionOfId?: string;
 }
 
 export type PathKind =
   | "road"
+  | "cottage_road"
   | "footpath"
   | "dirt_trail"
   | "cobblestone"

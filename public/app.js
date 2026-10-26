@@ -247,6 +247,7 @@ engine = createMeadowWorldEngine(
 );
 
 window.__geminIslandCam = () => engine.getCameraState();
+window.__geminIslandEngine = engine;
 
 camPanBtn?.addEventListener("click", () => {
   engine.setDragMode("pan");

@@ -54,14 +54,14 @@ export function estimatePreviewPlotRadius(promptText = "") {
   const s = String(promptText || "").trim();
   if (!s) return 3.3;
   if (
-    /\b(volcano|stratovolcano|caldera|mountain|mt\.|everest|fuji|matterhorn|glacier|canyon|mesa|castle|citadel|fortress|palace|cathedral|stadium|arena|colosseum|amphitheater|amphitheatre|pyramid|ziggurat|launch\s*pad|spaceport|world\s*tree|yggdrasil|colossus|kaiju|godzilla|giant\s+waterfall|niagara|skyscraper|megastructure)\b/i.test(
+    /\b(volcano|stratovolcano|caldera|mountain|mt\.|everest|fuji|matterhorn|glacier|canyon|mesa|waterfall|cascade|cataract|niagara|castle|citadel|fortress|palace|cathedral|stadium|arena|colosseum|amphitheater|amphitheatre|pyramid|ziggurat|launch\s*pad|spaceport|world\s*tree|yggdrasil|colossus|kaiju|godzilla|skyscraper|megastructure)\b/i.test(
       s,
     )
   ) {
     return 9.8;
   }
   if (
-    /\b(waterfall|cascade|cliff|clocktower|tower|windmill|lighthouse|datacentre|datacenter|factory|station|barn|bridge|temple|pagoda|museum|library|hotel|ship|galleon|roller\s*coaster)\b/i.test(
+    /\b(cliff|clocktower|tower|windmill|lighthouse|datacentre|datacenter|factory|quarry|mine|firehouse|station|barn|bridge|temple|pagoda|museum|library|hotel|ship|galleon|roller\s*coaster)\b/i.test(
       s,
     )
   ) {
@@ -849,6 +849,8 @@ class CreationSimEntity {
     this.feedMesh = null;
 
     this.routeCurve = null;
+    this.routeClosed = true;
+    this.routeDir = 1;
     this.routeLength = 1;
     this.routeDist = (index * 13.7) % 40;
     this.stopArcPositions = [];
@@ -919,6 +921,10 @@ class CreationSimEntity {
     if (wasStationary && creation.behavior?.type === "landmark") {
       this.x = creation.x;
       this.z = creation.z;
+      this.yaw =
+        typeof creation.behavior.facingYaw === "number"
+          ? creation.behavior.facingYaw
+          : creation.yaw || 0;
     }
     const nextSig = computeBlueprintSignature(creation.blueprint);
     if (creationsGroup && nextSig && nextSig !== this.blueprintSig) {
@@ -945,17 +951,22 @@ class CreationSimEntity {
       creationsGroup.add(this.group);
     }
     const b = creation.behavior;
-    if (b?.type === "vehicle_route" && Array.isArray(b.waypoints) && b.waypoints.length >= 3) {
+    const isPingPong = b?.loopMode === "pingpong";
+    const minRouteWps = isPingPong ? 2 : 3;
+    if (b?.type === "vehicle_route" && Array.isArray(b.waypoints) && b.waypoints.length >= minRouteWps) {
       const vecs = b.waypoints.map(([wx, wz]) => new THREE.Vector3(wx, 0, wz));
-      this.routeCurve = new THREE.CatmullRomCurve3(vecs, true, "centripetal", 0.5);
-      this.routeLength = Math.max(8, this.routeCurve.getLength());
-      this.routeDist = this.routeDist % this.routeLength;
+      this.routeClosed = !isPingPong;
+      this.routeCurve = new THREE.CatmullRomCurve3(vecs, this.routeClosed, "centripetal", 0.5);
+      this.routeLength = Math.max(4, this.routeCurve.getLength());
+      this.routeDist = this.routeClosed
+        ? this.routeDist % this.routeLength
+        : Math.max(0.2, Math.min(this.routeLength - 0.2, this.routeDist % this.routeLength));
 
       const samples = 160;
       this.stopArcPositions = (b.stops || []).map((stop) => {
         let bestU = 0;
         let bestD = Infinity;
-        for (let i = 0; i < samples; i++) {
+        for (let i = 0; i <= samples; i++) {
           const u = i / samples;
           const pt = this.routeCurve.getPointAt(u);
           const d = Math.hypot(pt.x - stop.x, pt.z - stop.z);
@@ -1007,9 +1018,13 @@ class CreationSimEntity {
       } else {
         let speedScale = 1.0;
         for (const sp of this.stopArcPositions) {
-          let ahead = sp.distOnCurve - this.routeDist;
-          if (ahead < -this.routeLength * 0.5) ahead += this.routeLength;
-          if (ahead > this.routeLength * 0.5) ahead -= this.routeLength;
+          let ahead = this.routeClosed
+            ? sp.distOnCurve - this.routeDist
+            : (sp.distOnCurve - this.routeDist) * this.routeDir;
+          if (this.routeClosed) {
+            if (ahead < -this.routeLength * 0.5) ahead += this.routeLength;
+            if (ahead > this.routeLength * 0.5) ahead -= this.routeLength;
+          }
 
           if (Math.abs(ahead) > 4.2 && this.lastStoppedId === sp.stop.id) {
             this.lastStoppedId = null;
@@ -1020,6 +1035,13 @@ class CreationSimEntity {
               this.routeDist = sp.distOnCurve;
               this.dwellingStop = sp.stop;
               this.dwellTimer = sp.stop.dwellSec || 4.0;
+              if (!this.routeClosed) {
+                if (this.routeDir > 0 && sp.distOnCurve >= this.routeLength - 2.2) {
+                  this.routeDir = -1;
+                } else if (this.routeDir < 0 && sp.distOnCurve <= 2.2) {
+                  this.routeDir = 1;
+                }
+              }
               speedScale = 0;
               break;
             }
@@ -1044,21 +1066,44 @@ class CreationSimEntity {
         }
 
         const stepDist = (b.speed || 6.0) * speedScale * dt;
-        this.routeDist = (this.routeDist + stepDist) % this.routeLength;
+        if (this.routeClosed) {
+          this.routeDist = (this.routeDist + stepDist) % this.routeLength;
+        } else {
+          this.routeDist += this.routeDir * stepDist;
+          if (this.routeDir > 0 && this.routeDist >= this.routeLength - 0.12) {
+            this.routeDist = this.routeLength - 0.12;
+            this.routeDir = -1;
+            const termStop = this.stopArcPositions.find((s) => s.distOnCurve >= this.routeLength - 3.0);
+            this.dwellingStop = termStop ? termStop.stop : { id: "__turn_end__", dwellSec: 3.0 };
+            this.dwellTimer = this.dwellingStop.dwellSec || 3.0;
+            speedScale = 0;
+          } else if (this.routeDir < 0 && this.routeDist <= 0.12) {
+            this.routeDist = 0.12;
+            this.routeDir = 1;
+            const startStop = this.stopArcPositions.find((s) => s.distOnCurve <= 3.0);
+            this.dwellingStop = startStop ? startStop.stop : { id: "__turn_start__", dwellSec: 3.0 };
+            this.dwellTimer = this.dwellingStop.dwellSec || 3.0;
+            speedScale = 0;
+          }
+        }
         this.wheelAngle += stepDist / 0.62;
         this.moveFactor = speedScale;
       }
 
-      const u = (((this.routeDist % this.routeLength) + this.routeLength) % this.routeLength) / this.routeLength;
+      const u = this.routeClosed
+        ? (((this.routeDist % this.routeLength) + this.routeLength) % this.routeLength) / this.routeLength
+        : Math.max(0.002, Math.min(0.998, this.routeDist / this.routeLength));
       const pos = this.routeCurve.getPointAt(u);
       const tan = this.routeCurve.getTangentAt(u);
-      this.x = pos.x;
-      this.z = pos.z;
-      this.y = 0.092;
-      this.yaw = Math.atan2(tan.x, tan.z);
+      const dirSign = this.routeClosed ? 1 : this.routeDir;
+      this.yaw = Math.atan2(tan.x * dirSign, tan.z * dirSign);
 
       const rightX = -Math.cos(this.yaw);
       const rightZ = Math.sin(this.yaw);
+      const laneOffset = this.routeClosed ? 0 : 0.46;
+      this.x = pos.x + rightX * laneOffset;
+      this.z = pos.z + rightZ * laneOffset;
+      this.y = 0.092;
       this.doorX = this.x + rightX * 1.9 + Math.sin(this.yaw) * 0.9;
       this.doorZ = this.z + rightZ * 1.9 + Math.cos(this.yaw) * 0.9;
 
@@ -1210,6 +1255,8 @@ class CreationSimEntity {
       this.y = 0.004;
       if (typeof b?.facingYaw === "number") {
         this.yaw = b.facingYaw;
+      } else if (typeof this.data?.yaw === "number") {
+        this.yaw = this.data.yaw;
       }
       if (this.feedReading?.kind === "wind" && typeof this.feedReading.value === "number") {
         this.moveFactor = Math.max(0.45, Math.min(2.1, this.feedReading.value / 15));
@@ -1456,6 +1503,18 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     vv.put(variant === 0 ? -2 : 1, 0, 0, "ash");
     vv.put(0, 0, variant === 0 ? 1 : -1, "lava", 1.15);
     return buildVoxelMesh(vv, { scale: 0.2, castShadow: false, depthLayer: 2 });
+  });
+
+  const cottageBorderProtos = [0, 1, 2].map((variant) => {
+    const gv = new Vox(610 + variant * 15);
+    const stoneCol = variant === 0 ? "limestone" : variant === 1 ? "path" : "stone";
+    gv.box(-2, 0, -1, 1, 1, 1, stoneCol);
+    gv.put(1, 0, 0, variant === 1 ? "cream" : "concrete");
+    if (variant === 2) {
+      gv.put(-1, 1, 0, "leaf");
+      gv.put(0, 1, 0, "#f6d55c");
+    }
+    return buildVoxelMesh(gv, { scale: 0.16, castShadow: false, depthLayer: 1 });
   });
 
   const pathsGroup = new THREE.Group();
@@ -1767,7 +1826,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         const curve = new THREE.CatmullRomCurve3(vecs, Boolean(p.closed), "centripetal", 0.5);
         const len = Math.max(3, curve.getLength());
         return {
-          clearance: p.kind === "road" ? 3.8 : 2.35,
+          clearance: p.kind === "road" ? 3.8 : p.kind === "cottage_road" ? 2.75 : 2.35,
           pts: curve.getSpacedPoints(Math.min(120, Math.max(12, Math.round(len * 0.6)))),
         };
       });
@@ -1922,6 +1981,27 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           dash.rotation.y = Math.atan2(tan.x, tan.z);
           pathsGroup.add(dash);
         }
+      } else if (p.kind === "cottage_road") {
+        // Warm country honey-gravel cottage lane with twin wheel tracks, sandy-clover center crown & fieldstone border stones
+        const zBias = Math.min(28, pIdx) * 0.00022;
+        pathsGroup.add(buildRibbonMesh(curve, samples, 1.24, 0.032 - zBias, "#c5b089", true, -1, true));
+        pathsGroup.add(buildRibbonMesh(curve, samples, 0.90, 0.048 - zBias, "#e6d8b9", true, -2, true));
+        pathsGroup.add(buildRibbonMesh(curve, samples, 0.24, 0.056 - zBias, "#bda67b", true, -2.5, true));
+
+        const borderCount = Math.max(2, Math.floor(len / 2.2));
+        for (let i = 1; i < borderCount; i++) {
+          const u = i / borderCount;
+          const pt = curve.getPointAt(u);
+          const tan = curve.getTangentAt(u);
+          const side = i % 2 === 0 ? 1 : -1;
+          const nx = -tan.z * side;
+          const nz = tan.x * side;
+          const st = cottageBorderProtos[i % cottageBorderProtos.length].clone();
+          st.userData.sharedProto = true;
+          st.position.set(pt.x + nx * 1.14, -0.11, pt.z + nz * 1.14);
+          st.rotation.y = Math.atan2(tan.x, tan.z) + (((i * 3) % 5) - 2) * 0.12;
+          pathsGroup.add(st);
+        }
       } else if (p.kind === "dirt_trail") {
         // Gentle country dirt path with rounded ends, soft sandy-loam edge & subtle border stones
         const zBias = Math.min(28, pIdx) * 0.00022;
@@ -2054,7 +2134,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     const contribCount =
       typeof world.contributorCount === "number"
         ? world.contributorCount
-        : (world.creations || []).filter((c) => !c.isSeed).length;
+        : (world.creations || []).filter((c) => !c.isSeed && !c.isCompanion).length;
     citySignboard.updateCount(contribCount);
     updateBiomeShaderUniforms(world.terrainZones || []);
     updatePerimeterTreeClearance(world);
@@ -2903,6 +2983,26 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     clampTarget();
   }
 
+  function setCameraPose({ tx, tz, zoom, az, el, ty, instant = true } = {}) {
+    cancelIntroSweep();
+    if (fp.active) exitFirstPerson(false);
+    if (typeof tx === "number") cam.goalTx = tx;
+    if (typeof tz === "number") cam.goalTz = tz;
+    if (typeof zoom === "number") cam.goalZoom = Math.min(3.4, Math.max(0.32, zoom));
+    if (typeof az === "number") cam.goalAz = az;
+    if (typeof el === "number") cam.goalEl = Math.max(MIN_EL, Math.min(MAX_EL, el));
+    cam.goalTy = typeof ty === "number" ? ty : lowAngleTargetY(cam.goalEl);
+    clampTarget();
+    if (instant) {
+      cam.tx = cam.goalTx;
+      cam.ty = cam.goalTy;
+      cam.tz = cam.goalTz;
+      cam.zoom = cam.goalZoom;
+      cam.az = cam.goalAz;
+      cam.el = cam.goalEl;
+    }
+  }
+
   function focusCreationById(id) {
     const ent = creationEntities.get(id);
     if (!ent) return;
@@ -3274,6 +3374,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     setPreviewPrompt,
     focusCreationById,
     focusOn,
+    setCameraPose,
     recenterCamera,
     setDragMode,
     getDragMode,

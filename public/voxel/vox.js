@@ -43,6 +43,7 @@ export const PALETTE = {
   path: "#e6d6b5",
   path2: "#d8c6a1",
   concrete: "#dcd6cb",
+  stone: "#8e948c",
   concrete2: "#cfcac0",
   concreteDark: "#b4afa5",
   asphalt: "#585b63",

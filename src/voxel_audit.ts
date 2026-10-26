@@ -1,5 +1,6 @@
 import type {
   CreationBehavior,
+  PathKind,
   VoxelBlueprint,
   VoxelOp,
   VoxelPart,
@@ -8,7 +9,13 @@ import type {
   WorldPath,
   WorldProp,
 } from "./types";
-import { applySimOps, getCreationFootprintRadius, SimVox, translateOp } from "./voxel_dsl";
+import {
+  applySimOps,
+  detectBlueprintFrontAngle,
+  getCreationFootprintRadius,
+  SimVox,
+  translateOp,
+} from "./voxel_dsl";
 
 export interface PartOverlapReport {
   partIndex: number;
@@ -1252,6 +1259,190 @@ export function detectPathCrossings(paths: WorldPath[]): {
 }
 
 /**
+ * Deterministic contextual road & path classifier based on building/landmark function:
+ * - `"volcanic_trail"` -> volcanoes, lava calderas, obsidian peaks
+ * - `"boardwalk"`      -> beaches, coastlines, islands, surf docks, hammocks
+ * - `"road"`           -> mines/quarries, heavy industry, firehouses, datacentres, downtown towers, terminals
+ * - `"dirt_trail"`     -> waterfalls, cliffs, canyons, mountain camps, deep forest clearings
+ * - `"cobblestone"`    -> grand civic halls, parliaments, mansions, manors, arenas, amphitheatres, courts, pavilions, ziggurats, clocktowers
+ * - `"cottage_road"`   -> cottages, houses, bakeries, windmills, bookshops, pubs, cantinas, burger shacks, farms, apiaries
+ */
+export function inferContextualRoadKind(
+  target: Pick<WorldCreation, "name" | "description" | "creatorPrompt" | "category">,
+): PathKind {
+  const text = `${target.name ?? ""} ${target.description ?? ""} ${target.creatorPrompt ?? ""}`;
+  if (/\b(volcano|magma|lava|caldera|obsidian|geyser|brimstone)\b/i.test(text)) {
+    return "volcanic_trail";
+  }
+  if (
+    /\b(beach|surf|surfboard|lifeguard|dock|pier|coast(?:line|al)?|lagoon|island|tiki|hammock|lounger|palm)\b/i.test(
+      text,
+    )
+  ) {
+    return "boardwalk";
+  }
+  if (
+    /\b(quarry|mine|mining|ore|refinery|smelter|foundry|factory|plant|warehouse|depot|firehouse|fire\s*station|datacentre|datacenter|steel\s*tower|skyscraper|terminal|airport|spaceport)\b/i.test(
+      text,
+    )
+  ) {
+    return "road";
+  }
+  if (
+    /\b(waterfall|cascade|cataract|cliff|canyon|mountain|peak|forest|woods|grove|camp|campsite|tent|wilderness|cave|grotto)\b/i.test(
+      text,
+    )
+  ) {
+    return "dirt_trail";
+  }
+  if (
+    /\b(castle|citadel|fortress|palace|mansion|manor|villa|estate|parliament|capitol|cathedral|temple|shrine|museum|library|clocktower|arena|stadium|colosseum|amphitheater|amphitheatre|pavilion|plaza|fountain|monument|ziggurat|pyramid|court|pickleball|padel|tennis|half-?pipe|skate)\b/i.test(
+      text,
+    )
+  ) {
+    return "cobblestone";
+  }
+  if (
+    /\b(cottage|house|home|cabin|chalet|bungalow|shoe|boot|bakery|windmill|mill|bookshop|shop|store|pub|inn|tavern|cantina|burrito|shack|burger|diner|cafe|farm|barn|orchard|apiary|beehive|garden|greenhouse)\b/i.test(
+      text,
+    )
+  ) {
+    return "cottage_road";
+  }
+  return target.category === "building" ? "cottage_road" : "dirt_trail";
+}
+
+function wrapAnglePi(rad: number): number {
+  let a = rad;
+  while (a > Math.PI) a -= Math.PI * 2;
+  while (a < -Math.PI) a += Math.PI * 2;
+  return a;
+}
+
+function deterministicHashId(id: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+/**
+ * Deterministic organic frontage alignment:
+ * Orients stationary buildings and landmarks so their primary entrance (`+Z` or detected door side)
+ * faces their approach lane, cottage road, or arterial curb with subtle natural micro-variance (`±1.8°`),
+ * eliminating chaotic random yaw angles without locking the world onto a rigid 90° CAD grid.
+ */
+export function alignLandmarksToFrontage(
+  creations: WorldCreation[],
+  paths: WorldPath[],
+): { changedIds: string[] } {
+  const changedIds: string[] = [];
+  const sampledPaths = paths
+    .filter((p) => Array.isArray(p.points) && p.points.length >= 2)
+    .map((p) => ({
+      path: p,
+      curve: sampleCatmullRom2D(p.points, Boolean(p.closed), 0.65),
+    }))
+    .filter((entry) => entry.curve.length >= 2);
+
+  if (sampledPaths.length === 0) return { changedIds };
+
+  for (const c of creations) {
+    if (c.isSeed) continue;
+    if (c.category !== "building" && c.behavior?.type !== "landmark") continue;
+
+    const footR = getCreationFootprintRadius(
+      c.scaleClass,
+      c.blueprint?.stats?.footprintX ?? 14,
+      c.blueprint?.stats?.footprintZ ?? 14,
+    );
+
+    let targetPt: [number, number] | null = null;
+    let bestTerminusScore = Infinity;
+
+    // 1. Prefer an open approach spur/lane/road whose endpoint terminates at this landmark's frontage
+    for (const sp of sampledPaths) {
+      if (sp.path.closed) continue;
+      const startPt = sp.curve[0];
+      const endPt = sp.curve[sp.curve.length - 1];
+      const dStart = Math.hypot(startPt[0] - c.x, startPt[1] - c.z);
+      const dEnd = Math.hypot(endPt[0] - c.x, endPt[1] - c.z);
+      const minEndDist = Math.min(dStart, dEnd);
+      if (minEndDist > footR + 5.8) continue;
+
+      const isDedicated =
+        sp.path.id === `spur-${c.id}` ||
+        sp.path.id === `initpath-${c.id}` ||
+        sp.path.id.includes(c.id);
+      const kindBonus =
+        sp.path.kind === "road"
+          ? -1.4
+          : sp.path.kind === "cottage_road" || sp.path.kind === "cobblestone"
+            ? -0.8
+            : 0;
+      const score = minEndDist + (isDedicated ? -4.0 : 0) + kindBonus;
+      if (score < bestTerminusScore) {
+        bestTerminusScore = score;
+        if (dStart <= dEnd) {
+          targetPt = sp.curve[Math.min(sp.curve.length - 1, 4)];
+        } else {
+          targetPt = sp.curve[Math.max(0, sp.curve.length - 5)];
+        }
+      }
+    }
+
+    // 2. Otherwise face the closest passing road / cottage lane / trail
+    if (!targetPt) {
+      let bestPassScore = Infinity;
+      for (const sp of sampledPaths) {
+        const hit = distPointToPolyline2D(c.x, c.z, sp.curve);
+        const kindBonus =
+          sp.path.kind === "road"
+            ? -2.4
+            : sp.path.kind === "cottage_road" || sp.path.kind === "cobblestone"
+              ? -1.6
+              : 0;
+        const score = hit.dist + kindBonus;
+        if (score < bestPassScore) {
+          bestPassScore = score;
+          targetPt = [hit.closestX, hit.closestZ];
+        }
+      }
+    }
+
+    if (!targetPt) continue;
+    const dx = targetPt[0] - c.x;
+    const dz = targetPt[1] - c.z;
+    if (Math.hypot(dx, dz) < 0.25) continue;
+
+    const roadAngle = Math.atan2(dx, dz);
+    const localFront = c.blueprint ? detectBlueprintFrontAngle(c.blueprint) : 0;
+    const microVariance = ((deterministicHashId(c.id) % 17) - 8) * 0.004;
+    const desiredYaw = Math.round(wrapAnglePi(roadAngle - localFront + microVariance) * 100) / 100;
+
+    const yawDiff = Math.abs(wrapAnglePi((c.yaw || 0) - desiredYaw));
+    const behaviorDiff =
+      c.behavior?.type === "landmark"
+        ? c.behavior.facingYaw === undefined
+          ? 1
+          : Math.abs(wrapAnglePi(c.behavior.facingYaw - desiredYaw))
+        : 0;
+
+    if (yawDiff > 0.06 || behaviorDiff > 0.06) {
+      c.yaw = desiredYaw;
+      if (c.behavior?.type === "landmark") {
+        c.behavior = { ...c.behavior, facingYaw: desiredYaw };
+      }
+      changedIds.push(c.id);
+    }
+  }
+
+  return { changedIds };
+}
+
+/**
  * World-level spatial overlap & planar road/path topology auditor + deterministic auto-repair:
  * - Eliminates crossing roads & crossing trails (clipping trails cleanly at road stone curbs `2.52m` from road centerlines).
  * - Prunes stale `initpath-*` placeholders and redundant parallel corridor duplicates.
@@ -1353,7 +1544,7 @@ export function auditAndRepairWorldSpatial(
       } =>
         c.behavior?.type === "vehicle_route" &&
         Array.isArray(c.behavior.waypoints) &&
-        c.behavior.waypoints.length >= 3,
+        c.behavior.waypoints.length >= (c.behavior.loopMode === "pingpong" ? 2 : 3),
     )
     .map((c) => c.behavior.waypoints);
 
@@ -1383,26 +1574,36 @@ export function auditAndRepairWorldSpatial(
     }
 
     if (p.kind === "road") {
-      // Keep "path-main-loop" as the single crisp village asphalt ring road inside r < 95m;
-      // only smooth closed outer loops (minOrigin >= 95m) driven by outer vehicles are allowed.
+      // Allow:
+      // 1. Smooth closed outer loops (minOrigin >= 95m) driven by outer loop vehicles, OR
+      // 2. Clean open collector/haul roads (!p.closed) serving industrial/mining/firehouse landmarks or active vehicle routes.
       const minRad = Math.min(...p.points.map(([rx, rz]) => Math.hypot(rx, rz)));
       const isOuterSmoothLoop = Boolean(p.closed) && p.points.length >= 6 && minRad >= 95;
       const roadCurve = sampleCatmullRom2D(p.points, Boolean(p.closed), 0.75);
-      const usedByActiveVehicle =
-        isOuterSmoothLoop &&
-        activeVehicleRouteSets.some((wps) => {
-          let offMainMatches = 0;
-          for (const [wx, wz] of wps) {
-            const onMain =
-              mainLoopRefCurve.length >= 2 &&
-              distPointToPolyline2D(wx, wz, mainLoopRefCurve).dist <= 5.0;
-            if (!onMain && distPointToPolyline2D(wx, wz, roadCurve).dist <= 4.8) {
-              offMainMatches++;
-            }
+      const usedByActiveVehicle = activeVehicleRouteSets.some((wps) => {
+        let offMainMatches = 0;
+        for (const [wx, wz] of wps) {
+          const onMain =
+            mainLoopRefCurve.length >= 2 &&
+            distPointToPolyline2D(wx, wz, mainLoopRefCurve).dist <= 5.0;
+          if (!onMain && distPointToPolyline2D(wx, wz, roadCurve).dist <= 4.8) {
+            offMainMatches++;
           }
-          return offMainMatches >= 3;
-        });
-      if (!usedByActiveVehicle) {
+        }
+        return offMainMatches >= (p.closed ? 3 : 1);
+      });
+      const servesIndustrialLandmark =
+        !p.closed &&
+        polylineLength2D(roadCurve) >= 7.5 &&
+        buildings.some(
+          (b) =>
+            inferContextualRoadKind(b) === "road" &&
+            distPointToPolyline2D(b.x, b.z, roadCurve).dist <= plinthRadiusOf(b) + 7.5,
+        );
+      const keepRoad =
+        (isOuterSmoothLoop && usedByActiveVehicle) ||
+        (!p.closed && (usedByActiveVehicle || servesIndustrialLandmark));
+      if (!keepRoad) {
         redundantPathsRemoved++;
         details.push(`removed cluttered secondary asphalt road "${p.id}"`);
         continue;
@@ -1448,19 +1649,29 @@ export function auditAndRepairWorldSpatial(
       }
     }
 
-    if (p.id.startsWith("spur-")) {
-      const cid = p.id.slice("spur-".length);
+    let candidatePath = p;
+    if (p.id.startsWith("spur-") || p.id.startsWith("initpath-")) {
+      const prefix = p.id.startsWith("spur-") ? "spur-" : "initpath-";
+      const cid = p.id.slice(prefix.length);
       const owner = creationsById.get(cid);
       if (!owner || (owner.category !== "building" && owner.behavior?.type !== "landmark")) {
         redundantPathsRemoved++;
         details.push(`removed stale landmark spur "${p.id}"`);
         continue;
       }
+      const desired = inferContextualRoadKind(owner);
+      const resolvedKind: PathKind =
+        desired === "road" && p.kind !== "road" ? "cobblestone" : desired;
+      if (candidatePath.kind !== resolvedKind) {
+        footpathTrimCount++;
+        details.push(`contextualized "${p.id}" from ${candidatePath.kind} to ${resolvedKind}`);
+        candidatePath = { ...candidatePath, kind: resolvedKind };
+      }
     }
 
-    if (p.kind !== "road") {
-      const firstPt = p.points[0];
-      const lastPt = p.points[p.points.length - 1];
+    if (candidatePath.kind !== "road") {
+      const firstPt = candidatePath.points[0];
+      const lastPt = candidatePath.points[candidatePath.points.length - 1];
       const servesLandmark =
         buildings.some((b) => {
           const r = plinthRadiusOf(b) + 6.5;
@@ -1485,12 +1696,12 @@ export function auditAndRepairWorldSpatial(
         );
       if (targetsMobileOnly) {
         redundantPathsRemoved++;
-        details.push(`removed orphan trail "${p.id}" targeting mobile creation`);
+        details.push(`removed orphan trail "${candidatePath.id}" targeting mobile creation`);
         continue;
       }
     }
 
-    candidatePool.push(p);
+    candidatePool.push(candidatePath);
   }
 
   // Priority order (radially outward from village core within each tier so inner paths accept before outer branches!):
@@ -1587,31 +1798,37 @@ export function auditAndRepairWorldSpatial(
     return false;
   };
 
-  const isEndpointAnchored = (pt: [number, number]): boolean => {
+  const isEndpointAnchored = (pt: [number, number], forRoad = false): boolean => {
     const [x, z] = pt;
     for (const acc of accepted) {
+      if (forRoad && !acc.isRoad) continue;
       if (distPointToPolyline2D(x, z, acc.curve).dist <= 3.7) return true;
     }
     for (const b of buildings) {
-      if (Math.hypot(x - b.x, z - b.z) <= plinthRadiusOf(b) + 5.6) return true;
+      if (Math.hypot(x - b.x, z - b.z) <= plinthRadiusOf(b) + (forRoad ? 7.5 : 5.6)) return true;
     }
-    for (const pr of ponds) {
-      if (Math.hypot(x - pr.x, z - pr.z) <= (pr.radius ?? 6.5) + 3.8) return true;
+    if (!forRoad) {
+      for (const pr of ponds) {
+        if (Math.hypot(x - pr.x, z - pr.z) <= (pr.radius ?? 6.5) + 3.8) return true;
+      }
     }
     return false;
   };
 
-  const touchesConnectedNetwork = (pt: [number, number]): boolean => {
+  const touchesConnectedNetwork = (pt: [number, number], forRoad = false): boolean => {
     const [x, z] = pt;
     for (const acc of accepted) {
+      if (forRoad && !acc.isRoad) continue;
       if (distPointToPolyline2D(x, z, acc.curve).dist <= 3.7) return true;
     }
-    for (const b of buildings) {
-      if (
-        landmarkConnectedByAccepted(b) &&
-        Math.hypot(x - b.x, z - b.z) <= plinthRadiusOf(b) + 5.6
-      ) {
-        return true;
+    if (!forRoad) {
+      for (const b of buildings) {
+        if (
+          landmarkConnectedByAccepted(b) &&
+          Math.hypot(x - b.x, z - b.z) <= plinthRadiusOf(b) + 5.6
+        ) {
+          return true;
+        }
       }
     }
     return false;
@@ -1692,22 +1909,39 @@ export function auditAndRepairWorldSpatial(
       }
     }
 
-    // Open pedestrian trails must have BOTH ends anchored and connect into the accepted island network
-    if (!isRoad && !curveClosed) {
+    // Open paths/collector roads must have BOTH ends anchored and connect into the accepted island network
+    if (!curveClosed) {
       const pStart = curvePts[0];
       const pEnd = curvePts[curvePts.length - 1];
-      if (!isEndpointAnchored(pStart) || !isEndpointAnchored(pEnd)) {
+      if (!isEndpointAnchored(pStart, isRoad) || !isEndpointAnchored(pEnd, isRoad)) {
         return true;
       }
-      if (!touchesConnectedNetwork(pStart) && !touchesConnectedNetwork(pEnd)) {
+      if (!touchesConnectedNetwork(pStart, isRoad) && !touchesConnectedNetwork(pEnd, isRoad)) {
         return true;
       }
+    }
+
+    // Keep if an active vehicle route relies on this open road branch
+    if (isRoad && !curveClosed) {
+      const drivenOnBranch = activeVehicleRouteSets.some((wps) => {
+        let branchHits = 0;
+        for (const [wx, wz] of wps) {
+          const onMain =
+            mainLoopRefCurve.length >= 2 &&
+            distPointToPolyline2D(wx, wz, mainLoopRefCurve).dist <= 5.0;
+          if (!onMain && distPointToPolyline2D(wx, wz, curvePts).dist <= 4.8) {
+            branchHits++;
+          }
+        }
+        return branchHits >= 1;
+      });
+      if (drivenOnBranch) return false;
     }
 
     // Keep if this path uniquely connects an otherwise-unconnected landmark
     const uniquelyConnectsLandmark = buildings.some((b) => {
       if (landmarkConnectedByAccepted(b)) return false;
-      const reach = plinthRadiusOf(b) + (isRoad ? 5.6 : 3.8);
+      const reach = plinthRadiusOf(b) + (isRoad ? 7.2 : 3.8);
       return distPointToPolyline2D(b.x, b.z, curvePts).dist <= reach;
     });
 
@@ -2270,30 +2504,30 @@ export function auditAndRepairWorldSpatial(
     }
 
     if (chosenPts && chosenCurve) {
-      const bText = `${b.name} ${b.description} ${b.creatorPrompt ?? ""}`;
-      const spurKind = /\b(volcano|lava|magma|obsidian)\b/i.test(bText)
-        ? "volcanic_trail"
-        : /\b(beach|surf|dock|pier|coast(?:line|al)?|lagoon|island)\b/i.test(bText)
-          ? "boardwalk"
-          : /\b(waterfall|forest|farm|mill|cabin|quarry|mine|pub|outback|ranch|camp)\b/i.test(bText)
-            ? "dirt_trail"
-            : /\b(castle|tower|datacentre|datacenter|station|cathedral|stadium|museum|firehouse|mansion|pavilion)\b/i.test(
-                  bText,
-                )
-              ? "cobblestone"
-              : !bestAcc.isRoad && bestAcc.path.kind !== "volcanic_trail"
-                ? bestAcc.path.kind
-                : "footpath";
+      const desiredKind = inferContextualRoadKind(b);
+      const canUsePavedRoad =
+        desiredKind === "road" &&
+        bestAcc.isRoad &&
+        polylineLength2D(chosenCurve) >= 9.0 &&
+        validateCleanSpline(chosenPts, false, true) !== null &&
+        !checkRedundant(chosenCurve, false, true);
+      const spurKind: PathKind =
+        desiredKind === "road"
+          ? canUsePavedRoad
+            ? "road"
+            : "cobblestone"
+          : desiredKind;
       const spur: WorldPath = {
         id: `spur-${b.id}`,
         kind: spurKind,
         points: chosenPts,
       };
+      const spurIsRoad = spurKind === "road";
       const spurJunctions = getRoadCurbJunctions(chosenCurve, false);
-      accepted.push({ path: spur, curve: chosenCurve, isRoad: false });
+      accepted.push({ path: spur, curve: chosenCurve, isRoad: spurIsRoad });
       acceptedCurbJunctions.push(...spurJunctions);
       footpathTrimCount++;
-      details.push(`added clean curb-snapped spur "${spur.id}" for "${b.name}"`);
+      details.push(`added clean curb-snapped ${spurKind} "${spur.id}" for "${b.name}"`);
     }
   }
 
@@ -2347,12 +2581,15 @@ export function auditAndRepairWorldSpatial(
             passMoved = true;
           }
         }
-        // Keep signposts/benches/lamps off pedestrian trail centers
+        // Keep signposts/benches/lamps off cottage lanes and pedestrian trail centers
         for (const tr of acceptedTrails) {
+          const isCottageLane = tr.path.kind === "cottage_road";
+          const minDist = isCottageLane ? 1.42 : 1.15;
+          const pushDist = isCottageLane ? 1.78 : 1.5;
           const h = distPointToPolyline2D(px, pz, tr.curve);
-          if (h.dist < 1.15) {
-            px = round1(h.closestX + h.normalX * 1.5);
-            pz = round1(h.closestZ + h.normalZ * 1.5);
+          if (h.dist < minDist) {
+            px = round1(h.closestX + h.normalX * pushDist);
+            pz = round1(h.closestZ + h.normalZ * pushDist);
             moved = true;
             passMoved = true;
           }

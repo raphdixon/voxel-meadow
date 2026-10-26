@@ -119,9 +119,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
       leaf: "#62b558",
     },
     ops: [
-      { op: "plinth", sizeX: 22, heightY: 2, sizeZ: 20, base: "stoneDark", top: "stone", corner: "timber" },
-      { op: "stairs", x0: -3, y0: 0, z0: 8, steps: 2, width: 6, dir: "+z", color: "stone" },
-      // Main bakery cottage body (set slightly back so overhead windmill sails spin cleanly in front of the eaves)
+      // Main bakery cottage body grounded directly at Y=0 (set slightly back so overhead windmill sails spin cleanly)
       { op: "hollowBox", x0: -9, y0: 2, z0: -8, x1: 9, y1: 12, z1: 6, wall: 1, color: "plaster", trim: "timber" },
       { op: "roofGable", x0: -10, yBase: 12, z0: -9, x1: 10, z1: 7, rise: 4, axis: "x", color: "terracotta", trim: "timber" },
       // Cylindrical windmill tower rising cleanly above cottage + timber sail drive-shaft stub
@@ -186,9 +184,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
       iron: "#2b2f36",
     },
     ops: [
-      { op: "plinth", sizeX: 20, heightY: 2, sizeZ: 18, base: "stoneShade", top: "limestone", corner: "gold" },
-      { op: "stairs", x0: -3, y0: 0, z0: 8, steps: 2, width: 6, dir: "+z", color: "limestone" },
-      // Station hall
+      // Station hall grounded flush on the meadow
       { op: "hollowBox", x0: -9, y0: 2, z0: -6, x1: 9, y1: 12, z1: 6, wall: 1, color: "limestone", trim: "brick" },
       { op: "roofGable", x0: -10, yBase: 12, z0: -7, x1: 10, z1: 7, rise: 4, axis: "x", color: "slate", trim: "limestone" },
       // Front timber colonnade porch
@@ -252,7 +248,6 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
       blossom: "#f095b4",
     },
     ops: [
-      { op: "plinth", sizeX: 18, heightY: 2, sizeZ: 16, base: "sageDark", top: "cream", corner: "oak" },
       { op: "hollowBox", x0: -8, y0: 2, z0: -6, x1: 8, y1: 15, z1: 6, wall: 1, color: "sage", trim: "oak" },
       // Second floor cornice band
       { op: "box", x0: -9, y0: 8, z0: -7, x1: 9, y1: 9, z1: 7, color: "oak" },
@@ -602,7 +597,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
     },
     {
       id: "path-bakery-spur",
-      kind: "dirt_trail",
+      kind: "cottage_road",
       points: [
         [-31, -3],
         [-26.5, -1],
@@ -610,7 +605,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
     },
     {
       id: "path-bookshop-spur",
-      kind: "footpath",
+      kind: "cottage_road",
       points: [
         [25.5, 20.5],
         [20.2, 17.5],

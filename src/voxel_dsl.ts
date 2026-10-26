@@ -1009,10 +1009,256 @@ export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string,
   }
 }
 
+const EXPLICIT_PEDESTAL_SUBJECT_RE =
+  /\b(statue|monument|memorial|trophy|bust|obelisk|pedestal|podium)\b/i;
+
+const LIVED_IN_PLACE_RE =
+  /\b(cottage|house|home|cabin|villa|manor|mansion|hall|parliament|shop|store|bookshop|bakery|windmill|cafe|pub|bar|inn|cantina|shack|burger|ihop|pancake|diner|restaurant|firehouse|station|datacentre|datacenter|tower|arena|stadium|amphitheater|amphitheatre|pavilion|court|half-?pipe|skate|quarry|mine|mining|farm|barn|apiary|waterfall|cliff|volcano|mountain|island|coast|beach|hammock|lounger)\b/i;
+
+function isCarveOpTouchingSlab(op: VoxelOp, slabY0: number, slabY1: number): boolean {
+  if (op.op === "clear") {
+    return op.y0 < slabY1 && op.y1 > slabY0;
+  }
+  if (op.op === "cylinder" && op.carve) {
+    const axis = op.axis ?? "y";
+    const minY = axis === "y" ? (op.y0 ?? 0) : (op.cy ?? 0) - op.radius;
+    const maxY = axis === "y" ? (op.y1 ?? 6) : (op.cy ?? 0) + op.radius;
+    return minY < slabY1 - 0.1 && maxY > slabY0 + 0.1;
+  }
+  if (op.op === "sphere" && op.carve) {
+    const minY = op.cy - op.ry;
+    const maxY = op.cy + op.ry;
+    return minY < slabY1 - 0.1 && maxY > slabY0 + 0.1;
+  }
+  return false;
+}
+
+/**
+ * Strips artificial raised `plinth`s, wide plot-filling base pedestal slabs (`box`/`roundedBox`),
+ * and orphaned pedestal-climbing `stairs` so buildings, courts, quarries, and landforms sit
+ * directly and naturally on the meadow ground (`Y = 0`) instead of on raised concrete blocks.
+ * Preserves court playing surfaces (detected via coplanar boundary-line ops) and explicit stepped monuments.
+ */
+export function stripRaisedPlatformOps(
+  ops: VoxelOp[],
+  palette: Record<string, string>,
+  contextText = "",
+): { ops: VoxelOp[]; stripped: boolean } {
+  const preservePedestal =
+    EXPLICIT_PEDESTAL_SUBJECT_RE.test(contextText) && !LIVED_IN_PLACE_RE.test(contextText);
+
+  let curOps = ops.map((o) => ({ ...o }));
+  let stripped = false;
+
+  // 1. Always strip rectangular `plinth` ops unless this is an explicit statue/monument pedestal
+  if (!preservePedestal) {
+    const withoutPlinth = curOps.filter((o) => o.op !== "plinth");
+    if (withoutPlinth.length !== curOps.length) {
+      curOps = withoutPlinth;
+      stripped = true;
+    }
+  } else {
+    return { ops: curOps, stripped: false };
+  }
+
+  // 2. Peel up to 3 wide, flat bottom base slabs (e.g. stacked concrete/tarmac/plaza/blue-pad platform boxes under buildings)
+  for (let pass = 0; pass < 3; pass++) {
+    const sim = new SimVox();
+    applySimOps(
+      sim,
+      curOps.filter((o) => o.op !== "stairs"),
+      palette,
+    );
+    const b = sim.bounds();
+    if (b.count < 45) break;
+
+    const spanX = b.maxX - b.minX;
+    const spanZ = b.maxZ - b.minZ;
+    const totalH = b.maxY - b.minY;
+    if (totalH < 7 || spanX < 10 || spanZ < 10) break;
+
+    let slabIdx = -1;
+    let slabY1 = b.minY;
+
+    for (let i = 0; i < curOps.length; i++) {
+      const o = curOps[i];
+      if (o.op !== "box" && o.op !== "roundedBox") continue;
+      if (o.mirrorX || (o.emit && o.emit > 0.25)) continue;
+      if (o.y0 > b.minY + 1) continue;
+
+      const thickness = o.y1 - o.y0;
+      const maxSlabThickness =
+        totalH >= 28 && o.y0 === b.minY ? 5 : totalH >= 18 && o.y0 === b.minY ? 4 : 3;
+      if (thickness < 1 || thickness > maxSlabThickness) continue;
+      if (b.maxY < o.y1 + 5) continue;
+
+      const ox = o.x1 - o.x0;
+      const oz = o.z1 - o.z0;
+      if (ox < Math.max(10, spanX * 0.72) || oz < Math.max(10, spanZ * 0.72)) continue;
+
+      // Preserve functional court floors / striped plazas that have >= 3 coplanar line/detail ops
+      let coplanarDetailOps = 0;
+      for (let j = 0; j < curOps.length; j++) {
+        if (j === i) continue;
+        const d = curOps[j];
+        if (d.op === "box" || d.op === "roundedBox") {
+          const dh = d.y1 - d.y0;
+          if (dh <= 2 && d.y0 >= o.y0 && d.y0 <= o.y1 && d.y1 <= o.y1 + 1) {
+            const dx = d.x1 - d.x0;
+            const dz = d.z1 - d.z0;
+            if (dx < ox * 0.82 || dz < oz * 0.82) {
+              coplanarDetailOps++;
+            }
+          }
+        } else if (d.op === "line" && Math.min(d.y0, d.y1) >= o.y0 && Math.max(d.y0, d.y1) <= o.y1 + 1) {
+          coplanarDetailOps++;
+        }
+      }
+      if (coplanarDetailOps >= 3) continue;
+
+      // Preserve slabs that have a concave basin/pool carved directly into them from later ops
+      let carvedIntoSlab = false;
+      for (let j = i + 1; j < curOps.length; j++) {
+        if (isCarveOpTouchingSlab(curOps[j], o.y0, o.y1)) {
+          carvedIntoSlab = true;
+          break;
+        }
+      }
+      if (carvedIntoSlab) continue;
+
+      slabIdx = i;
+      slabY1 = o.y1;
+      break;
+    }
+
+    if (slabIdx === -1) break;
+
+    // Make sure removing this slab still leaves a substantial creation (>= 32% of voxels & >= 35 voxels)
+    const candidateOps = curOps.filter((_, idx) => idx !== slabIdx);
+    const checkVox = new SimVox();
+    applySimOps(checkVox, candidateOps, palette);
+    if (checkVox.size < Math.max(35, Math.floor(b.count * 0.32))) {
+      break;
+    }
+
+    curOps = candidateOps
+      .map((o): VoxelOp | null => {
+        // Slice cleanly at the new ground plane `slabY1` so no stray pedestal step, trim, or bollard
+        // dangles below `slabY1` and holds the building floating above Y = 0!
+        if (o.op === "box" || o.op === "roundedBox" || o.op === "pillars") {
+          if (o.y1 <= slabY1) return null;
+          if (o.y0 < slabY1) return { ...o, y0: slabY1 };
+          return o;
+        }
+        if (o.op === "cylinder" && (o.axis ?? "y") === "y") {
+          const cy0 = o.y0 ?? 0;
+          const cy1 = o.y1 ?? 6;
+          if (cy1 <= slabY1) return null;
+          if (cy0 < slabY1) return { ...o, y0: slabY1 };
+          return o;
+        }
+        if (o.op === "ring" && (o.axis ?? "y") === "y") {
+          const ry0 = o.y0 ?? 0;
+          const ry1 = o.y1 ?? 2;
+          if (ry1 <= slabY1) return null;
+          if (ry0 < slabY1) return { ...o, y0: slabY1 };
+          return o;
+        }
+        if (o.op === "cone") {
+          if (o.y1 <= slabY1) return null;
+          if (o.y0 < slabY1) return { ...o, y0: slabY1 };
+          return o;
+        }
+        if (o.op === "stairs") {
+          const drop = slabY1 - o.y0;
+          if (drop <= 0) return o;
+          const remSteps = o.steps - drop;
+          if (remSteps <= 0) return null;
+          // Shift stair start inward along its climb direction by `drop` steps
+          const nx0 = o.dir === "+x" ? o.x0 + drop : o.dir === "-x" ? o.x0 - drop : o.x0;
+          const nz0 = o.dir === "+z" ? o.z0 + drop : o.dir === "-z" ? o.z0 - drop : o.z0;
+          return { ...o, x0: nx0, y0: slabY1, z0: nz0, steps: remSteps };
+        }
+        if (o.op === "line") {
+          if (Math.max(o.y0, o.y1) <= slabY1) return null;
+          if (Math.min(o.y0, o.y1) < slabY1) {
+            return {
+              ...o,
+              y0: Math.max(slabY1, o.y0),
+              y1: Math.max(slabY1, o.y1),
+            };
+          }
+          return o;
+        }
+        return o;
+      })
+      .filter((o): o is VoxelOp => o !== null);
+    stripped = true;
+  }
+
+  // 3. If a `plinth` op was stripped in step 1 (typically height 2..3) without a matching slab box,
+  // also trim orphaned pedestal stairs / bollards below the main structure's base `sb.minY`.
+  const structVox = new SimVox();
+  applySimOps(
+    structVox,
+    curOps.filter((o) => o.op !== "stairs"),
+    palette,
+  );
+  const sb = structVox.bounds();
+  if (sb.count >= 35 && sb.minY > 0) {
+    const filteredStairs = curOps
+      .map((o): VoxelOp | null => {
+        if (o.op !== "stairs") return o;
+        const drop = sb.minY - o.y0;
+        if (drop <= 0) return o;
+        const remSteps = o.steps - drop;
+        if (remSteps <= 0) return null;
+        const nx0 = o.dir === "+x" ? o.x0 + drop : o.dir === "-x" ? o.x0 - drop : o.x0;
+        const nz0 = o.dir === "+z" ? o.z0 + drop : o.dir === "-z" ? o.z0 - drop : o.z0;
+        return { ...o, x0: nx0, y0: sb.minY, z0: nz0, steps: remSteps };
+      })
+      .filter((o): o is VoxelOp => o !== null);
+    if (JSON.stringify(filteredStairs) !== JSON.stringify(curOps)) {
+      curOps = filteredStairs;
+      stripped = true;
+    }
+  }
+
+  return { ops: curOps, stripped };
+}
+
+/**
+ * Infers the local horizontal forward/entrance angle (in radians, where `0` = `+Z`,
+ * `Math.PI / 2` = `+X`, `Math.PI` = `-Z`, `-Math.PI / 2` = `-X`) of a stationary blueprint
+ * so the world orchestrator can orient doorways/courtyards cleanly toward their road frontage.
+ */
+export function detectBlueprintFrontAngle(bp: VoxelBlueprint): number {
+  const votes = { posZ: 0, negZ: 0, posX: 0, negX: 0 };
+  for (const o of bp.ops || []) {
+    if (o.op === "stairs") {
+      if (o.dir === "+z" || o.z0 >= 3) votes.posZ += 2;
+      else if (o.dir === "-z" || o.z0 <= -3) votes.negZ += 2;
+      else if (o.dir === "+x" || o.x0 >= 3) votes.posX += 2;
+      else if (o.dir === "-x" || o.x0 <= -3) votes.negX += 2;
+    } else if (o.op === "arch") {
+      if (o.axis === "z" && o.cz >= 2) votes.posZ += 2;
+      else if (o.axis === "z" && o.cz <= -2) votes.negZ += 2;
+      else if (o.axis === "x" && o.cx >= 2) votes.posX += 2;
+      else if (o.axis === "x" && o.cx <= -2) votes.negX += 2;
+    }
+  }
+  if (votes.posZ > 0) return 0;
+  const best = Math.max(votes.negZ, votes.posX, votes.negX);
+  if (best <= 0) return 0;
+  if (votes.posX === best) return Math.PI / 2;
+  if (votes.negX === best) return -Math.PI / 2;
+  return Math.PI;
+}
+
 export function normalizeAndGroundBlueprint(
   raw: Record<string, unknown>,
   fallbackName = "Meadow Creation",
-  options?: { skipAutoRepair?: boolean },
+  options?: { skipAutoRepair?: boolean; keepPlinth?: boolean; contextText?: string },
 ): VoxelBlueprint {
   const palette: Record<string, string> = {};
   if (raw.palette && typeof raw.palette === "object" && !Array.isArray(raw.palette)) {
@@ -1109,6 +1355,11 @@ export function normalizeAndGroundBlueprint(
         }
       }
     }
+  }
+
+  if (!options?.keepPlinth) {
+    const ctxText = `${typeof raw.name === "string" ? raw.name : ""} ${typeof raw.description === "string" ? raw.description : ""} ${fallbackName} ${options?.contextText ?? ""}`;
+    ops = stripRaisedPlatformOps(ops, palette, ctxText).ops;
   }
 
   // Simulate full combined voxel volume (base + parts at pivots) to compute exact ground contact!

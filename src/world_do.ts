@@ -38,11 +38,13 @@ import type {
   WorldVillager,
 } from "./types";
 import {
+  alignLandmarksToFrontage,
   auditAndRepairWorldSpatial,
   auditBlueprintOverlaps,
   autoRepairBlueprintOverlaps,
   detectPathCrossings,
   distPointToPolyline2D,
+  inferContextualRoadKind,
   sampleCatmullRom2D,
 } from "./voxel_audit";
 import { reviewBlueprintWithCritic } from "./voxel_critic";
@@ -51,6 +53,10 @@ import {
   getCreationFootprintRadius,
   normalizeAndGroundBlueprint,
 } from "./voxel_dsl";
+import {
+  buildColossalWaterfallBlueprint,
+  buildCompanionVehicleBlueprint,
+} from "./world_landmarks_v16";
 
 const MAX_CONCURRENT_SCULPTS = 3;
 const MAX_QUEUE_DEPTH = 40;
@@ -558,6 +564,17 @@ export class WorldDO extends DurableObject<Env> {
       Date.now() - 36 * 60 * 60 * 1000,
     );
 
+    // One-time v16 organic world upgrade (flush plinth-free foundations, colossal waterfall,
+    // contextual cottage/paved roads, quarry haul dump truck, cohesive frontage alignment)
+    const upgradedV16 = sql
+      .exec(`SELECT value FROM meta WHERE key = 'upgrade_v16_organic_world' LIMIT 1`)
+      .toArray();
+    if (upgradedV16.length === 0) {
+      this.runUpgradeV16OrganicWorld();
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v16_organic_world', '1')`);
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('lastOgCaptureAt', '0')`);
+    }
+
     // Lightweight startup overlap & planar road-crossing repair (< 4ms, zero LLM calls)
     const bootAudit = this.auditAndRepairWorld();
     const upgradedV14 = sql
@@ -576,6 +593,371 @@ export class WorldDO extends DurableObject<Env> {
     );
     if (pendingJobs > 0) {
       void this.pumpBuildQueue();
+    }
+  }
+
+  private runUpgradeV16OrganicWorld(): void {
+    const sql = this.ctx.storage.sql;
+    const seed = buildSeedWorld();
+    const seedCreationsById = new Map(seed.creations.map((c) => [c.id, c]));
+    const seedPathsById = new Map(seed.paths.map((p) => [p.id, p]));
+
+    // 1. Refresh seed cottage spurs ("path-bakery-spur", "path-bookshop-spur")
+    for (const pid of ["path-bakery-spur", "path-bookshop-spur", "path-clocktower-spur"]) {
+      const sp = seedPathsById.get(pid);
+      if (sp) {
+        sql.exec(`INSERT OR REPLACE INTO paths (id, json) VALUES (?, ?)`, sp.id, JSON.stringify(sp));
+      }
+    }
+
+    // Relocate stranded far-corner outliers (r = 119..184m) into cohesive outer-neighborhood clearings
+    const relocations: Record<string, [number, number]> = {
+      "c-mvnc7tlr-6784e6": [72.0, -50.0], // Borealis Mineral Quarry -> NE Mesa Haul Clearing
+      "c-mvodkwqc-c9e4a4": [68.0, -4.0], // Federal Parliament Hall -> East Civic Avenue
+      "c-mvnmyyq6-bc000b": [76.0, 22.0], // Broadcaster Virtual Island -> East Coastal Boardwalk
+      "c-mvns4thf-81f7de": [36.0, 42.0], // Beacon Hill Firehouse -> SE Civic Corridor
+      "c-mvn0lbb4-74136e": [-24.0, 74.0], // Emerald Cliff Waterfall -> Colossal South Canyon Vista
+      "c-mvofu6xi-9656b7": [58.0, 35.0], // Banana Hammock Lounger -> Coastal Beach Clearing
+    };
+
+    const creationRows = sql.exec(`SELECT id, json FROM creations ORDER BY created_at ASC`).toArray();
+    const existingIds = new Set<string>();
+
+    for (const row of creationRows) {
+      const cid = String(row.id);
+      existingIds.add(cid);
+      const c = JSON.parse(String(row.json)) as WorldCreation;
+
+      if (c.isSeed && seedCreationsById.has(cid)) {
+        const freshSeed = seedCreationsById.get(cid)!;
+        c.blueprint = freshSeed.blueprint;
+        sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(c), cid);
+        continue;
+      }
+      if (c.isCompanion) continue;
+
+      if (cid === "c-mvn0lbb4-74136e") {
+        // Re-make Emerald Cliff Waterfall as a monumental "colossal" canyon waterfall
+        const wfBp = buildColossalWaterfallBlueprint();
+        c.blueprint = wfBp;
+        c.scaleClass = "colossal";
+        c.category = "prop";
+        c.x = relocations[cid][0];
+        c.z = relocations[cid][1];
+        c.behavior = {
+          type: "landmark",
+          facingYaw: 0.31,
+          activity: "thundering twin cataracts into the emerald lagoon",
+          statusLine: "Roaring down the mossy granite canyon walls into Emerald Lagoon",
+        };
+      } else {
+        // Strip artificial raised platforms / plinths / pedestal slabs so buildings sit flush at Y = 0
+        let grounded = normalizeAndGroundBlueprint(
+          c.blueprint as unknown as Record<string, unknown>,
+        );
+        if (!auditBlueprintOverlaps(grounded).clean) {
+          grounded = autoRepairBlueprintOverlaps(grounded).blueprint;
+        }
+        c.blueprint = grounded;
+        c.scaleClass = grounded.scaleClass;
+      }
+
+      if (relocations[cid]) {
+        c.x = relocations[cid][0];
+        c.z = relocations[cid][1];
+      }
+
+      if (cid === "c-mvofu6xi-9656b7") {
+        // Keep Banana Hammock Lounger grounded peacefully on the sandy shore instead of hopping around!
+        c.category = "prop";
+        c.blueprint.category = "prop";
+        c.behavior = {
+          type: "landmark",
+          facingYaw: -0.78,
+          activity: "lounging in the coastal breeze",
+          statusLine: "Relaxing in a beachfront hammock beside Emerald Coastline Vista",
+        };
+      }
+
+      sql.exec(
+        `UPDATE creations SET integrated_level = ?, json = ? WHERE id = ?`,
+        Math.max(2, c.integratedLevel ?? 2),
+        JSON.stringify(c),
+        cid,
+      );
+    }
+
+    // 2. Clean up stale far-corner spurs & zones so crisp contextual roads & spurs replace them
+    for (const stalePathId of [
+      "spur-c-mvnc7tlr-6784e6",
+      "spur-c-mvodkwqc-c9e4a4",
+      "spur-c-mvnmyyq6-bc000b",
+      "spur-c-mvns4thf-81f7de",
+      "spur-c-mvn0lbb4-74136e",
+    ]) {
+      sql.exec(`DELETE FROM paths WHERE id = ?`, stalePathId);
+    }
+    for (const staleZoneId of [
+      "zone-ae02feba",
+      "zone-632ce741",
+      "zone-b441736f",
+      "zone-fa04166a",
+      "zone-c875eaa2",
+      "zone-75672d51",
+      "zone-d1972a3b",
+    ]) {
+      sql.exec(`DELETE FROM terrain_zones WHERE id = ?`, staleZoneId);
+    }
+
+    // Contextualize existing pedestrian walkways in cottage clusters to warm "cottage_road"
+    const pathRows = sql.exec(`SELECT id, json FROM paths`).toArray();
+    for (const pr of pathRows) {
+      const p = JSON.parse(String(pr.json)) as WorldPath;
+      if (p.id === "footpath-0dff685c") {
+        p.kind = "cottage_road";
+        sql.exec(`INSERT OR REPLACE INTO paths (id, json) VALUES (?, ?)`, p.id, JSON.stringify(p));
+      }
+    }
+
+    // 3. Lay clean paved arterial "road" corridors for Borealis Mineral Quarry & Beacon Hill Firehouse
+    if (existingIds.has("c-mvnc7tlr-6784e6")) {
+      const quarryHaulRoad: WorldPath = {
+        id: "road-quarry-haul",
+        kind: "road",
+        points: [
+          [25.9, -5.6],
+          [47.5, -10.2],
+          [68.0, -24.5],
+          [70.6, -35.8],
+        ],
+      };
+      sql.exec(
+        `INSERT OR REPLACE INTO paths (id, json) VALUES (?, ?)`,
+        quarryHaulRoad.id,
+        JSON.stringify(quarryHaulRoad),
+      );
+      const quarryZone: WorldTerrainZone = {
+        id: "zone-quarry-mesa",
+        biome: "desert_mesa",
+        x: 72.0,
+        z: -50.0,
+        radius: 19.5,
+      };
+      sql.exec(
+        `INSERT OR REPLACE INTO terrain_zones (id, json) VALUES (?, ?)`,
+        quarryZone.id,
+        JSON.stringify(quarryZone),
+      );
+
+      // Spawn Borealis Heavy Haul Dump Truck actively hauling mineral ore from the Quarry to the City!
+      const dumpBp = buildCompanionVehicleBlueprint(
+        "mining_dump_truck",
+        "Borealis Heavy Haul Dump Truck",
+        "Articulated yellow mining dump truck hauling rare-earth mineral ore along the paved haul road from Borealis Mineral Quarry into the city.",
+      );
+      const dumpCreation: WorldCreation = {
+        id: "comp-quarry-dump-truck",
+        name: dumpBp.name,
+        description: dumpBp.description,
+        category: "vehicle",
+        scaleClass: "medium",
+        blueprint: dumpBp,
+        x: 70.6,
+        z: -35.8,
+        yaw: -0.2,
+        createdAt: Date.now(),
+        isCompanion: true,
+        companionOfId: "c-mvnc7tlr-6784e6",
+        integratedLevel: 2,
+        behavior: {
+          type: "vehicle_route",
+          loopMode: "pingpong",
+          speed: 5.4,
+          waypoints: [
+            [70.6, -35.8],
+            [68.0, -24.5],
+            [47.5, -10.2],
+            [25.9, -5.6],
+            [23.5, -3.5],
+            [18.0, -16.0],
+            [0.0, -19.0],
+          ],
+          stops: [
+            {
+              id: "stop-quarry-bay",
+              name: "Borealis Quarry Loading Bay",
+              x: 70.6,
+              z: -35.8,
+              dwellSec: 4.4,
+              nearCreationId: "c-mvnc7tlr-6784e6",
+            },
+            {
+              id: "stop-city-ore-exchange",
+              name: "Clocktower Ore Exchange",
+              x: 0.0,
+              z: -19.0,
+              dwellSec: 3.8,
+              nearCreationId: "seed-clocktower-station",
+            },
+          ],
+          statusLine: "Hauling rare-earth mineral ore from Borealis Quarry to the city",
+        },
+      };
+      sql.exec(
+        `INSERT OR REPLACE INTO creations (id, created_at, integrated_level, json) VALUES (?, ?, ?, ?)`,
+        dumpCreation.id,
+        dumpCreation.createdAt,
+        dumpCreation.integratedLevel,
+        JSON.stringify(dumpCreation),
+      );
+    }
+
+    if (existingIds.has("c-mvns4thf-81f7de")) {
+      const firehouseRoad: WorldPath = {
+        id: "road-firehouse-se",
+        kind: "road",
+        points: [
+          [13.5, 20.6],
+          [19.5, 31.0],
+          [29.8, 39.2],
+        ],
+      };
+      sql.exec(
+        `INSERT OR REPLACE INTO paths (id, json) VALUES (?, ?)`,
+        firehouseRoad.id,
+        JSON.stringify(firehouseRoad),
+      );
+      const fireZone: WorldTerrainZone = {
+        id: "zone-firehouse-plaza",
+        biome: "stone_plaza",
+        x: 36.0,
+        z: 42.0,
+        radius: 11.5,
+      };
+      sql.exec(
+        `INSERT OR REPLACE INTO terrain_zones (id, json) VALUES (?, ?)`,
+        fireZone.id,
+        JSON.stringify(fireZone),
+      );
+
+      const pumperBp = buildCompanionVehicleBlueprint(
+        "fire_engine",
+        "Beacon Hill Pumper Engine",
+        "Crimson municipal fire engine with roof ladder and emergency beacons patrolling between Beacon Hill Firehouse and the village loop.",
+      );
+      const pumperCreation: WorldCreation = {
+        id: "comp-firehouse-pumper",
+        name: pumperBp.name,
+        description: pumperBp.description,
+        category: "vehicle",
+        scaleClass: "medium",
+        blueprint: pumperBp,
+        x: 29.8,
+        z: 39.2,
+        yaw: -2.2,
+        createdAt: Date.now() + 1,
+        isCompanion: true,
+        companionOfId: "c-mvns4thf-81f7de",
+        integratedLevel: 2,
+        behavior: {
+          type: "vehicle_route",
+          loopMode: "pingpong",
+          speed: 5.8,
+          waypoints: [
+            [29.8, 39.2],
+            [19.5, 31.0],
+            [13.5, 20.6],
+            [12.5, 18.0],
+            [0.0, 19.0],
+            [-18.0, 16.0],
+          ],
+          stops: [
+            {
+              id: "stop-firehouse-apron",
+              name: "Beacon Hill Engine Bay",
+              x: 29.8,
+              z: 39.2,
+              dwellSec: 4.5,
+              nearCreationId: "c-mvns4thf-81f7de",
+            },
+            {
+              id: "stop-south-green",
+              name: "Clover Pond Watch",
+              x: 0.0,
+              z: 19.0,
+              dwellSec: 3.6,
+            },
+          ],
+          statusLine: "Patrolling the paved civic route from Beacon Hill Firehouse",
+        },
+      };
+      sql.exec(
+        `INSERT OR REPLACE INTO creations (id, created_at, integrated_level, json) VALUES (?, ?, ?, ?)`,
+        pumperCreation.id,
+        pumperCreation.createdAt,
+        pumperCreation.integratedLevel,
+        JSON.stringify(pumperCreation),
+      );
+    }
+
+    // Add matching ground biome zones for relocated Waterfall, Parliament, Island & Hammock
+    const extraZones: WorldTerrainZone[] = [];
+    if (existingIds.has("c-mvn0lbb4-74136e")) {
+      extraZones.push({
+        id: "zone-waterfall-lagoon",
+        biome: "misty_moss",
+        x: -24.0,
+        z: 72.0,
+        radius: 19.5,
+      });
+    }
+    if (existingIds.has("c-mvodkwqc-c9e4a4")) {
+      extraZones.push({
+        id: "zone-parliament-plaza",
+        biome: "stone_plaza",
+        x: 68.0,
+        z: -4.0,
+        radius: 15.5,
+      });
+    }
+    if (existingIds.has("c-mvnmyyq6-bc000b")) {
+      extraZones.push({
+        id: "zone-virtual-island-shore",
+        biome: "sandy_shore",
+        x: 76.0,
+        z: 22.0,
+        radius: 15.0,
+      });
+    }
+    if (existingIds.has("c-mvofu6xi-9656b7")) {
+      extraZones.push({
+        id: "zone-hammock-beach",
+        biome: "sandy_shore",
+        x: 58.0,
+        z: 35.0,
+        radius: 9.5,
+      });
+    }
+    for (const tz of extraZones) {
+      sql.exec(`INSERT OR REPLACE INTO terrain_zones (id, json) VALUES (?, ?)`, tz.id, JSON.stringify(tz));
+    }
+    const zIds = sql.exec(`SELECT id FROM terrain_zones`).toArray().map((r) => String(r.id));
+    if (zIds.length > 28) {
+      const removable = zIds.filter(
+        (id) =>
+          !id.startsWith("zone-clover-") &&
+          !id.startsWith("zone-clocktower-") &&
+          !id.startsWith("zone-bakery-") &&
+          !id.startsWith("zone-quarry-") &&
+          !id.startsWith("zone-waterfall-") &&
+          !id.startsWith("zone-firehouse-") &&
+          !id.startsWith("zone-parliament-") &&
+          !id.startsWith("zone-virtual-") &&
+          !id.startsWith("zone-hammock-"),
+      );
+      for (const delId of removable.slice(0, zIds.length - 28)) {
+        sql.exec(`DELETE FROM terrain_zones WHERE id = ?`, delId);
+      }
     }
   }
 
@@ -631,27 +1013,32 @@ export class WorldDO extends DurableObject<Env> {
       repairs.push(...spatial.report.details);
     }
 
-    // Ensure every active vehicle_route creation cruises strictly on accepted asphalt roads (no off-road detours!)
-    const acceptedRoadCurves = spatial.paths
-      .filter((p) => p.kind === "road" && p.points.length >= 3)
+    // Ensure every active vehicle_route creation cruises strictly on accepted roads or country lanes (no off-road detours!)
+    const acceptedDriveCurves = spatial.paths
+      .filter((p) => (p.kind === "road" || p.kind === "cottage_road") && p.points.length >= 2)
       .map((p) => ({
         path: p,
         curve: sampleCatmullRom2D(p.points, Boolean(p.closed), 0.7),
       }));
     const mainLoopEntry =
-      acceptedRoadCurves.find((r) => r.path.id === "path-main-loop") ?? acceptedRoadCurves[0];
+      acceptedDriveCurves.find((r) => r.path.id === "path-main-loop") ??
+      acceptedDriveCurves.find((r) => r.path.kind === "road" && r.path.points.length >= 3) ??
+      acceptedDriveCurves[0];
     if (mainLoopEntry) {
       let vehIdx = 0;
       for (const c of creations) {
         if (c.behavior?.type !== "vehicle_route") continue;
         const myVehSlot = vehIdx++;
+        const isPingPong = c.behavior.loopMode === "pingpong";
+        const minWps = isPingPong ? 2 : 4;
+        const maxTol = isPingPong ? 4.4 : 3.2;
         const wps = c.behavior.waypoints ?? [];
         const hasOffRoadWaypoint =
-          wps.length < 4 ||
+          wps.length < minWps ||
           wps.some(
             ([wx, wz]) =>
-              !acceptedRoadCurves.some(
-                (rc) => distPointToPolyline2D(wx, wz, rc.curve).dist <= 3.2,
+              !acceptedDriveCurves.some(
+                (rc) => distPointToPolyline2D(wx, wz, rc.curve).dist <= maxTol,
               ),
           );
         if (hasOffRoadWaypoint) {
@@ -680,6 +1067,7 @@ export class WorldDO extends DurableObject<Env> {
           c.z = alignedWps[0][1];
           c.behavior = {
             ...c.behavior,
+            loopMode: "loop",
             waypoints: alignedWps,
             stops:
               alignedStops.length >= 2
@@ -704,6 +1092,17 @@ export class WorldDO extends DurableObject<Env> {
           sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(c), c.id);
           repairs.push(`aligned vehicle "${c.name}" (${c.id}) cleanly onto village ring road`);
         }
+      }
+    }
+
+    // Align non-seed stationary buildings & landmarks to face their approach road/lane naturally
+    const frontage = alignLandmarksToFrontage(creations, spatial.paths);
+    if (frontage.changedIds.length > 0) {
+      for (const cid of frontage.changedIds) {
+        const target = creations.find((c) => c.id === cid);
+        if (!target) continue;
+        sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(target), cid);
+        repairs.push(`aligned "${target.name}" (${cid}) frontage to approach road`);
       }
     }
 
@@ -838,6 +1237,12 @@ export class WorldDO extends DurableObject<Env> {
       for (const v of snapshot.villagers) {
         sql.exec(`INSERT OR REPLACE INTO villagers (id, json) VALUES (?, ?)`, v.id, JSON.stringify(v));
       }
+    }
+    if (
+      Array.isArray(snapshot.creations) &&
+      !snapshot.creations.some((c) => c.id === "comp-quarry-dump-truck")
+    ) {
+      this.runUpgradeV16OrganicWorld();
     }
     const repairRes = this.auditAndRepairWorld();
     const after = this.readBaseWorld();
@@ -1072,6 +1477,7 @@ export class WorldDO extends DurableObject<Env> {
           .exec(
             `SELECT COUNT(*) AS c FROM creations c
              WHERE c.id NOT LIKE 'seed-%'
+               AND c.id NOT LIKE 'comp-%'
                AND NOT EXISTS (SELECT 1 FROM creator_builds cb WHERE cb.creation_id = c.id)`,
           )
           .toArray()[0]?.c,
@@ -1883,6 +2289,43 @@ export class WorldDO extends DurableObject<Env> {
       }
     }
 
+    // First prefer natural roadside frontage plots along established paved roads, cottage lanes, and cobbles
+    // so new cottages/shops form organic winding neighborhoods rather than isolated scattered dots.
+    if ((category === "building" || category === "prop") && newRadius < 8.5) {
+      const frontagePaths = world.paths.filter(
+        (p) =>
+          (p.kind === "road" || p.kind === "cottage_road" || p.kind === "cobblestone") &&
+          p.points.length >= 2,
+      );
+      for (let pi = 0; pi < frontagePaths.length; pi++) {
+        const p = frontagePaths[(pi + world.creations.length) % frontagePaths.length];
+        const curve = sampleCatmullRom2D(p.points, Boolean(p.closed), 5.5);
+        const halfRoad = p.kind === "road" ? 3.2 : 2.0;
+        const setback = halfRoad + newRadius + 2.6;
+        for (let si = 1; si < curve.length - 1; si++) {
+          const idx = (si * 7 + world.creations.length * 3) % Math.max(1, curve.length - 1);
+          const pt = curve[idx];
+          const nxPt = curve[Math.min(curve.length - 1, idx + 1)];
+          const pvPt = curve[Math.max(0, idx - 1)];
+          const dx = nxPt[0] - pvPt[0];
+          const dz = nxPt[1] - pvPt[1];
+          const segLen = Math.hypot(dx, dz);
+          if (segLen < 0.05) continue;
+          const perpX = -dz / segLen;
+          const perpZ = dx / segLen;
+          for (const side of [1, -1]) {
+            const tx = pt[0] + perpX * setback * side;
+            const tz = pt[1] + perpZ * setback * side;
+            const radial = Math.hypot(tx, tz);
+            if (radial < 26 || radial > 102) continue;
+            if (this.isSpotClear(tx, tz, category, newRadius, world, ignoreId)) {
+              return [Number(tx.toFixed(1)), Number(tz.toFixed(1))];
+            }
+          }
+        }
+      }
+    }
+
     // Golden-angle spiral around the island perimeter, starting further out for colossal landmarks
     const startR = newRadius >= 8.5 ? 42 : category === "building" ? 28 : 14;
     for (let i = 0; i < 260; i++) {
@@ -1900,7 +2343,14 @@ export class WorldDO extends DurableObject<Env> {
   private applyWorldPatch(patch: WorldPatch): void {
     const sql = this.ctx.storage.sql;
     const hasCustomRoad = patch.newPaths.some((p) => p.kind === "road");
-    const nonRoadTrailKinds = new Set(["footpath", "dirt_trail", "cobblestone", "boardwalk", "volcanic_trail"]);
+    const nonRoadTrailKinds = new Set([
+      "footpath",
+      "cottage_road",
+      "dirt_trail",
+      "cobblestone",
+      "boardwalk",
+      "volcanic_trail",
+    ]);
 
     for (const upd of patch.updatedBehaviors) {
       const rows = sql.exec(`SELECT json FROM creations WHERE id = ?`, upd.creationId).toArray();
@@ -2030,11 +2480,68 @@ export class WorldDO extends DurableObject<Env> {
       }
     }
 
-    const allCreations = sql
+    let allCreations = sql
       .exec(`SELECT json FROM creations`)
       .toArray()
       .map((r) => JSON.parse(String(r.json)) as WorldCreation);
-    const contributors = allCreations.filter((c) => !c.isSeed).length;
+
+    if (patch.companionCreations && patch.companionCreations.length > 0) {
+      let companionCount = allCreations.filter((c) => Boolean(c.isCompanion) || c.id.startsWith("comp-")).length;
+      for (const spec of patch.companionCreations) {
+        const existingComp = allCreations.find((c) => c.companionOfId === spec.sourceCreationId);
+        if (existingComp) {
+          existingComp.name = spec.name;
+          existingComp.description = spec.description;
+          existingComp.blueprint.name = spec.name;
+          existingComp.blueprint.description = spec.description;
+          existingComp.behavior = spec.behavior;
+          if (spec.behavior.type === "vehicle_route" && spec.behavior.waypoints.length > 0) {
+            existingComp.x = spec.behavior.waypoints[0][0];
+            existingComp.z = spec.behavior.waypoints[0][1];
+          }
+          existingComp.integratedLevel = 2;
+          sql.exec(
+            `UPDATE creations SET integrated_level = 2, json = ? WHERE id = ?`,
+            JSON.stringify(existingComp),
+            existingComp.id,
+          );
+          continue;
+        }
+        if (companionCount >= 6) break;
+        const bp = buildCompanionVehicleBlueprint(spec.archetype, spec.name, spec.description);
+        const startWp =
+          spec.behavior.type === "vehicle_route" && spec.behavior.waypoints.length > 0
+            ? spec.behavior.waypoints[0]
+            : ([24, 0] as [number, number]);
+        const compId = `comp-${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}`;
+        const compCreation: WorldCreation = {
+          id: compId,
+          name: bp.name,
+          description: bp.description,
+          category: "vehicle",
+          scaleClass: bp.scaleClass,
+          createdAt: Date.now(),
+          x: startWp[0],
+          z: startWp[1],
+          yaw: 0,
+          blueprint: bp,
+          behavior: spec.behavior,
+          integratedLevel: 2,
+          isCompanion: true,
+          companionOfId: spec.sourceCreationId,
+        };
+        sql.exec(
+          `INSERT OR REPLACE INTO creations (id, created_at, integrated_level, json) VALUES (?, ?, 2, ?)`,
+          compCreation.id,
+          compCreation.createdAt,
+          JSON.stringify(compCreation),
+        );
+        allCreations.push(compCreation);
+        companionCount++;
+      }
+    }
+
+    const contributors = allCreations.filter((c) => !c.isSeed && !c.isCompanion).length;
     const maxVillagers = Math.min(18, 6 + contributors * 2);
 
     const existingVillagers = sql
@@ -2291,7 +2798,7 @@ export class WorldDO extends DurableObject<Env> {
     const unreviewed: WorldCreation[] = [];
     for (const r of rows) {
       const c = JSON.parse(String(r.json)) as WorldCreation;
-      if (c.isSeed || !c.creatorPrompt || c.blueprint.criticReview) continue;
+      if (c.isSeed || c.isCompanion || !c.creatorPrompt || c.blueprint.criticReview) continue;
       const tries = Number(this.getMeta(`critic_heal_tries:${c.id}`, "0")) || 0;
       if (tries >= 2) continue;
       unreviewed.push(c);
@@ -2440,8 +2947,10 @@ export class WorldDO extends DurableObject<Env> {
     }
 
     const world = this.readBaseWorld();
-    const hasUnintegrated = world.creations.some((c) => c.integratedLevel < 2);
-    const hasStuckMobile = world.creations.some((c) => !c.isSeed && needsMobilityAmendment(c));
+    const hasUnintegrated = world.creations.some((c) => !c.isCompanion && c.integratedLevel < 2);
+    const hasStuckMobile = world.creations.some(
+      (c) => !c.isSeed && !c.isCompanion && needsMobilityAmendment(c),
+    );
     const lastWeaveCount = Number(this.getMeta("lastWeaveCount", "0")) || 0;
     const hasNewCreations = world.creations.length > lastWeaveCount;
 
@@ -2467,8 +2976,8 @@ export class WorldDO extends DurableObject<Env> {
       if (patch) {
         this.applyWorldPatch(patch);
         this.auditAndRepairWorld();
-        this.setMeta("lastWeaveCount", String(world.creations.length));
         const refreshed = this.readBaseWorld();
+        this.setMeta("lastWeaveCount", String(refreshed.creations.length));
         this.broadcast({
           type: "world_updated",
           note: patch.weaveNote,

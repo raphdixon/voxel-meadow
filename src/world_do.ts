@@ -2931,11 +2931,14 @@ export class WorldDO extends DurableObject<Env> {
     newRadius: number,
     world: Omit<WorldStateSnapshot, "myCreationId">,
     ignoreId?: string,
+    tightInfill = false,
   ): boolean {
     const bound = Math.max(115, 142 - newRadius);
     if (Math.abs(x) > bound || Math.abs(z) > bound) return false;
-    if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < newRadius + 2.8) return false;
+    const signPad = tightInfill ? 2.15 : 2.8;
+    if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < newRadius + signPad) return false;
 
+    const neighborPad = tightInfill ? 0.72 : 1.8;
     for (const c of world.creations) {
       if (c.id === ignoreId) continue;
       if (c.category === "aircraft" || c.behavior.type === "fly_circle") continue;
@@ -2945,20 +2948,21 @@ export class WorldDO extends DurableObject<Env> {
         c.blueprint?.stats?.footprintX ?? 14,
         c.blueprint?.stats?.footprintZ ?? 14,
       );
-      const minSep = newRadius + otherR + 1.8;
+      const minSep = newRadius + otherR + neighborPad;
       if (Math.hypot(x - c.x, z - c.z) < minSep) return false;
     }
 
     if (category !== "watercraft") {
+      const pondPad = tightInfill ? 0.85 : 1.4;
       for (const pr of world.props) {
-        if (pr.kind === "pond" && Math.hypot(x - pr.x, z - pr.z) < (pr.radius ?? 6.5) + newRadius + 1.4) {
+        if (pr.kind === "pond" && Math.hypot(x - pr.x, z - pr.z) < (pr.radius ?? 6.5) + newRadius + pondPad) {
           return false;
         }
       }
     }
 
     if (category === "building" || category === "prop") {
-      const roadClear = newRadius + 2.6;
+      const roadClear = newRadius + (tightInfill ? 2.12 : 2.6);
       for (const p of world.paths) {
         if (p.kind !== "road") continue;
         for (let i = 0; i < p.points.length; i++) {
@@ -2982,6 +2986,11 @@ export class WorldDO extends DurableObject<Env> {
     scaleClass: WorldCreation["scaleClass"] = "medium",
     contextText = "",
   ): [number, number] {
+    const hasExplicitReq =
+      typeof reqX === "number" &&
+      Number.isFinite(reqX) &&
+      typeof reqZ === "number" &&
+      Number.isFinite(reqZ);
     return chooseSimCityPlot({
       reqX,
       reqZ,
@@ -2990,7 +2999,8 @@ export class WorldDO extends DurableObject<Env> {
       newRadius,
       contextText,
       world,
-      isSpotClear: (tx, tz) => this.isSpotClear(tx, tz, category, newRadius, world, ignoreId),
+      isSpotClear: (tx, tz) =>
+        this.isSpotClear(tx, tz, category, newRadius, world, ignoreId, hasExplicitReq),
     });
   }
 
@@ -3239,7 +3249,10 @@ export class WorldDO extends DurableObject<Env> {
       };
     }
 
-    const bp = normalizeAndGroundBlueprint(input.blueprintRaw, "Island Creation");
+    const cleanPrompt = sanitizePlainText(input.creatorPrompt, 240, true);
+    const bp = normalizeAndGroundBlueprint(input.blueprintRaw, "Island Creation", {
+      contextText: cleanPrompt,
+    });
     if (bp.stats.voxels < 20) {
       return { ok: false, error: "Blueprint has too few voxels to place." };
     }
@@ -3250,7 +3263,6 @@ export class WorldDO extends DurableObject<Env> {
       bp.stats.footprintZ,
     );
     const worldBefore = this.readBaseWorld();
-    const cleanPrompt = sanitizePlainText(input.creatorPrompt, 240, true);
     const cleanDesc = normalizeFactualDescription(bp.description);
     bp.description = cleanDesc;
     const contextText = `${bp.name} ${cleanDesc} ${cleanPrompt}`;

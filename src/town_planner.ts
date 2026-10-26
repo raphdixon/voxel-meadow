@@ -181,6 +181,17 @@ export function chooseSimCityPlot(opts: {
     if (isSpotClear(cx, cz)) {
       return [Number(cx.toFixed(1)), Number(cz.toFixed(1))];
     }
+    // Fine-grained spiral search around user-requested spot so inner-park & next-door infill stays right where requested
+    for (let rad = 1.6; rad <= 22; rad += 1.6) {
+      for (let k = 0; k < 16; k++) {
+        const ang = (k / 16) * Math.PI * 2;
+        const tx = Number((cx + Math.cos(ang) * rad).toFixed(1));
+        const tz = Number((cz + Math.sin(ang) * rad).toFixed(1));
+        if (isSpotClear(tx, tz)) {
+          return [tx, tz];
+        }
+      }
+    }
     for (let step = 4; step <= 88; step += 4) {
       const offsets: [number, number][] = [
         [step, 0],

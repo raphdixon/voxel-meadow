@@ -1881,7 +1881,7 @@ export function auditAndRepairWorldSpatial(
         }
       }
       if (insideCentralGreen / curvePts.length > 0.30) {
-        if (!uniquelyConnectsLandmark || totalCurveLen > 8.5) {
+        if (!uniquelyConnectsLandmark || totalCurveLen > 16.5) {
           return true;
         }
       }

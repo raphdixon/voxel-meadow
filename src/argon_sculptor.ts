@@ -172,6 +172,23 @@ const SCULPTOR_SYSTEM_PROMPT = `You are Master Voxel Sculptor Argon, creating br
      * Satellite dish, space station, radar, rocket launchpad -> \`{"kind":"iss","place":"Orbit"}\`
    - If the user mentions a real city or beach (e.g. "Tokyo clock", "Malibu surf shack", "London weather box"), fill \`place\`, \`lat\`, \`lon\`, and \`timezone\` for that real location! Keep it simple.
 
+7b. OPTIONAL PLAYABLE 3D MINI-GAME OR INTERACTIVE CONTRAPTION (\`interaction\`):
+   - Set \`"interaction": null\` for ordinary buildings, vehicles, creatures, and props.
+   - When the user asks for an interactive mini-game or clickable voxel contraption, set \`"category": "prop"\` (or \`"building"\`), \`"scaleClass": "medium"\` (or \`"large"\`), and set \`"interaction": { "kind": "<kind>" }\` using one of:
+     * \`"tic_tac_toe"\` — Naughts & Crosses / Tic-Tac-Toe vs Computer: sculpt a cozy open-top stone/wood park game table (\`maxY <= 5\` at center, NO overhead roof!) with stools/lanterns on the sides so the engine mounts live clickable 3D X and O pieces cleanly on top!
+     * \`"connect_four"\` — Four-in-a-Row vs Computer: sculpt a sleek arcade base / plaza kiosk backdrop; the engine mounts the live 7x6 slotted drop-frame & falling 3D discs on the front!
+     * \`"whack_a_mole"\` — Whack-a-Mole Arcade: sculpt a festive low garden bed or open-top carnival table (\`maxY <= 5\` at center, NO overhead roof!) with mallet rack & marquee header at \`-Z\` so 9 live 3D moles pop up cleanly!
+     * \`"floor_piano"\` — Giant Walk-On Floor Piano: sculpt a low stage soundboard frame (\`maxY <= 2\` at center, NO overhead roof!) with back speakers/music-stand at \`-Z\` so players can walk across and click the 8 giant glowing 3D keys!
+     * \`"simon_synth"\` — 4-Pad Simon Memory Synth: sculpt a low geometric synth pedestal (\`maxY <= 4\` at center, NO roof) with glowing trim so 4 live musical memory pads mount cleanly on top!
+     * \`"lights_out"\` — 3x3 Glowing Rune Puzzle Shrine: sculpt an ancient mossy basalt altar base (\`maxY <= 4\` at center, NO roof) flanked by twin torches at \`-Z\` so the 9 toggleable crystal rune blocks sit cleanly on top!
+     * \`"step_sequencer"\` — 8-Step Beat/Melody Matrix: sculpt a sleek modular synth booth / DJ console backdrop at \`-Z\` so the live 8x4 clickable LED voxel matrix mounts cleanly on \`+Z\`!
+     * \`"basketball_hoop"\` — Streetball Trick-Shot Court: sculpt a half-court asphalt/hardwood floor (\`y = 0..1\`) with stanchion, backboard, and orange hoop at \`-Z\` (\`z = -9..-7\`) facing \`+Z\`!
+     * \`"slot_machine"\` — Mechanical 3-Reel Jackpot Automaton: sculpt a chunky vintage brass-and-crimson arcade cabinet facing \`+Z\` so the 3 spinning 3D symbol reels, side pull-lever, and coin tray mount on \`+Z\`!
+     * \`"fireworks_mortar"\` — Voxel Fireworks Mortar Battery: sculpt angled brass/bamboo launch tubes, powder crates, and festival lanterns; clicking launches sky-high 3D voxel fireworks!
+     * \`"tesla_coil"\` — High-Voltage Tesla Lightning Coil: sculpt copper primary windings, ceramic insulators, and a top chrome toroid ring; clicking arcs branching 3D voxel lightning bolts!
+     * \`"gravity_inverter"\` — Anti-Gravity / Upside-Down House: sculpt a surreal Escher cottage or levitation chamber; clicking flips the entire structure 180° upside-down in mid-air!
+     * \`"marble_run"\` — Kinetic Marble Run / Rube Goldberg Spire: sculpt a tall stepped spiral clockwork tower with brass rails and chimes; clicking cascades glowing 3D voxel marbles from the peak!
+
 8. OUTPUT STRICT JSON ONLY:
 {
   "safe": true,
@@ -181,6 +198,7 @@ const SCULPTOR_SYSTEM_PROMPT = `You are Master Voxel Sculptor Argon, creating br
   "category": "vehicle" | "creature" | "building" | "prop" | "aircraft" | "watercraft",
   "scaleClass": "tiny" | "small" | "medium" | "large" | "colossal",
   "liveFeed": null,
+  "interaction": null,
   "palette": { "body": "#...", "bodyShade": "#...", "trim": "#...", "accent": "#...", "glass": "#...", "glow": "#..." },
   "ops": [ ... 32 to 65 detailed VoxelOp objects ... ],
   "parts": [
@@ -296,7 +314,10 @@ export async function sculptWithArgon(
     fallbackTitle: string,
     attemptNumber: number,
   ): Promise<CandidateAttempt> => {
-    const rawDraft = normalizeAndGroundBlueprint(rawJson, fallbackTitle, { skipAutoRepair: true });
+    const rawDraft = normalizeAndGroundBlueprint(rawJson, fallbackTitle, {
+      skipAutoRepair: true,
+      contextText: promptText,
+    });
     const draftAudit = auditBlueprintOverlaps(rawDraft);
     const repairedBp = autoRepairBlueprintOverlaps(rawDraft).blueprint;
 
@@ -376,7 +397,10 @@ export async function sculptWithArgon(
     }
     if (needsCollision) {
       const draftAudit = auditBlueprintOverlaps(
-        normalizeAndGroundBlueprint(current.rawJson, current.bp.name, { skipAutoRepair: true }),
+        normalizeAndGroundBlueprint(current.rawJson, current.bp.name, {
+          skipAutoRepair: true,
+          contextText: promptText,
+        }),
       );
       notes.push(
         `VOXEL Z-FIGHTING / COLLISION DETECTED IN ANIMATED PARTS:\n${formatAuditFeedbackForArgon(draftAudit)}\nReposition the colliding part pivots or adjust the base roof/wall ops so every animated part spins/swings with >= 1 full voxel of clearance.`,

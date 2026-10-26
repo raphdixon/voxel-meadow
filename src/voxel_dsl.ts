@@ -4,7 +4,9 @@ import { autoRepairBlueprintOverlaps } from "./voxel_audit";
 import type {
   BlueprintAmendment,
   BlueprintCriticReview,
+  BlueprintInteraction,
   CreationCategory,
+  InteractionKind,
   ScaleClass,
   VoxelBlueprint,
   VoxelOp,
@@ -1009,8 +1011,85 @@ export function sanitizeOp(raw: Record<string, unknown>, palette: Record<string,
   }
 }
 
+const INTERACTION_KINDS: Record<InteractionKind, true> = {
+  tic_tac_toe: true,
+  connect_four: true,
+  whack_a_mole: true,
+  floor_piano: true,
+  simon_synth: true,
+  lights_out: true,
+  step_sequencer: true,
+  basketball_hoop: true,
+  slot_machine: true,
+  fireworks_mortar: true,
+  tesla_coil: true,
+  gravity_inverter: true,
+  marble_run: true,
+};
+
+export function sanitizeInteraction(
+  raw: unknown,
+  contextText = "",
+): BlueprintInteraction | null {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const rec = raw as Record<string, unknown>;
+    const k = typeof rec.kind === "string" ? rec.kind.trim().toLowerCase() : "";
+    if (INTERACTION_KINDS[k as InteractionKind]) {
+      return { kind: k as InteractionKind };
+    }
+  } else if (typeof raw === "string") {
+    const k = raw.trim().toLowerCase();
+    if (INTERACTION_KINDS[k as InteractionKind]) {
+      return { kind: k as InteractionKind };
+    }
+  }
+
+  const text = contextText.toLowerCase();
+  if (!text) return null;
+  if (/\b(naughts?\s*(?:and|&)\s*crosses|noughts?\s*(?:and|&)\s*crosses|tic[\s-]*tac[\s-]*toe)\b/i.test(text)) {
+    return { kind: "tic_tac_toe" };
+  }
+  if (/\b(connect[\s-]*(?:four|4)|four[\s-]*in[\s-]*a[\s-]*row|4[\s-]*in[\s-]*a[\s-]*row)\b/i.test(text)) {
+    return { kind: "connect_four" };
+  }
+  if (/\b(whack[\s-]*a[\s-]*mole|whac[\s-]*a[\s-]*mole|critter\s*bonk|mole\s*arcade)\b/i.test(text)) {
+    return { kind: "whack_a_mole" };
+  }
+  if (/\b(floor\s*piano|walk[\s-]*on\s*piano|giant\s*(?:voxel\s*)?piano|piano\s*mat|foot\s*piano)\b/i.test(text)) {
+    return { kind: "floor_piano" };
+  }
+  if (/\b(simon\s*(?:says|memory|synth|obelisk)|memory\s*(?:obelisk|pads?|game))\b/i.test(text)) {
+    return { kind: "simon_synth" };
+  }
+  if (/\b(lights[\s-]*out|rune\s*puzzle|glowing\s*rune\s*grid)\b/i.test(text)) {
+    return { kind: "lights_out" };
+  }
+  if (/\b(step\s*sequencer|beat\s*(?:matrix|sequencer)|drum\s*matrix|chiptune\s*sequencer)\b/i.test(text)) {
+    return { kind: "step_sequencer" };
+  }
+  if (/\b(basketball\s*(?:hoop|court)|streetball|trick[\s-]*shot\s*hoop|free[\s-]*throw\s*court)\b/i.test(text)) {
+    return { kind: "basketball_hoop" };
+  }
+  if (/\b(slot\s*machine|one[\s-]*armed\s*bandit|jackpot\s*(?:machine|reels?|automaton)|fortune\s*reels?)\b/i.test(text)) {
+    return { kind: "slot_machine" };
+  }
+  if (/\b(fireworks?\s*(?:mortar|battery|launcher|rack)|pyrotechnic\s*launcher)\b/i.test(text)) {
+    return { kind: "fireworks_mortar" };
+  }
+  if (/\b(tesla\s*coil|lightning\s*(?:coil|spire|generator)|jacob'?s\s*ladder)\b/i.test(text)) {
+    return { kind: "tesla_coil" };
+  }
+  if (/\b(gravity\s*(?:inverter|flipper)|anti[\s-]*gravity\s*house|upside[\s-]*down\s*(?:escher\s*)?house)\b/i.test(text)) {
+    return { kind: "gravity_inverter" };
+  }
+  if (/\b(marble\s*run|rube\s*goldberg|kinetic\s*ball\s*tower|pinball\s*tower)\b/i.test(text)) {
+    return { kind: "marble_run" };
+  }
+  return null;
+}
+
 const EXPLICIT_PEDESTAL_SUBJECT_RE =
-  /\b(statue|monument|memorial|trophy|bust|obelisk|pedestal|podium)\b/i;
+  /\b(statue|monument|memorial|trophy|bust|obelisk|pedestal|podium|floor\s*piano|walk[\s-]*on\s*piano|tic[\s-]*tac[\s-]*toe|naughts|noughts|lights[\s-]*out|simon)\b/i;
 
 const LIVED_IN_PLACE_RE =
   /\b(cottage|house|home|cabin|villa|manor|mansion|hall|parliament|shop|store|bookshop|bakery|windmill|cafe|pub|bar|inn|cantina|shack|burger|ihop|pancake|diner|restaurant|firehouse|station|datacentre|datacenter|tower|arena|stadium|amphitheater|amphitheatre|pavilion|court|half-?pipe|skate|quarry|mine|mining|farm|barn|apiary|waterfall|cliff|volcano|mountain|island|coast|beach|hammock|lounger)\b/i;
@@ -1420,6 +1499,20 @@ export function normalizeAndGroundBlueprint(
     description = `${(lastSpace > 120 ? cut.slice(0, lastSpace) : cut).replace(/[,;:\s]+$/, "")}…`;
   }
 
+  const fullContextText = `${name} ${description} ${options?.contextText ?? ""}`;
+  const interaction = sanitizeInteraction(raw.interaction, fullContextText);
+
+  let finalCategory = category;
+  let finalScaleClass = scaleClass;
+  if (interaction) {
+    if (finalCategory !== "building" && finalCategory !== "prop") {
+      finalCategory = "prop";
+    }
+    if (finalScaleClass === "tiny") {
+      finalScaleClass = "medium";
+    }
+  }
+
   const liveFeed = sanitizeLiveFeed(raw.liveFeed);
   let criticReview: BlueprintCriticReview | undefined;
   if (raw.criticReview && typeof raw.criticReview === "object") {
@@ -1441,12 +1534,13 @@ export function normalizeAndGroundBlueprint(
     version: 1,
     name,
     description,
-    category,
-    scaleClass,
+    category: finalCategory,
+    scaleClass: finalScaleClass,
     palette,
     ops,
     parts,
     ...(liveFeed ? { liveFeed } : {}),
+    ...(interaction ? { interaction } : {}),
     ...(criticReview ? { criticReview } : {}),
     stats: {
       voxels: b.count,
@@ -1573,6 +1667,7 @@ export function applyBlueprintAmendment(
       ops: nextOps,
       parts: nextParts,
       liveFeed: existing.liveFeed ?? null,
+      ...(existing.interaction ? { interaction: existing.interaction } : {}),
       ...(existing.criticReview ? { criticReview: existing.criticReview } : {}),
     },
     existing.name,

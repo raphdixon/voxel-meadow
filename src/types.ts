@@ -100,6 +100,25 @@ export interface BlueprintCriticReview {
   reviewedAt: number;
 }
 
+export type InteractionKind =
+  | "tic_tac_toe"
+  | "connect_four"
+  | "whack_a_mole"
+  | "floor_piano"
+  | "simon_synth"
+  | "lights_out"
+  | "step_sequencer"
+  | "basketball_hoop"
+  | "slot_machine"
+  | "fireworks_mortar"
+  | "tesla_coil"
+  | "gravity_inverter"
+  | "marble_run";
+
+export interface BlueprintInteraction {
+  kind: InteractionKind;
+}
+
 export interface VoxelBlueprint {
   version: 1;
   name: string;
@@ -110,6 +129,7 @@ export interface VoxelBlueprint {
   ops: VoxelOp[];
   parts: VoxelPart[];
   liveFeed?: LiveFeedSpec | null;
+  interaction?: BlueprintInteraction | null;
   criticReview?: BlueprintCriticReview;
   stats: {
     voxels: number;

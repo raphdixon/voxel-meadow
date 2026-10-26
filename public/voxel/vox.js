@@ -871,6 +871,8 @@ export function buildCreationGroup(blueprint, options = {}) {
 
   group.userData.topY = Math.max(1.0, maxTopY);
   group.userData.voxScale = voxScale;
+  group.userData.baseVox = baseVox;
+  group.userData.baseBounds = baseVox.bounds();
   group.userData.animate = (t, motion = null) => {
     for (const fn of animators) fn(t, motion);
   };

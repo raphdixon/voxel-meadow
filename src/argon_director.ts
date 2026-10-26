@@ -176,7 +176,7 @@ function findNearestPathCurb(
 }
 
 const STATIONARY_OVERRIDE_RE =
-  /\b(statue|monument|memorial|sculpture|fountain|shrine|temple|house|cottage|shop|bakery|cafe|pub|bar|inn|hotel|restaurant|diner|cantina|shack|station|firehouse|quarry|mine|parliament|manor|mansion|apiary|beehive|tower|castle|barn|windmill|datacentre|datacenter|museum|library|school|kiosk|stall|bench|hammock|lounger|sunbed|deckchair|sign|tree|bush|garden|bridge|archway|volcano|mountain|waterfall|cliff|canyon|coastline|island|pyramid|ziggurat|arena|amphitheater|amphitheatre|stadium|colosseum|cathedral|half-?pipe|quarter-?pipe|skate\s*park|skatepark|ramp|bowl|court|rink|pool|playground|park|gazebo|pavilion|garage)\b/i;
+  /\b(statue|monument|memorial|sculpture|fountain|shrine|temple|house|cottage|shop|bakery|cafe|pub|bar|inn|hotel|restaurant|diner|cantina|shack|station|firehouse|quarry|mine|parliament|manor|mansion|apiary|beehive|tower|castle|barn|windmill|datacentre|datacenter|museum|library|school|kiosk|stall|bench|hammock|lounger|sunbed|deckchair|sign|tree|bush|garden|bridge|archway|volcano|mountain|waterfall|cliff|canyon|coastline|island|pyramid|ziggurat|arena|amphitheater|amphitheatre|stadium|colosseum|cathedral|half-?pipe|quarter-?pipe|skate\s*park|skatepark|ramp|bowl|court|rink|pool|playground|park|gazebo|pavilion|garage|conservatory|greenhouse|terrarium|laundromat|parlor|parlour|observatory|planetarium|arcade|piano|sequencer|orrery|coil)\b/i;
 
 const COLOSSAL_SUBJECT_RE =
   /\b(volcano|stratovolcano|caldera|mountain|mt\.|everest|fuji|matterhorn|glacier|canyon|mesa|waterfall|cataract|niagara|castle|citadel|fortress|palace|cathedral|stadium|arena|colosseum|amphitheater|amphitheatre|pyramid|ziggurat|launch\s*pad|spaceport|world\s*tree|yggdrasil|colossus|kaiju|godzilla|skyscraper|megastructure)\b/i;
@@ -262,6 +262,9 @@ const GLIDER_SUBJECT_RE =
  * to determine whether it should fly, drive, float, or roam rather than stay stationary!
  */
 export function inferEffectiveMobility(target: WorldCreation): CreationCategory {
+  if (target.blueprint?.interaction) {
+    return target.category === "building" ? "building" : "prop";
+  }
   const combined = `${target.name} ${target.description} ${target.creatorPrompt ?? ""}`;
   const isExplicitlyStationary =
     STATIONARY_OVERRIDE_RE.test(combined) &&
@@ -1121,7 +1124,11 @@ export function sanitizeWorldPatch(
     const bRaw = rec.behavior && typeof rec.behavior === "object" ? (rec.behavior as Record<string, unknown>) : null;
     if (!bRaw) continue;
 
-    const bType = typeof bRaw.type === "string" ? bRaw.type : "";
+    const bType = target.blueprint?.interaction
+      ? "landmark"
+      : typeof bRaw.type === "string"
+        ? bRaw.type
+        : "";
     const statusLine = normalizeFactualDescription(
       sanitizePlainText(bRaw.statusLine, 120, true) || target.description || target.name,
     );
@@ -1220,8 +1227,11 @@ export function sanitizeWorldPatch(
 
     if (behavior) {
       const validCats = new Set(["vehicle", "creature", "building", "prop", "aircraft", "watercraft"]);
-      const recCat =
-        typeof rec.category === "string" && validCats.has(rec.category.trim().toLowerCase())
+      const recCat = target.blueprint?.interaction
+        ? target.category === "building"
+          ? "building"
+          : "prop"
+        : typeof rec.category === "string" && validCats.has(rec.category.trim().toLowerCase())
           ? (rec.category.trim().toLowerCase() as CreationCategory)
           : behavior.type === "fly_circle"
             ? "aircraft"

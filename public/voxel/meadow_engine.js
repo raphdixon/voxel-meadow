@@ -16,6 +16,7 @@ import {
   UnrealBloomPass,
 } from "../vendor/three-bundle.js";
 import { VillagerAgent, buildWorldPropMesh } from "./villagers.js";
+import { INTERACTIVE_HIT_LAYER, createInteractiveController } from "./interactive_games.js";
 import {
   Vox,
   buildCreationGroup,
@@ -811,7 +812,7 @@ function computeBlueprintSignature(bp) {
   const partsSig = (bp.parts || [])
     .map((p) => `${p.name}:${p.kind}:${p.phase || 0}:${(p.pivot || []).join(",")}:${(p.ops || []).length}`)
     .join("|");
-  return `${bp.category || ""}:${bp.scaleClass || ""}:${bp.stats?.voxels || 0}:${opsSig}#${partsSig}`;
+  return `${bp.category || ""}:${bp.scaleClass || ""}:${bp.interaction?.kind || ""}:${bp.stats?.voxels || 0}:${opsSig}#${partsSig}`;
 }
 
 class CreationSimEntity {
@@ -876,6 +877,7 @@ class CreationSimEntity {
     this.hopPhase = 0;
 
     this.orbitAngle = (index * 1.9) % (Math.PI * 2);
+    this.interactive = null;
 
     this.rebuildBehavior(creation);
     this.group.position.set(this.x, this.y, this.z);
@@ -933,8 +935,12 @@ class CreationSimEntity {
           : creation.yaw || 0;
     }
     const nextSig = computeBlueprintSignature(creation.blueprint);
+    let rebuiltGroup = false;
     if (creationsGroup && nextSig && nextSig !== this.blueprintSig) {
+      rebuiltGroup = true;
       this.blueprintSig = nextSig;
+      this.interactive?.dispose?.();
+      this.interactive = null;
       if (this.feedMesh) {
         this.group.remove(this.feedMesh);
       }
@@ -955,6 +961,14 @@ class CreationSimEntity {
       this.group.position.set(this.x, this.y, this.z);
       this.group.rotation.y = this.yaw;
       creationsGroup.add(this.group);
+    }
+    const desiredInteractionKind = creation.blueprint?.interaction?.kind || null;
+    if (!this.interactive || rebuiltGroup || this.interactive.kind !== desiredInteractionKind) {
+      this.interactive?.dispose?.();
+      this.interactive = createInteractiveController(creation, this.group);
+    }
+    if (this.interactive?.extraRadius > 0) {
+      this.footprintRadius = Math.max(this.footprintRadius, this.interactive.extraRadius);
     }
     const b = creation.behavior;
     const isPingPong = b?.loopMode === "pingpong";
@@ -1442,8 +1456,18 @@ class CreationSimEntity {
       }
     }
 
-    this.group.position.set(this.x, this.y, this.z);
-    this.group.rotation.set(pitchX, this.yaw, rollZ);
+    this.interactive?.step?.(dt, t, {
+      viewerPos,
+      entX: this.x,
+      entZ: this.z,
+      entYaw: this.yaw,
+    });
+    const poseOff = this.interactive?.getPoseOffset?.(t) || null;
+    const finalY = this.y + (poseOff?.liftY || 0);
+    const finalRollZ = rollZ + (poseOff?.rollZ || 0);
+
+    this.group.position.set(this.x, finalY, this.z);
+    this.group.rotation.set(pitchX, this.yaw, finalRollZ);
     const popEase = this.spawnScale < 1 ? 1 - (1 - this.spawnScale) ** 3 : 1;
     this.group.scale.setScalar(popEase);
 
@@ -1462,6 +1486,8 @@ class CreationSimEntity {
   }
 
   dispose() {
+    this.interactive?.dispose?.();
+    this.interactive = null;
     if (this.feedMesh) {
       this.feedMesh.geometry.dispose();
       this.feedMesh.material.dispose();
@@ -1874,7 +1900,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     const rNew = Math.max(1.3, Number(candidateRadius) || 3.3);
     const bound = Math.max(112, 138 - rNew);
     if (Math.abs(x) > bound || Math.abs(z) > bound) return false;
-    if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < rNew + 2.8) return false;
+    if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < rNew + 2.2) return false;
     if (!currentWorld) return true;
     for (const c of currentWorld.creations || []) {
       if (c.category === "aircraft" || c.behavior?.type === "fly_circle") continue;
@@ -1884,10 +1910,10 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         c.blueprint?.stats?.footprintX ?? 14,
         c.blueprint?.stats?.footprintZ ?? 14,
       );
-      if (Math.hypot(x - c.x, z - c.z) < rNew + otherR + 1.8) return false;
+      if (Math.hypot(x - c.x, z - c.z) < rNew + otherR + 0.85) return false;
     }
     for (const pr of currentWorld.props || []) {
-      if (pr.kind === "pond" && Math.hypot(x - pr.x, z - pr.z) < (pr.radius || 6.5) + rNew + 1.4) {
+      if (pr.kind === "pond" && Math.hypot(x - pr.x, z - pr.z) < (pr.radius || 6.5) + rNew + 0.9) {
         return false;
       }
     }
@@ -1897,7 +1923,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         const a = p.points[i];
         const b = p.points[(i + 1) % p.points.length];
         if (!p.closed && i === p.points.length - 1) break;
-        if (distToSeg2D(x, z, a[0], a[1], b[0], b[1]) < rNew + 2.5) return false;
+        if (distToSeg2D(x, z, a[0], a[1], b[0], b[1]) < rNew + 2.15) return false;
       }
     }
     return true;
@@ -1939,8 +1965,48 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   const raycaster = new THREE.Raycaster();
+  const interactiveRaycaster = new THREE.Raycaster();
+  interactiveRaycaster.layers.set(INTERACTIVE_HIT_LAYER);
+  let hoveredInteractiveEnt = null;
   const groundPlaneMath = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
   const tmpHit = new THREE.Vector3();
+
+  function clearInteractiveHover() {
+    if (hoveredInteractiveEnt) {
+      hoveredInteractiveEnt.interactive?.setHovered?.(null);
+      hoveredInteractiveEnt = null;
+    }
+  }
+
+  function pickInteractiveAt(clientX, clientY) {
+    const hitTargets = [];
+    for (const ent of creationEntities.values()) {
+      if (ent.interactive?.hitMeshes?.length) {
+        for (const m of ent.interactive.hitMeshes) {
+          hitTargets.push(m);
+        }
+      }
+    }
+    if (hitTargets.length === 0) return null;
+
+    const rect = canvas.getBoundingClientRect();
+    const locked = fp.active && document.pointerLockElement === canvas;
+    const ndcX = locked ? 0 : ((clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1;
+    const ndcY = locked ? 0 : -((clientY - rect.top) / Math.max(1, rect.height)) * 2 + 1;
+    interactiveRaycaster.setFromCamera({ x: ndcX, y: ndcY }, fp.active ? fpCamera : camera);
+    interactiveRaycaster.far = fp.active ? 42 : 620;
+    const hits = interactiveRaycaster.intersectObjects(hitTargets, false);
+    if (!hits.length) return null;
+    const top = hits[0].object;
+    const cid = top.userData?.creationId;
+    const ent = cid ? creationEntities.get(cid) : null;
+    if (!ent || !ent.interactive) return null;
+    return {
+      ent,
+      action: top.userData?.interactiveAction || null,
+      point: hits[0].point,
+    };
+  }
 
   const FP_EYE_HEIGHT = 1.65;
   const FP_MIN_PITCH = -1.12;
@@ -2507,6 +2573,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       }
     }
     for (const ent of creationEntities.values()) {
+      if (ent.interactive?.allowWalkOver) continue;
       if (ent.data.category === "building" || ent.data.behavior?.type === "landmark") {
         const r = (ent.footprintRadius || 3.4) + 0.6 + extraMargin;
         if (Math.hypot(x - ent.x, z - ent.z) < r) return false;
@@ -2543,6 +2610,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         }
       }
       for (const ent of creationEntities.values()) {
+        if (ent.interactive?.allowWalkOver) continue;
         if (ent.data.category === "building" || ent.data.behavior?.type === "landmark") {
           pushOut(ent.x, ent.z, (ent.footprintRadius || 3.4) + 0.58);
         } else if (ent.data.behavior?.type === "vehicle_route") {
@@ -2955,6 +3023,19 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         return;
       }
       if (document.pointerLockElement !== canvas) {
+        const iHitFp = pickInteractiveAt(e.clientX, e.clientY);
+        if (iHitFp) {
+          if (hoveredInteractiveEnt && hoveredInteractiveEnt !== iHitFp.ent) {
+            hoveredInteractiveEnt.interactive?.setHovered?.(null);
+          }
+          hoveredInteractiveEnt = iHitFp.ent;
+          hoveredInteractiveEnt.interactive?.setHovered?.(iHitFp.action);
+          const readingFp = liveFeedsById[iHitFp.ent.id] || null;
+          callbacks.onHoverCreation?.(iHitFp.ent.data, e.clientX, e.clientY, readingFp);
+          canvas.style.cursor = "pointer";
+          return;
+        }
+        clearInteractiveHover();
         const hoveredFp = pickCreationAt(e.clientX, e.clientY);
         const readingFp =
           hoveredFp && hoveredFp.id !== "__city_sign__" ? liveFeedsById[hoveredFp.id] || null : null;
@@ -3028,10 +3109,24 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
     if (!pointerGesture) {
       if (spotState.mode === "picking") {
+        clearInteractiveHover();
         callbacks.onHoverCreation?.(null, e.clientX, e.clientY, null);
         canvas.style.cursor = "crosshair";
         return;
       }
+      const iHit = pickInteractiveAt(e.clientX, e.clientY);
+      if (iHit) {
+        if (hoveredInteractiveEnt && hoveredInteractiveEnt !== iHit.ent) {
+          hoveredInteractiveEnt.interactive?.setHovered?.(null);
+        }
+        hoveredInteractiveEnt = iHit.ent;
+        hoveredInteractiveEnt.interactive?.setHovered?.(iHit.action);
+        const reading = liveFeedsById[iHit.ent.id] || null;
+        callbacks.onHoverCreation?.(iHit.ent.data, e.clientX, e.clientY, reading);
+        canvas.style.cursor = "pointer";
+        return;
+      }
+      clearInteractiveHover();
       const hovered = pickCreationAt(e.clientX, e.clientY);
       const reading = hovered && hovered.id !== "__city_sign__" ? liveFeedsById[hovered.id] || null : null;
       callbacks.onHoverCreation?.(hovered ? hovered.data : null, e.clientX, e.clientY, reading);
@@ -3047,6 +3142,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
     if (Math.hypot(e.clientX - pointerGesture.startX, e.clientY - pointerGesture.startY) > 4.5) {
       pointerGesture.moved = true;
+      clearInteractiveHover();
     }
 
     if (!pointerGesture.moved) return;
@@ -3061,11 +3157,23 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   });
 
   const handleFirstPersonTap = (clientX, clientY) => {
+    const iHit = pickInteractiveAt(clientX, clientY);
+    if (iHit) {
+      highlightedId = iHit.ent.id;
+      const msg = iHit.ent.interactive?.trigger?.(iHit.action);
+      if (msg) {
+        callbacks.onInteractiveEvent?.(iHit.ent.data, msg);
+      } else {
+        callbacks.onSelectCreation?.(iHit.ent.data, liveFeedsById[iHit.ent.id] || null);
+      }
+      return;
+    }
     const picked = pickCreationAt(clientX, clientY);
     if (picked) {
       if (picked.id !== "__city_sign__") {
         highlightedId = picked.id;
       }
+      picked.interactive?.onInspectFocus?.();
       callbacks.onSelectCreation?.(picked.data, liveFeedsById[picked.id] || null);
     }
   };
@@ -3140,14 +3248,38 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         }
       }
 
+      if (spotState.mode === "hidden") {
+        const iHit = pickInteractiveAt(e.clientX, e.clientY);
+        if (iHit) {
+          highlightedId = iHit.ent.id;
+          if (
+            Math.hypot(cam.goalTx - iHit.ent.x, cam.goalTz - iHit.ent.z) > 10.5 ||
+            cam.goalZoom < 1.38
+          ) {
+            focusOn(iHit.ent.x, iHit.ent.z, Math.max(1.88, cam.goalZoom));
+          }
+          const msg = iHit.ent.interactive?.trigger?.(iHit.action);
+          if (msg) {
+            callbacks.onInteractiveEvent?.(iHit.ent.data, msg);
+          } else {
+            callbacks.onSelectCreation?.(iHit.ent.data, liveFeedsById[iHit.ent.id] || null);
+          }
+          return;
+        }
+      }
+
       const picked = pickCreationAt(e.clientX, e.clientY);
       if (picked) {
         if (picked.id !== "__city_sign__") {
           highlightedId = picked.id;
         }
         const scaleCls = picked.data?.scaleClass;
-        const targetZoom =
+        let targetZoom =
           scaleCls === "colossal" ? 0.86 : scaleCls === "large" ? 1.28 : scaleCls === "tiny" ? 2.0 : 1.55;
+        if (picked.interactive) {
+          targetZoom = Math.max(1.88, targetZoom);
+          picked.interactive.onInspectFocus?.();
+        }
         focusOn(picked.x, picked.z, targetZoom);
         callbacks.onSelectCreation?.(picked.data, liveFeedsById[picked.id] || null);
       }
@@ -3156,6 +3288,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   canvas.addEventListener("pointerup", endGesture);
   canvas.addEventListener("pointercancel", endGesture);
   canvas.addEventListener("lostpointercapture", endGesture);
+  canvas.addEventListener("pointerleave", clearInteractiveHover);
 
   const isKeyDown = (...tokens) => tokens.some((tk) => pressedKeys.has(tk));
 
@@ -3262,7 +3395,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     const projX = ent.x - Math.sin(cam.az) * altOffset;
     const projZ = ent.z - Math.cos(cam.az) * altOffset;
     const scaleCls = ent.data?.scaleClass;
-    const zoom =
+    let zoom =
       ent.y > 4
         ? 1.22
         : scaleCls === "colossal"
@@ -3272,6 +3405,10 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
             : scaleCls === "tiny"
               ? 2.05
               : 1.62;
+    if (ent.interactive) {
+      zoom = Math.max(1.88, zoom);
+      ent.interactive.onInspectFocus?.();
+    }
     focusOn(projX, projZ, zoom);
   }
 

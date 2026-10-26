@@ -242,6 +242,10 @@ engine = createMeadowWorldEngine(
         : baseDesc;
       showToast(detail ? `${creation.name} — ${detail}` : creation.name);
     },
+    onInteractiveEvent(_creation, message) {
+      if (!message || isOgCapture) return;
+      showToast(message);
+    },
     onPickGroundSpot(x, z) {
       chosenSpot = { x, z };
       uiState = "composing";

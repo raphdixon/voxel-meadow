@@ -7,8 +7,8 @@ import { Vox, buildVoxelMesh } from "./vox.js";
 const SKIN_TONES = ["#f5cfa8", "#e6b48a", "#c98e63", "#8d5838", "#f7dcc0"];
 const PANTS_COLORS = ["#394a6d", "#4b4f59", "#6b4f3a", "#3d6b5e", "#54476e"];
 
-const ISLAND_HALF_EXTENT = 155.0;
-const ISLAND_SUPERELLIPSE_EXP = 4.2;
+const ISLAND_HALF_EXTENT = 163.5;
+const ISLAND_SUPERELLIPSE_EXP = 3.1;
 
 function getIslandInlandMargin(x, z) {
   const ax = Math.abs(x) / ISLAND_HALF_EXTENT;
@@ -20,10 +20,11 @@ function getIslandInlandMargin(x, z) {
     ) * ISLAND_HALF_EXTENT;
   const theta = Math.atan2(z, x);
   const warp =
-    4.8 * Math.cos(2 * theta - 0.55) +
-    3.4 * Math.sin(3 * theta + 0.85) +
-    2.5 * Math.cos(5 * theta - 1.15) +
-    1.6 * Math.sin(7 * theta + 0.35);
+    9.2 * Math.cos(2 * theta + 1.55) +
+    7.8 * Math.sin(3 * theta + 0.75) +
+    5.6 * Math.cos(4 * theta + 3.08) +
+    4.1 * Math.sin(5 * theta - 0.85) +
+    2.6 * Math.cos(7 * theta + 0.4);
   return ISLAND_HALF_EXTENT + warp - superDist;
 }
 

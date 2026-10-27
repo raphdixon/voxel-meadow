@@ -11,15 +11,16 @@ import type {
 import { distPointToPolyline2D, sampleCatmullRom2D } from "./voxel_audit";
 import { detectBlueprintFrontAngle, getCreationFootprintRadius } from "./voxel_dsl";
 
-export const ISLAND_HALF_EXTENT = 155.0;
-export const ISLAND_SUPERELLIPSE_EXP = 4.2;
+export const ISLAND_HALF_EXTENT = 163.5;
+export const ISLAND_SUPERELLIPSE_EXP = 3.1;
 
 export function getIslandCoastWarp(theta: number): number {
   return (
-    4.8 * Math.cos(2 * theta - 0.55) +
-    3.4 * Math.sin(3 * theta + 0.85) +
-    2.5 * Math.cos(5 * theta - 1.15) +
-    1.6 * Math.sin(7 * theta + 0.35)
+    9.2 * Math.cos(2 * theta + 1.55) +
+    7.8 * Math.sin(3 * theta + 0.75) +
+    5.6 * Math.cos(4 * theta + 3.08) +
+    4.1 * Math.sin(5 * theta - 0.85) +
+    2.6 * Math.cos(7 * theta + 0.4)
   );
 }
 

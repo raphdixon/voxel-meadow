@@ -30,15 +30,16 @@ const CITY_SIGN_POS = [3.8, -10.8];
 const CITY_SIGN_YAW = 0.62;
 const MAX_SHADER_ZONES = 28;
 
-export const ISLAND_HALF_EXTENT = 155.0;
-export const ISLAND_SUPERELLIPSE_EXP = 4.2;
+export const ISLAND_HALF_EXTENT = 163.5;
+export const ISLAND_SUPERELLIPSE_EXP = 3.1;
 
 export function getIslandCoastWarp(theta) {
   return (
-    4.8 * Math.cos(2 * theta - 0.55) +
-    3.4 * Math.sin(3 * theta + 0.85) +
-    2.5 * Math.cos(5 * theta - 1.15) +
-    1.6 * Math.sin(7 * theta + 0.35)
+    9.2 * Math.cos(2 * theta + 1.55) +
+    7.8 * Math.sin(3 * theta + 0.75) +
+    5.6 * Math.cos(4 * theta + 3.08) +
+    4.1 * Math.sin(5 * theta - 0.85) +
+    2.6 * Math.cos(7 * theta + 0.4)
   );
 }
 
@@ -510,17 +511,18 @@ function drawFeedBadgeCanvas(canvas, reading) {
 
 const ISLAND_GLSL_HELPERS = `
   float islandCoastWarp(float theta) {
-    return 4.8 * cos(2.0 * theta - 0.55)
-         + 3.4 * sin(3.0 * theta + 0.85)
-         + 2.5 * cos(5.0 * theta - 1.15)
-         + 1.6 * sin(7.0 * theta + 0.35);
+    return 9.2 * cos(2.0 * theta + 1.55)
+         + 7.8 * sin(3.0 * theta + 0.75)
+         + 5.6 * cos(4.0 * theta + 3.08)
+         + 4.1 * sin(5.0 * theta - 0.85)
+         + 2.6 * cos(7.0 * theta + 0.4);
   }
   float islandCliffFactor(float theta) {
     return clamp(0.48 + 0.58 * sin(3.0 * theta - 0.4) + 0.34 * cos(5.0 * theta + 1.1), 0.0, 1.0);
   }
   float islandInlandMargin(vec2 wp) {
-    const float H = 155.0;
-    const float P = 4.2;
+    const float H = 163.5;
+    const float P = 3.1;
     float ax = max(1e-5, abs(wp.x) / H);
     float az = max(1e-5, abs(wp.y) / H);
     float superDist = pow(pow(ax, P) + pow(az, P), 1.0 / P) * H;
@@ -717,13 +719,13 @@ function buildEndlessGrassMaterial(uniforms) {
         }`,
       );
   };
-  mat.customProgramCacheKey = () => "geminisland-island-biomes-v8";
+  mat.customProgramCacheKey = () => "geminisland-island-biomes-v9";
   return mat;
 }
 
 function buildIslandTerrainGeometry() {
-  const size = 376;
-  const segs = 248;
+  const size = 408;
+  const segs = 256;
   const geo = new THREE.PlaneGeometry(size, size, segs, segs);
   geo.rotateX(-Math.PI / 2);
   const pos = geo.attributes.position;

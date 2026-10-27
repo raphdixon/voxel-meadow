@@ -2,10 +2,10 @@ import { extractJsonObject, parseModelList } from "./gemini_models";
 import { redactSecrets, safeLogWarn, sanitizePlainText } from "./security";
 
 export const DEFAULT_FLASH_LITE_MODELS = [
-  "gemini-flash-lite-latest",
-  "gemini-3.5-flash-lite",
   "gemini-3.1-flash-lite",
+  "gemini-3.5-flash-lite",
   "gemini-2.5-flash-lite",
+  "gemini-flash-lite-latest",
 ] as const;
 
 export type MinigameAiKind = "tic_tac_toe" | "connect_four";
@@ -25,6 +25,7 @@ export interface MinigameMoveResult {
 }
 
 let cachedFlashLiteModel: string | null = null;
+const skipThinkingConfigModels = new Set<string>();
 
 function buildFlashLiteModelOrder(configured?: string): string[] {
   const custom = parseModelList(configured);
@@ -154,9 +155,9 @@ async function callSingleFlashLiteModel(opts: {
       },
     };
     if (opts.withZeroThinking) {
-      generationConfig.thinkingConfig = {
-        thinkingBudget: 0,
-      };
+      generationConfig.thinkingConfig = /^gemini-3/i.test(opts.model)
+        ? { thinkingLevel: "MINIMAL" }
+        : { thinkingBudget: 0 };
     }
 
     const res = await fetch(endpoint, {
@@ -301,21 +302,24 @@ export async function chooseMoveWithGeminiFlashLite(opts: {
   const errors: string[] = [];
 
   for (const model of models) {
+    const tryZeroThinking = !skipThinkingConfigModels.has(model);
     let res = await callSingleFlashLiteModel({
       model,
       apiKey: opts.apiKey,
       systemPrompt,
       userPrompt,
-      withZeroThinking: true,
+      withZeroThinking: tryZeroThinking,
       timeoutMs: 4_500,
     });
 
     if (
+      tryZeroThinking &&
       !res.ok &&
       res.httpStatus === 400 &&
       res.errorBody &&
       /thinking|schema/i.test(res.errorBody)
     ) {
+      skipThinkingConfigModels.add(model);
       res = await callSingleFlashLiteModel({
         model,
         apiKey: opts.apiKey,

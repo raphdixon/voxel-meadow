@@ -7,6 +7,40 @@ import { Vox, buildVoxelMesh } from "./vox.js";
 const SKIN_TONES = ["#f5cfa8", "#e6b48a", "#c98e63", "#8d5838", "#f7dcc0"];
 const PANTS_COLORS = ["#394a6d", "#4b4f59", "#6b4f3a", "#3d6b5e", "#54476e"];
 
+const ISLAND_HALF_EXTENT = 155.0;
+const ISLAND_SUPERELLIPSE_EXP = 4.2;
+
+function getIslandInlandMargin(x, z) {
+  const ax = Math.abs(x) / ISLAND_HALF_EXTENT;
+  const az = Math.abs(z) / ISLAND_HALF_EXTENT;
+  const superDist =
+    Math.pow(
+      Math.pow(ax, ISLAND_SUPERELLIPSE_EXP) + Math.pow(az, ISLAND_SUPERELLIPSE_EXP),
+      1 / ISLAND_SUPERELLIPSE_EXP,
+    ) * ISLAND_HALF_EXTENT;
+  const theta = Math.atan2(z, x);
+  const warp =
+    4.8 * Math.cos(2 * theta - 0.55) +
+    3.4 * Math.sin(3 * theta + 0.85) +
+    2.5 * Math.cos(5 * theta - 1.15) +
+    1.6 * Math.sin(7 * theta + 0.35);
+  return ISLAND_HALF_EXTENT + warp - superDist;
+}
+
+function clampVillagerToIsland(x, z, minMargin = 2.0) {
+  if (getIslandInlandMargin(x, z) >= minMargin) return [x, z];
+  const r = Math.hypot(x, z);
+  if (r < 0.001) return [0, 0];
+  let lo = 0;
+  let hi = 1;
+  for (let i = 0; i < 10; i++) {
+    const mid = (lo + hi) * 0.5;
+    if (getIslandInlandMargin(x * mid, z * mid) >= minMargin) lo = mid;
+    else hi = mid;
+  }
+  return [x * lo, z * lo];
+}
+
 export function buildVillagerRig(villager, index = 0) {
   const root = new THREE.Group();
   const s = 0.135; // Fine micro-voxel scale (~1.5m tall villager)
@@ -109,8 +143,43 @@ export class VillagerAgent {
     this.ridingVehicleId = null;
     this.boardedStopId = null;
     this.phase = index * 1.37;
+    this.avoidSide = index % 2 === 0 ? 1 : -1;
+    this.smoothDirX = Math.sin(this.yaw);
+    this.smoothDirZ = Math.cos(this.yaw);
+    this.stuckSec = 0;
+    this.initialSanitized = false;
 
     this.group.position.set(this.x, 0, this.z);
+  }
+
+  sanitizeTarget(rawX, rawZ) {
+    let [tx, tz] = clampVillagerToIsland(rawX, rawZ, 2.2);
+    for (let pass = 0; pass < 2; pass++) {
+      for (const pond of this.ponds || []) {
+        const pr = (pond.radius || 6.4) + 1.15;
+        const dx = tx - pond.x;
+        const dz = tz - pond.z;
+        const d = Math.hypot(dx, dz);
+        if (d < pr) {
+          const ang = d > 0.01 ? Math.atan2(dz, dx) : (this.index * 2.399) % (Math.PI * 2);
+          tx = pond.x + Math.cos(ang) * pr;
+          tz = pond.z + Math.sin(ang) * pr;
+        }
+      }
+      for (const obs of this.obstacles || []) {
+        const clearR = obs.r + 0.95;
+        const dx = tx - obs.x;
+        const dz = tz - obs.z;
+        const d = Math.hypot(dx, dz);
+        if (d < clearR) {
+          const ang = d > 0.01 ? Math.atan2(dz, dx) : (this.index * 2.399) % (Math.PI * 2);
+          tx = obs.x + Math.cos(ang) * clearR;
+          tz = obs.z + Math.sin(ang) * clearR;
+        }
+      }
+      [tx, tz] = clampVillagerToIsland(tx, tz, 2.2);
+    }
+    return [tx, tz];
   }
 
   updateFromServer(data) {
@@ -121,6 +190,12 @@ export class VillagerAgent {
     this.ponds = ponds;
     this.allVillagers = allVillagers;
     this.obstacles = obstacles;
+    if (!this.initialSanitized && obstacles.length > 1) {
+      const [sx, sz] = this.sanitizeTarget(this.x, this.z);
+      this.x = sx;
+      this.z = sz;
+      this.initialSanitized = true;
+    }
 
     const stops = this.data.stops && this.data.stops.length >= 2 ? this.data.stops : [[this.x, this.z], [0, -16]];
     let movingSpeed = 0;
@@ -139,9 +214,15 @@ export class VillagerAgent {
           this.group.visible = true;
           this.scale = 0.25;
           // Step off with slight per-villager fan-out so alighting passengers don't stack
-          this.x = bus.doorX + this.queueOffsetX * 0.35;
-          this.z = bus.doorZ + this.queueOffsetZ * 0.35;
+          const [ax, az] = this.sanitizeTarget(
+            bus.doorX + this.queueOffsetX * 0.35,
+            bus.doorZ + this.queueOffsetZ * 0.35,
+          );
+          this.x = ax;
+          this.z = az;
           this.yaw = bus.yaw + Math.PI / 2;
+          this.smoothDirX = Math.sin(this.yaw);
+          this.smoothDirZ = Math.cos(this.yaw);
           this.stopIndex = (this.stopIndex + 1) % stops.length;
           this.state = "ALIGHT_VISIT";
           this.timer = 6.5 + (this.index % 4);
@@ -160,9 +241,9 @@ export class VillagerAgent {
       const target = stops[this.stopIndex % stops.length];
       const tx = target[0] + this.queueOffsetX;
       const tz = target[1] + this.queueOffsetZ;
-      const arrived = this.walkToward(tx, tz, 2.25, dt, false);
-      movingSpeed = arrived ? 0 : 1;
-      if (arrived) {
+      const res = this.walkToward(tx, tz, 2.25, dt, false);
+      movingSpeed = res.arrived ? 0 : res.moveRatio;
+      if (res.arrived) {
         this.state = "WAIT_FOR_BUS";
         this.timer = 0;
       }
@@ -188,9 +269,9 @@ export class VillagerAgent {
         this.state = "WAIT_FOR_BUS";
         this.scale = 1.0;
       } else {
-        const arrivedDoor = this.walkToward(bus.doorX, bus.doorZ, 3.35, dt, true);
-        movingSpeed = 1.2;
-        if (arrivedDoor) {
+        const res = this.walkToward(bus.doorX, bus.doorZ, 3.35, dt, true);
+        movingSpeed = 1.2 * Math.max(0.35, res.moveRatio);
+        if (res.arrived) {
           this.scale = Math.max(0.15, this.scale - dt * 4.5);
           if (this.scale <= 0.2) {
             this.state = "RIDING";
@@ -203,9 +284,9 @@ export class VillagerAgent {
       const visitSpot = stops[this.stopIndex % stops.length];
       const tx = visitSpot[0] + this.queueOffsetX * 1.15;
       const tz = visitSpot[1] + this.queueOffsetZ * 1.15;
-      const arrived = this.walkToward(tx, tz, 2.15, dt, false);
-      movingSpeed = arrived ? 0 : 1;
-      if (arrived) {
+      const res = this.walkToward(tx, tz, 2.15, dt, false);
+      movingSpeed = res.arrived ? 0 : res.moveRatio;
+      if (res.arrived) {
         this.timer -= dt;
         this.rig.headPivot.rotation.y = Math.sin(t * 1.8 + this.phase) * 0.3;
         if (this.timer <= 0) {
@@ -217,9 +298,9 @@ export class VillagerAgent {
       const target = stops[this.stopIndex % stops.length];
       const tx = target[0] + this.queueOffsetX;
       const tz = target[1] + this.queueOffsetZ;
-      const arrived = this.walkToward(tx, tz, 1.9, dt, false);
-      movingSpeed = arrived ? 0 : 0.85;
-      if (arrived) {
+      const res = this.walkToward(tx, tz, 1.9, dt, false);
+      movingSpeed = res.arrived ? 0 : 0.85 * res.moveRatio;
+      if (res.arrived) {
         this.timer -= dt;
         if (this.timer <= 0) {
           this.stopIndex = (this.stopIndex + 1) % stops.length;
@@ -237,13 +318,13 @@ export class VillagerAgent {
     }
 
     // Animate gait (swinging limbs + cheerful walk bounce)
-    const stride = movingSpeed > 0.05 ? Math.sin(t * 8.5 + this.phase) * 0.62 * movingSpeed : 0;
-    const bounce = movingSpeed > 0.05 ? Math.abs(Math.sin(t * 8.5 + this.phase)) * 0.09 : 0;
+    const stride = movingSpeed > 0.08 ? Math.sin(t * 8.5 + this.phase) * 0.62 * movingSpeed : 0;
+    const bounce = movingSpeed > 0.08 ? Math.abs(Math.sin(t * 8.5 + this.phase)) * 0.09 * movingSpeed : 0;
     this.rig.leftLeg.rotation.x = stride;
     this.rig.rightLeg.rotation.x = -stride;
     this.rig.leftArm.rotation.x = -stride * 0.8;
     this.rig.rightArm.rotation.x = stride * 0.8;
-    if (movingSpeed > 0.05) {
+    if (movingSpeed > 0.08) {
       this.rig.headPivot.rotation.y *= 0.85;
     }
 
@@ -252,15 +333,21 @@ export class VillagerAgent {
     this.group.scale.setScalar(this.scale);
   }
 
-  walkToward(tx, tz, speed, dt, isBoarding = false) {
+  walkToward(rawTx, rawTz, speed, dt, isBoarding = false) {
+    const [tx, tz] = isBoarding ? [rawTx, rawTz] : this.sanitizeTarget(rawTx, rawTz);
     const dx = tx - this.x;
     const dz = tz - this.z;
     const dist = Math.hypot(dx, dz);
-    const arriveTol = isBoarding ? 0.45 : 0.55;
-    if (dist < arriveTol) return true;
+    const arriveTol = isBoarding ? 0.45 : 0.65;
+    if (dist < arriveTol) {
+      this.stuckSec = 0;
+      return { arrived: true, moveRatio: 0 };
+    }
 
-    let steerX = dx / dist;
-    let steerZ = dz / dist;
+    const goalUx = dx / dist;
+    const goalUz = dz / dist;
+    let steerX = goalUx;
+    let steerZ = goalUz;
 
     // Social-force personal-space repulsion + right-hand passing rule
     if (!isBoarding && this.allVillagers) {
@@ -273,32 +360,34 @@ export class VillagerAgent {
           const ux = vx / d;
           const uz = vz / d;
           const prox = (3.2 - d) / 3.2;
-          // Push away + curve to right shoulder so oncoming villagers glide past each other
-          const repel = prox * prox * 1.65;
-          const rightPass = prox * 0.95;
+          const repel = prox * prox * 1.45;
+          const rightPass = prox * 0.85;
           steerX += ux * repel - uz * rightPass;
           steerZ += uz * repel + ux * rightPass;
         }
       }
     }
 
-    // Smoothly skirt around stationary buildings & town signboard
+    // Smoothly skirt around stationary buildings & town signboard with hysteresis (no 60Hz sign-flipping!)
     if (!isBoarding && this.obstacles) {
       for (const obs of this.obstacles) {
         const vx = this.x - obs.x;
         const vz = this.z - obs.z;
         const d = Math.hypot(vx, vz);
-        const avoidR = obs.r + 1.2;
+        const avoidR = obs.r + 1.55;
         if (d < avoidR && d > 0.001) {
           const ux = vx / d;
           const uz = vz / d;
           const prox = (avoidR - d) / avoidR;
-          // Pick tangent direction aligned with goal
-          const t1x = -uz, t1z = ux;
-          const dot = t1x * (dx / dist) + t1z * (dz / dist);
-          const sign = dot >= 0 ? 1 : -1;
-          steerX += ux * prox * 1.5 + t1x * sign * prox * 1.1;
-          steerZ += uz * prox * 1.5 + t1z * sign * prox * 1.1;
+          const t1x = -uz;
+          const t1z = ux;
+          const dot = t1x * goalUx + t1z * goalUz;
+          if (Math.abs(dot) > 0.38 && d > obs.r + 0.35) {
+            this.avoidSide = dot >= 0 ? 1 : -1;
+          }
+          const sign = Math.abs(dot) > 0.55 ? (dot >= 0 ? 1 : -1) : this.avoidSide;
+          steerX += ux * prox * 1.25 + t1x * sign * prox * 1.65;
+          steerZ += uz * prox * 1.25 + t1z * sign * prox * 1.65;
         }
       }
     }
@@ -307,21 +396,62 @@ export class VillagerAgent {
     steerX /= sLen;
     steerZ /= sLen;
 
+    const prevX = this.x;
+    const prevZ = this.z;
     const stepLen = Math.min(dist, speed * dt);
     this.x += steerX * stepLen;
     this.z += steerZ * stepLen;
 
     this.resolveCollisions(dt, isBoarding);
 
-    const targetYaw = Math.atan2(steerX, steerZ);
-    let diff = targetYaw - this.yaw;
-    while (diff > Math.PI) diff -= Math.PI * 2;
-    while (diff < -Math.PI) diff += Math.PI * 2;
-    this.yaw += diff * Math.min(1, dt * 8.5);
-    return Math.hypot(tx - this.x, tz - this.z) <= arriveTol;
+    const actualDx = this.x - prevX;
+    const actualDz = this.z - prevZ;
+    const actualMove = Math.hypot(actualDx, actualDz);
+    const fwdProgress = actualDx * steerX + actualDz * steerZ;
+    const moveRatio =
+      stepLen > 1e-4 ? Math.max(0, Math.min(1, Math.max(0, fwdProgress > -0.002 ? actualMove : 0) / stepLen)) : 0;
+
+    // Smooth facing direction without ever snapping to single-frame collision pushback
+    const blend = Math.min(1, dt * 7.5);
+    this.smoothDirX += (steerX - this.smoothDirX) * blend;
+    this.smoothDirZ += (steerZ - this.smoothDirZ) * blend;
+    const smLen = Math.hypot(this.smoothDirX, this.smoothDirZ) || 1;
+    this.smoothDirX /= smLen;
+    this.smoothDirZ /= smLen;
+
+    if (moveRatio > 0.12) {
+      const targetYaw = Math.atan2(this.smoothDirX, this.smoothDirZ);
+      let diff = targetYaw - this.yaw;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      const maxTurn = dt * 5.2;
+      this.yaw += Math.max(-maxTurn, Math.min(maxTurn, diff * Math.min(1, dt * 6.5)));
+    }
+
+    if (!isBoarding) {
+      if (moveRatio < 0.28) {
+        this.stuckSec += dt;
+        if (this.stuckSec >= 0.65) {
+          this.stuckSec = 0;
+          this.avoidSide *= -1;
+          return { arrived: true, moveRatio: 0 };
+        }
+      } else {
+        this.stuckSec = Math.max(0, this.stuckSec - dt * 1.5);
+      }
+    }
+
+    const reached = Math.hypot(tx - this.x, tz - this.z) <= arriveTol;
+    if (reached) this.stuckSec = 0;
+    return { arrived: reached, moveRatio };
   }
 
   resolveCollisions(dt, isBoarding = false) {
+    // Keep on the island plateau
+    const [ix, iz] = clampVillagerToIsland(this.x, this.z, 1.8);
+    this.x = ix;
+    this.z = iz;
+
     // Keep dry outside ponds
     for (const pond of this.ponds || []) {
       const pr = (pond.radius || 6.4) + 0.9;

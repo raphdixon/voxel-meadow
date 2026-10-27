@@ -804,6 +804,7 @@ export function buildCreationGroup(blueprint, options = {}) {
   const { seed = 11, ghost = false, useWorldScale = true } = options;
   const group = new THREE.Group();
   const animators = [];
+  const partPivots = {};
   const pal = blueprint?.palette || {};
 
   const scaleFactor = useWorldScale ? (SCALE_FACTORS[blueprint?.scaleClass] || SCALE_FACTORS.medium) : 1.0;
@@ -825,6 +826,8 @@ export function buildCreationGroup(blueprint, options = {}) {
     if (!pv.size) continue;
 
     const pivot = new THREE.Group();
+    const partName = part.name || `part-${i}`;
+    pivot.name = partName;
     const [px, py, pz] = part.pivot || [0, 0, 0];
     pivot.position.set(px * voxScale, py * voxScale, pz * voxScale);
     const pMesh = buildVoxelMesh(pv, {
@@ -836,6 +839,18 @@ export function buildCreationGroup(blueprint, options = {}) {
     pMesh.scale.setScalar(0.9985);
     pivot.add(pMesh);
     group.add(pivot);
+
+    partPivots[partName] = {
+      pivot,
+      px,
+      py,
+      pz,
+      baseX: px * voxScale,
+      baseY: py * voxScale,
+      baseZ: pz * voxScale,
+      voxScale,
+      part,
+    };
 
     maxTopY = Math.max(maxTopY, (py + pv.bounds().maxY) * voxScale);
 
@@ -873,6 +888,7 @@ export function buildCreationGroup(blueprint, options = {}) {
   group.userData.voxScale = voxScale;
   group.userData.baseVox = baseVox;
   group.userData.baseBounds = baseVox.bounds();
+  group.userData.partPivots = partPivots;
   group.userData.animate = (t, motion = null) => {
     for (const fn of animators) fn(t, motion);
   };
@@ -882,4 +898,97 @@ export function buildCreationGroup(blueprint, options = {}) {
     });
   };
   return group;
+}
+
+/**
+ * Splits a dual-vehicle blueprint (where two side-by-side vehicles were sculpted across X=0.5,
+ * such as the Waratah Train + Melbourne Tram) into two centered, independently animated THREE.Groups.
+ */
+export function buildSplitDualVehicleGroups(blueprint, options = {}) {
+  const { seed = 11, ghost = false, useWorldScale = true, splitX = 0.5 } = options;
+  const pal = blueprint?.palette || {};
+  const scaleFactor = useWorldScale ? (SCALE_FACTORS[blueprint?.scaleClass] || SCALE_FACTORS.medium) : 1.0;
+  const voxScale = VOXEL_UNIT * scaleFactor;
+
+  const fullVox = new Vox(seed);
+  applyOps(fullVox, blueprint?.ops || [], pal);
+
+  const buildSideGroup = (isRightSide, seedOffset) => {
+    const sideVox = new Vox(seed + seedOffset);
+    let minX = Infinity;
+    let maxX = -Infinity;
+    for (const [k, cell] of fullVox.v.entries()) {
+      const belongs = isRightSide ? cell.x >= splitX : cell.x < splitX;
+      if (!belongs) continue;
+      sideVox.v.set(k, { ...cell });
+      if (cell.x < minX) minX = cell.x;
+      if (cell.x + 1 > maxX) maxX = cell.x + 1;
+    }
+    if (!sideVox.size) return null;
+
+    const sideParts = (blueprint?.parts || []).filter((p) => {
+      const px = p.pivot?.[0] ?? 0;
+      return isRightSide ? px >= splitX : px < splitX;
+    });
+    const centerX = sideParts.length
+      ? sideParts.reduce((acc, p) => acc + (p.pivot?.[0] ?? 0), 0) / sideParts.length
+      : (minX + maxX) * 0.5;
+
+    const outer = new THREE.Group();
+    const inner = new THREE.Group();
+    inner.position.x = -centerX * voxScale;
+    outer.add(inner);
+
+    const animators = [];
+    const baseMesh = buildVoxelMesh(sideVox, { scale: voxScale, ghost });
+    inner.add(baseMesh);
+
+    let maxTopY = sideVox.bounds().maxY * voxScale;
+    for (let i = 0; i < sideParts.length; i++) {
+      const part = sideParts[i];
+      const pv = new Vox(seed + seedOffset + 19 + i * 7);
+      applyOps(pv, part.ops || [], pal);
+      if (!pv.size) continue;
+
+      const pivot = new THREE.Group();
+      const [px, py, pz] = part.pivot || [0, 0, 0];
+      pivot.position.set(px * voxScale, py * voxScale, pz * voxScale);
+      const pMesh = buildVoxelMesh(pv, {
+        scale: voxScale,
+        ghost,
+        depthLayer: (i % 6) + 1,
+      });
+      pMesh.scale.setScalar(0.9985);
+      pivot.add(pMesh);
+      inner.add(pivot);
+      maxTopY = Math.max(maxTopY, (py + pv.bounds().maxY) * voxScale);
+
+      const speed = Number(part.speed) || 1.2;
+      const kind = part.kind || "wheel";
+      animators.push((t, motion = null) => {
+        if (kind === "wheel") {
+          const angle =
+            motion && typeof motion.wheelAngle === "number" ? motion.wheelAngle * speed : t * 2.4 * speed;
+          pivot.rotation.x = angle;
+        }
+      });
+    }
+
+    outer.userData.topY = Math.max(1.0, maxTopY);
+    outer.userData.voxScale = voxScale;
+    outer.userData.animate = (t, motion = null) => {
+      for (const fn of animators) fn(t, motion);
+    };
+    outer.userData.dispose = () => {
+      outer.traverse((obj) => {
+        if (obj.isMesh && obj.geometry) obj.geometry.dispose();
+      });
+    };
+    return outer;
+  };
+
+  const leftGroup = buildSideGroup(false, 0);
+  const rightGroup = buildSideGroup(true, 101);
+  if (!leftGroup || !rightGroup) return null;
+  return { leftGroup, rightGroup };
 }

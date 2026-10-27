@@ -301,6 +301,7 @@ export interface WorldStateSnapshot {
   terrainZones: WorldTerrainZone[];
   villagers: WorldVillager[];
   contributorCount: number;
+  contributionCount?: number;
   myCreationId: string | null;
   myActiveJob?: BuildQueueJobInfo | null;
   lastWeaveNote: string;

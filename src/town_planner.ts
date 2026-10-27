@@ -11,6 +11,52 @@ import type {
 import { distPointToPolyline2D, sampleCatmullRom2D } from "./voxel_audit";
 import { detectBlueprintFrontAngle, getCreationFootprintRadius } from "./voxel_dsl";
 
+export const ISLAND_HALF_EXTENT = 155.0;
+export const ISLAND_SUPERELLIPSE_EXP = 4.2;
+
+export function getIslandCoastWarp(theta: number): number {
+  return (
+    4.8 * Math.cos(2 * theta - 0.55) +
+    3.4 * Math.sin(3 * theta + 0.85) +
+    2.5 * Math.cos(5 * theta - 1.15) +
+    1.6 * Math.sin(7 * theta + 0.35)
+  );
+}
+
+/**
+ * Signed distance (in meters) inward from the flat buildable GeminIsland plateau rim.
+ * `> 0` is on the flat buildable island plateau; `0` is the coastal bluff/beach crest;
+ * `< 0` slopes down through sandy beach / rocky cliffs into the ocean.
+ */
+export function getIslandInlandMargin(x: number, z: number): number {
+  const ax = Math.abs(x) / ISLAND_HALF_EXTENT;
+  const az = Math.abs(z) / ISLAND_HALF_EXTENT;
+  const superDist =
+    Math.pow(
+      Math.pow(ax, ISLAND_SUPERELLIPSE_EXP) + Math.pow(az, ISLAND_SUPERELLIPSE_EXP),
+      1 / ISLAND_SUPERELLIPSE_EXP,
+    ) * ISLAND_HALF_EXTENT;
+  const theta = Math.atan2(z, x);
+  return ISLAND_HALF_EXTENT + getIslandCoastWarp(theta) - superDist;
+}
+
+export function clampPointToIsland(x: number, z: number, minInlandMargin = 3.0): [number, number] {
+  if (getIslandInlandMargin(x, z) >= minInlandMargin) return [x, z];
+  const r = Math.hypot(x, z);
+  if (r < 0.001) return [0, 0];
+  let lo = 0;
+  let hi = 1;
+  for (let i = 0; i < 12; i++) {
+    const mid = (lo + hi) * 0.5;
+    if (getIslandInlandMargin(x * mid, z * mid) >= minInlandMargin) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return [x * lo, z * lo];
+}
+
 export type TownPlanningRole =
   | "mobile"
   | "natural_scenic"
@@ -176,8 +222,7 @@ export function chooseSimCityPlot(opts: {
     typeof reqZ === "number" &&
     Number.isFinite(reqZ)
   ) {
-    const cx = Math.max(-138, Math.min(138, reqX));
-    const cz = Math.max(-138, Math.min(138, reqZ));
+    const [cx, cz] = clampPointToIsland(reqX, reqZ, newRadius + 2.8);
     if (isSpotClear(cx, cz)) {
       return [Number(cx.toFixed(1)), Number(cz.toFixed(1))];
     }
@@ -1181,15 +1226,16 @@ export function decongestWorldTraffic(
     }
   }
 
-  // Step 3: Stagger speeds slightly among vehicles sharing any corridor so they don't platoon
+  // Step 3: Stagger speeds clearly among vehicles sharing any corridor so they never pace side-by-side
   const postReport = analyzeWorldTrafficCongestion(creations, paths);
+  const corridorSpeedSlots = [6.4, 4.65, 5.55];
   for (const corr of postReport.corridors) {
     if (corr.vehicleIds.length < 2) continue;
     corr.vehicleIds.forEach((vid, slotIdx) => {
       const vc = creations.find((x) => x.id === vid);
       if (!vc || vc.behavior?.type !== "vehicle_route" || vc.isSeed) return;
-      const desiredSpeed = Number((5.5 + (slotIdx % 3) * 0.55).toFixed(2));
-      if (Math.abs((vc.behavior.speed || 5.8) - desiredSpeed) > 0.35) {
+      const desiredSpeed = corridorSpeedSlots[slotIdx % corridorSpeedSlots.length];
+      if (Math.abs((vc.behavior.speed || 5.8) - desiredSpeed) > 0.25) {
         vc.behavior = { ...vc.behavior, speed: desiredSpeed };
         changedIds.add(vc.id);
       }

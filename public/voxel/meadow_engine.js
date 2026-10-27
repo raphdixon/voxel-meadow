@@ -20,6 +20,7 @@ import { INTERACTIVE_HIT_LAYER, createInteractiveController } from "./interactiv
 import {
   Vox,
   buildCreationGroup,
+  buildSplitDualVehicleGroups,
   buildVoxelMesh,
   getCreationFootprintRadius,
   getWorldVoxelSize,
@@ -28,6 +29,74 @@ import {
 const CITY_SIGN_POS = [3.8, -10.8];
 const CITY_SIGN_YAW = 0.62;
 const MAX_SHADER_ZONES = 28;
+
+export const ISLAND_HALF_EXTENT = 155.0;
+export const ISLAND_SUPERELLIPSE_EXP = 4.2;
+
+export function getIslandCoastWarp(theta) {
+  return (
+    4.8 * Math.cos(2 * theta - 0.55) +
+    3.4 * Math.sin(3 * theta + 0.85) +
+    2.5 * Math.cos(5 * theta - 1.15) +
+    1.6 * Math.sin(7 * theta + 0.35)
+  );
+}
+
+export function getIslandCliffFactor(theta) {
+  return Math.max(
+    0,
+    Math.min(1, 0.48 + 0.58 * Math.sin(3 * theta - 0.4) + 0.34 * Math.cos(5 * theta + 1.1)),
+  );
+}
+
+/**
+ * Signed distance (in meters) inward from the flat buildable GeminIsland plateau rim.
+ * `> 0` is on the flat buildable island plateau (`y = 0`); `0` is the coastal crest;
+ * `< 0` slopes down through sandy beaches & terraced coastal cliffs into the ocean.
+ */
+export function getIslandInlandMargin(x, z) {
+  const ax = Math.abs(x) / ISLAND_HALF_EXTENT;
+  const az = Math.abs(z) / ISLAND_HALF_EXTENT;
+  const superDist =
+    Math.pow(
+      Math.pow(ax, ISLAND_SUPERELLIPSE_EXP) + Math.pow(az, ISLAND_SUPERELLIPSE_EXP),
+      1 / ISLAND_SUPERELLIPSE_EXP,
+    ) * ISLAND_HALF_EXTENT;
+  const theta = Math.atan2(z, x);
+  return ISLAND_HALF_EXTENT + getIslandCoastWarp(theta) - superDist;
+}
+
+export function clampPointToIsland(x, z, minInlandMargin = 3.0) {
+  if (getIslandInlandMargin(x, z) >= minInlandMargin) return [x, z];
+  const r = Math.hypot(x, z);
+  if (r < 0.001) return [0, 0];
+  let lo = 0;
+  let hi = 1;
+  for (let i = 0; i < 12; i++) {
+    const mid = (lo + hi) * 0.5;
+    if (getIslandInlandMargin(x * mid, z * mid) >= minInlandMargin) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return [x * lo, z * lo];
+}
+
+export function getIslandGroundHeight(x, z) {
+  const m = getIslandInlandMargin(x, z);
+  if (m >= 0) return 0;
+  const theta = Math.atan2(z, x);
+  const cliff = getIslandCliffFactor(theta);
+  const out = -m; // meters beyond plateau crest
+  // Gentle sandy beach slope (waterline y = -0.56 sits around out ~ 6.2m)
+  const tBeach = Math.min(1, out / 22.0);
+  const beachY = -2.95 * Math.pow(tBeach, 1.12);
+  // Voxel-terraced coastal cliff drop-off on headlands
+  const rawCliff = -3.2 * Math.pow(Math.min(1, out / 13.5), 0.82);
+  const terracedCliff = Math.round(rawCliff / 0.42) * 0.42;
+  return beachY * (1 - cliff * 0.72) + terracedCliff * (cliff * 0.72);
+}
 
 const BIOME_IDS = {
   meadow_clover: 1,
@@ -92,10 +161,10 @@ function makeMeadowSkyTexture() {
   c.height = 256;
   const g = c.getContext("2d");
   const grad = g.createLinearGradient(0, 0, 0, 256);
-  grad.addColorStop(0.0, "#9ccaf0");
-  grad.addColorStop(0.54, "#c9e4f6");
-  grad.addColorStop(0.86, "#dfeed8");
-  grad.addColorStop(1.0, "#cbe4be");
+  grad.addColorStop(0.0, "#88bef0");
+  grad.addColorStop(0.52, "#bfe1f7");
+  grad.addColorStop(0.84, "#d8eefb");
+  grad.addColorStop(1.0, "#bce0f5");
   g.fillStyle = grad;
   g.fillRect(0, 0, 4, 256);
   const tex = new THREE.CanvasTexture(c);
@@ -149,8 +218,8 @@ function buildFirstPersonSkyDome(uTimeUniform) {
         vec3 dir = normalize(vLocalDir);
         float h = clamp(dir.y, 0.0, 1.0);
 
-        vec3 cHorizonMist = srgb2lin(203.0, 228.0, 190.0);
-        vec3 cLowHaze     = srgb2lin(223.0, 238.0, 216.0);
+        vec3 cHorizonMist = srgb2lin(188.0, 224.0, 245.0);
+        vec3 cLowHaze     = srgb2lin(216.0, 238.0, 251.0);
         vec3 cPaleSky     = srgb2lin(192.0, 225.0, 246.0);
         vec3 cMidSky      = srgb2lin(134.0, 192.0, 240.0);
         vec3 cZenith      = srgb2lin(96.0, 162.0, 228.0);
@@ -298,8 +367,8 @@ function createContributorSignboard(maxAniso = 4) {
     ctx.fillText(String(n), 256, 148);
 
     ctx.fillStyle = "#267043";
-    ctx.font = "800 32px -apple-system, BlinkMacSystemFont, 'Inter', sans-serif";
-    ctx.fillText(n === 1 ? "CONTRIBUTOR" : "CONTRIBUTORS", 256, 220);
+    ctx.font = "800 29px -apple-system, BlinkMacSystemFont, 'Inter', sans-serif";
+    ctx.fillText(n === 1 ? "CONTRIBUTION" : "CONTRIBUTIONS", 256, 220);
 
     tex.needsUpdate = true;
   }
@@ -439,6 +508,27 @@ function drawFeedBadgeCanvas(canvas, reading) {
   ctx.fillText(String(reading.badge || "").slice(0, 20), 74, h / 2 + 2);
 }
 
+const ISLAND_GLSL_HELPERS = `
+  float islandCoastWarp(float theta) {
+    return 4.8 * cos(2.0 * theta - 0.55)
+         + 3.4 * sin(3.0 * theta + 0.85)
+         + 2.5 * cos(5.0 * theta - 1.15)
+         + 1.6 * sin(7.0 * theta + 0.35);
+  }
+  float islandCliffFactor(float theta) {
+    return clamp(0.48 + 0.58 * sin(3.0 * theta - 0.4) + 0.34 * cos(5.0 * theta + 1.1), 0.0, 1.0);
+  }
+  float islandInlandMargin(vec2 wp) {
+    const float H = 155.0;
+    const float P = 4.2;
+    float ax = max(1e-5, abs(wp.x) / H);
+    float az = max(1e-5, abs(wp.y) / H);
+    float superDist = pow(pow(ax, P) + pow(az, P), 1.0 / P) * H;
+    float theta = length(wp) > 1e-4 ? atan(wp.y, wp.x) : 0.0;
+    return H + islandCoastWarp(theta) - superDist;
+  }
+`;
+
 function buildEndlessGrassMaterial(uniforms) {
   const mat = new THREE.MeshStandardMaterial({
     color: "#ffffff",
@@ -494,7 +584,8 @@ function buildEndlessGrassMaterial(uniforms) {
             mix(mHash(i + vec2(0.0, 1.0)), mHash(i + vec2(1.0, 1.0)), u.x),
             u.y
           );
-        }`,
+        }
+        ${ISLAND_GLSL_HELPERS}`,
       )
       .replace(
         "#include <color_fragment>",
@@ -525,7 +616,7 @@ function buildEndlessGrassMaterial(uniforms) {
         grassCol = mix(grassCol, turfMid, smoothstep(0.42, 0.85, subZone) * 0.72);
         grassCol = mix(grassCol, turfSun, smoothstep(0.68, 0.96, meadowZone * 0.6 + subZone * 0.4) * 0.45);
 
-        // Organic voxel-stepped ground biome zones (stepped per voxel cell so borders look crisp & blocky!)
+        // Organic voxel-stepped ground biome zones
         float borderWarp = (mNoise(cellCenter * 0.15) - 0.5) * 4.2 + (mNoise(cellCenter * 0.37 + 11.3) - 0.5) * 1.8;
         float volcanicGlowMask = 0.0;
 
@@ -538,21 +629,17 @@ function buildEndlessGrassMaterial(uniforms) {
             int bId = int(zn.w + 0.5);
             vec3 bCol = grassCol;
             if (bId == 1) {
-              // 1: meadow_clover — lush emerald clover + wildflower pixels
               bCol = mix(srgb2lin(86.0, 168.0, 68.0), srgb2lin(118.0, 196.0, 82.0), subZone);
               if (cellH2 > 0.91) {
                 bCol = cellH > 0.5 ? srgb2lin(249.0, 214.0, 92.0) : srgb2lin(242.0, 148.0, 184.0);
               }
             } else if (bId == 2) {
-              // 2: sandy_shore — sunlit coastal golden sand & shell flecks
               bCol = mix(srgb2lin(224.0, 194.0, 134.0), srgb2lin(242.0, 221.0, 168.0), subZone);
               if (cellH2 > 0.93) bCol = srgb2lin(250.0, 243.0, 224.0);
             } else if (bId == 3) {
-              // 3: misty_moss — deep damp forest moss, fern turf & river stones
               bCol = mix(srgb2lin(68.0, 126.0, 69.0), srgb2lin(92.0, 152.0, 82.0), subZone);
               if (cellH2 > 0.86) bCol = srgb2lin(116.0, 125.0, 122.0);
             } else if (bId == 4) {
-              // 4: volcanic_basalt — scorched obsidian rock, ash & glowing magma fissures
               bCol = mix(srgb2lin(42.0, 44.0, 52.0), srgb2lin(66.0, 64.0, 72.0), subZone);
               float crackField = abs(mNoise(cellCenter * 0.28 + vec2(4.2, -8.1)) - 0.5);
               if (crackField < 0.055 && d < zn.z * 0.85) {
@@ -561,23 +648,47 @@ function buildEndlessGrassMaterial(uniforms) {
                 volcanicGlowMask = max(volcanicGlowMask, w * pulse);
               }
             } else if (bId == 5) {
-              // 5: snow_frost — crisp alpine snow & pale glacier blue
               bCol = mix(srgb2lin(222.0, 236.0, 248.0), srgb2lin(247.0, 251.0, 255.0), subZone);
             } else if (bId == 6) {
-              // 6: stone_plaza — warm sandstone & limestone courtyard pavers
               float checker = mod(cell.x + cell.y, 2.0);
               bCol = mix(srgb2lin(202.0, 190.0, 168.0), srgb2lin(224.0, 214.0, 194.0), checker * 0.65 + subZone * 0.35);
             } else if (bId == 7) {
-              // 7: autumn_grove — golden-amber & russet fallen leaf carpet
               bCol = mix(srgb2lin(182.0, 124.0, 56.0), srgb2lin(218.0, 158.0, 68.0), subZone);
               if (cellH2 > 0.82) bCol = srgb2lin(174.0, 78.0, 52.0);
               else if (cellH2 < 0.22) bCol = srgb2lin(116.0, 162.0, 72.0);
             } else if (bId == 8) {
-              // 8: desert_mesa — red-ochre canyon earth & terracotta sand
               bCol = mix(srgb2lin(198.0, 114.0, 68.0), srgb2lin(224.0, 152.0, 96.0), subZone);
             }
             grassCol = mix(grassCol, bCol, w);
           }
+        }
+
+        // Island Coastline Rim: voxel-stepped transition from meadow turf -> dune grass -> golden beach sand & rocky limestone bluffs
+        float coastTheta = length(cellCenter) > 1e-4 ? atan(cellCenter.y, cellCenter.x) : 0.0;
+        float cliffAmt = islandCliffFactor(coastTheta);
+        float coastM = islandInlandMargin(cellCenter) + borderWarp * 0.38;
+
+        // Warm coastal dune grass right at the buildable island edge (margin 1.2m..5.6m)
+        float duneBlend = 1.0 - smoothstep(1.2, 5.6, coastM);
+        vec3 duneGrass = mix(srgb2lin(154.0, 196.0, 92.0), srgb2lin(192.0, 206.0, 116.0), subZone);
+        grassCol = mix(grassCol, duneGrass, duneBlend * 0.72);
+
+        // Beyond the buildable crest (margin <= 1.8m): golden sandy beaches & layered coastal limestone cliffs
+        float shoreBlend = 1.0 - smoothstep(-1.2, 1.8, coastM);
+        if (shoreBlend > 0.005) {
+          vec3 drySand = mix(srgb2lin(234.0, 206.0, 146.0), srgb2lin(249.0, 232.0, 184.0), subZone);
+          if (cellH2 > 0.92) drySand = srgb2lin(253.0, 247.0, 230.0);
+          float wetBand = smoothstep(-0.26, -0.68, vWorldPos.y);
+          vec3 wetSand = mix(srgb2lin(182.0, 150.0, 98.0), srgb2lin(146.0, 122.0, 82.0), cellH * 0.5);
+          vec3 beachCol = mix(drySand, wetSand, wetBand);
+
+          float strata = fract(vWorldPos.y * -1.8 + cellH * 0.25);
+          vec3 cliffRock = mix(srgb2lin(168.0, 160.0, 144.0), srgb2lin(132.0, 126.0, 116.0), smoothstep(0.25, 0.85, strata));
+          cliffRock = mix(cliffRock, srgb2lin(112.0, 108.0, 102.0), wetBand * 0.55);
+
+          float rockMask = smoothstep(0.46, 0.78, cliffAmt + (subZone - 0.5) * 0.22);
+          vec3 coastCol = mix(beachCol, cliffRock, rockMask);
+          grassCol = mix(grassCol, coastCol, shoreBlend);
         }
 
         float blockTone = (floor(cellH * 4.0) / 3.0 - 0.5) * 0.075 + (lawnCheck - 0.5) * 0.028;
@@ -596,10 +707,6 @@ function buildEndlessGrassMaterial(uniforms) {
         float cloud = mNoise(cloudUv) * 0.65 + mNoise(cloudUv * 2.0 + 3.7) * 0.35;
         grassCol *= mix(0.92, 1.05, smoothstep(0.32, 0.70, cloud));
 
-        float distFocus = length(wp - uFocusXZ);
-        vec3 horizonMist = srgb2lin(164.0, 212.0, 142.0);
-        grassCol = mix(grassCol, horizonMist, smoothstep(115.0, 265.0, distFocus) * 0.55);
-
         diffuseColor.rgb = grassCol;`,
       )
       .replace(
@@ -608,16 +715,143 @@ function buildEndlessGrassMaterial(uniforms) {
         if (volcanicGlowMask > 0.01) {
           totalEmissiveRadiance += srgb2lin(255.0, 102.0, 28.0) * (volcanicGlowMask * 0.85);
         }`,
-      )
-      .replace(
-        "#include <opaque_fragment>",
-        `#include <opaque_fragment>
-        float horizonSkyBlend = smoothstep(uHorizonRange.x, uHorizonRange.y, length(vWorldPos.xz - uFocusXZ));
-        gl_FragColor.rgb = mix(gl_FragColor.rgb, srgb2lin(203.0, 228.0, 190.0), horizonSkyBlend);`,
       );
   };
-  mat.customProgramCacheKey = () => "geminisland-voxel-biomes-v6";
+  mat.customProgramCacheKey = () => "geminisland-island-biomes-v8";
   return mat;
+}
+
+function buildIslandTerrainGeometry() {
+  const size = 376;
+  const segs = 248;
+  const geo = new THREE.PlaneGeometry(size, size, segs, segs);
+  geo.rotateX(-Math.PI / 2);
+  const pos = geo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i);
+    const z = pos.getZ(i);
+    const y = getIslandGroundHeight(x, z);
+    pos.setY(i, y);
+  }
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
+  geo.computeBoundingSphere();
+  return geo;
+}
+
+function buildIslandOceanMaterial(uniforms) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: uniforms.uTime,
+      uFocusXZ: uniforms.uFocusXZ,
+      uSunDir: { value: new THREE.Vector3(64, 118, 76).normalize() },
+    },
+    toneMapped: true,
+    vertexShader: `
+      varying vec3 vWorldPos;
+      void main() {
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vWorldPos = wp.xyz;
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }
+    `,
+    fragmentShader: `
+      uniform float uTime;
+      uniform vec2 uFocusXZ;
+      uniform vec3 uSunDir;
+      varying vec3 vWorldPos;
+
+      vec3 srgb2lin(float r, float g, float b) {
+        return pow(vec3(r, g, b) / 255.0, vec3(2.2));
+      }
+      float oHash(vec2 p) {
+        vec2 q = fract(p * vec2(127.1, 311.7));
+        q += dot(q, q + 34.23);
+        return fract(q.x * q.y);
+      }
+      float oNoise(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        vec2 u = f * f * (3.0 - 2.0 * f);
+        return mix(
+          mix(oHash(i), oHash(i + vec2(1.0, 0.0)), u.x),
+          mix(oHash(i + vec2(0.0, 1.0)), oHash(i + vec2(1.0, 1.0)), u.x),
+          u.y
+        );
+      }
+      ${ISLAND_GLSL_HELPERS}
+
+      void main() {
+        vec2 wp = vWorldPos.xz;
+        float rawMargin = islandInlandMargin(wp);
+        // Cull ocean strictly under the dry interior plateau to save GPU fillrate
+        if (rawMargin > 4.0) discard;
+
+        // Voxel-quantized ocean cell for charming blocky surf & caustic shimmer
+        const float WTILE = 0.95;
+        vec2 wCell = floor(wp / WTILE);
+        vec2 wCenter = (wCell + 0.5) * WTILE;
+        float cellRand = oHash(wCell);
+
+        float coastM = islandInlandMargin(wCenter) + (oNoise(wCenter * 0.14) - 0.5) * 1.4;
+        // Waterline occurs around coastM = -5.6m (where terrain reaches y = -0.56)
+        float offshore = max(0.0, -coastM - 5.2);
+
+        // Shallow turquoise lagoon -> sunlit aquamarine shelf -> deep cobalt sea
+        vec3 cShallow = srgb2lin(66.0, 208.0, 212.0);
+        vec3 cLagoon  = srgb2lin(38.0, 166.0, 204.0);
+        vec3 cShelf   = srgb2lin(26.0, 122.0, 184.0);
+        vec3 cDeep    = srgb2lin(19.0, 86.0, 152.0);
+
+        vec3 waterCol = mix(cShallow, cLagoon, smoothstep(0.0, 9.5, offshore));
+        waterCol = mix(waterCol, cShelf, smoothstep(8.0, 28.0, offshore));
+        waterCol = mix(waterCol, cDeep, smoothstep(26.0, 82.0, offshore));
+
+        // Blocky voxel water swell & shallow reef caustics
+        float swell1 = oNoise(wCenter * 0.075 + vec2(uTime * 0.22, -uTime * 0.16));
+        float swell2 = oNoise(wCenter * 0.16 + vec2(-uTime * 0.18, uTime * 0.24));
+        float caustic = smoothstep(0.56, 0.84, swell1 * 0.55 + swell2 * 0.45);
+        float shallowMask = 1.0 - smoothstep(2.0, 22.0, offshore);
+        waterCol += srgb2lin(125.0, 240.0, 245.0) * (caustic * shallowMask * 0.18);
+        waterCol *= 0.94 + 0.12 * smoothstep(0.25, 0.78, swell1);
+
+        // Animated lapping shoreline surf & voxel seafoam bands
+        float wavePhase1 = offshore * 0.72 - uTime * 2.15 + swell1 * 2.2;
+        float waveBand1 = smoothstep(0.72, 0.96, sin(wavePhase1)) * (1.0 - smoothstep(1.5, 13.5, offshore));
+        float shoreLip = 1.0 - smoothstep(0.0, 1.85, offshore);
+        float foam = clamp(max(shoreLip * (0.78 + 0.22 * sin(uTime * 2.8 + cellRand * 6.2)), waveBand1 * 0.88), 0.0, 1.0);
+        waterCol = mix(waterCol, srgb2lin(246.0, 252.0, 255.0), foam);
+
+        // Sunlit golden-hour ocean sparkles
+        float glintNoise = oNoise(wp * 0.42 + vec2(uTime * 0.65, -uTime * 0.48));
+        float glint = smoothstep(0.86, 0.97, glintNoise * 0.7 + cellRand * 0.3) * (1.0 - shoreLip * 0.7);
+        waterCol += srgb2lin(255.0, 246.0, 214.0) * (glint * 0.34);
+
+        // Seamless atmospheric blend into coastal horizon sky mist
+        float distFocus = length(wp - uFocusXZ);
+        float horizonMix = smoothstep(240.0, 680.0, distFocus);
+        vec3 seaHorizon = srgb2lin(188.0, 224.0, 245.0);
+        waterCol = mix(waterCol, seaHorizon, horizonMix);
+
+        gl_FragColor = vec4(waterCol, 1.0);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+  });
+}
+
+function buildCoastalRockMesh(variant = 0) {
+  const v = new Vox(940 + variant * 29);
+  const cMain = variant % 2 === 0 ? "stone" : "limestone";
+  const cDark = "concrete2";
+  v.sphere(0, 1.4, 0, 3.4, 2.2, 2.9, cMain);
+  v.sphere(2.4, 0.9, 1.3, 2.3, 1.6, 2.1, cDark);
+  if (variant % 3 === 0) {
+    v.sphere(-2.1, 1.0, -1.1, 2.0, 1.5, 1.9, "moss");
+  }
+  v.clear(-7, -4, -7, 7, -1, 7);
+  return buildVoxelMesh(v, { scale: 0.32 });
 }
 
 function buildRibbonMesh(
@@ -815,17 +1049,75 @@ function computeBlueprintSignature(bp) {
   return `${bp.category || ""}:${bp.scaleClass || ""}:${bp.interaction?.kind || ""}:${bp.stats?.voxels || 0}:${opsSig}#${partsSig}`;
 }
 
+function isDualTransitCreation(creation) {
+  if (!creation || creation.behavior?.type !== "vehicle_route") return false;
+  if (creation.id === "c-mvpvsf0l-5d0a39") return true;
+  const parts = creation.blueprint?.parts || [];
+  return parts.some((p) => /^waratah/i.test(p.name)) && parts.some((p) => /^tram/i.test(p.name));
+}
+
+function computeRouteBuildingDetour(posX, posZ, rightX, rightZ, baseLane, allEntities, selfEnt) {
+  let extraOffset = 0;
+  for (const other of allEntities) {
+    if (other === selfEnt) continue;
+    if (other.data.category !== "building" && other.data.behavior?.type !== "landmark") continue;
+    const clearR = (other.footprintRadius || 3.8) + 2.25;
+    const dx = other.x - posX;
+    const dz = other.z - posZ;
+    const centerDist = Math.hypot(dx, dz);
+    if (centerDist > clearR + 4.5) continue;
+
+    const candX = posX + rightX * (baseLane + extraOffset);
+    const candZ = posZ + rightZ * (baseLane + extraOffset);
+    const candDist = Math.hypot(candX - other.x, candZ - other.z);
+    if (candDist >= clearR) continue;
+
+    // Project obstacle position onto route normal (`rightX, rightZ`) and steer cleanly around the open side
+    const obsLat = dx * rightX + dz * rightZ;
+    const fwdSq = Math.max(0, centerDist * centerDist - obsLat * obsLat);
+    const reqLatSep = Math.sqrt(Math.max(0.25, clearR * clearR - fwdSq));
+    const pushRight = obsLat - baseLane <= 0;
+    const desiredLane = pushRight ? obsLat + reqLatSep : obsLat - reqLatSep;
+    const needed = Math.max(-6.5, Math.min(6.5, desiredLane - baseLane));
+    if (Math.abs(needed) > Math.abs(extraOffset)) {
+      extraOffset = needed;
+    }
+  }
+  return extraOffset;
+}
+
 class CreationSimEntity {
-  constructor(creation, index = 0, onInteractiveEvent = null) {
+  constructor(creation, index = 0, onInteractiveEvent = null, creationsGroup = null) {
     this.id = creation.id;
     this.index = index;
     this.data = creation;
     this.onInteractiveEvent = onInteractiveEvent;
     this.blueprintSig = computeBlueprintSignature(creation.blueprint);
-    this.group = buildCreationGroup(creation.blueprint, {
-      seed: 17 + index * 13,
-      useWorldScale: true,
-    });
+    this.isDualTransit = isDualTransitCreation(creation);
+    this.isVegasSphere =
+      creation.id === "c-mvoo26uh-4e0810" ||
+      /vegas.*sphere|emoji.*sphere/i.test(creation.name || "");
+    this.secondaryVehicle = null;
+
+    const splitGroups = this.isDualTransit
+      ? buildSplitDualVehicleGroups(creation.blueprint, {
+          seed: 17 + index * 13,
+          useWorldScale: true,
+        })
+      : null;
+
+    if (splitGroups) {
+      this.group = splitGroups.leftGroup;
+      this.secondaryVehicle = this.createSecondaryVehicleState(splitGroups.rightGroup);
+      if (creationsGroup) {
+        creationsGroup.add(this.secondaryVehicle.group);
+      }
+    } else {
+      this.group = buildCreationGroup(creation.blueprint, {
+        seed: 17 + index * 13,
+        useWorldScale: true,
+      });
+    }
     this.group.rotation.order = "YXZ";
     this.group.userData.creationId = this.id;
 
@@ -838,11 +1130,13 @@ class CreationSimEntity {
     this.spawnScale = creation.isSeed ? 1.0 : 0.05;
 
     const worldUnit = getWorldVoxelSize(creation.scaleClass);
-    this.footprintRadius = getCreationFootprintRadius(
-      creation.scaleClass,
-      creation.blueprint?.stats?.footprintX ?? 14,
-      creation.blueprint?.stats?.footprintZ ?? 14,
-    );
+    this.footprintRadius = splitGroups
+      ? 3.1
+      : getCreationFootprintRadius(
+          creation.scaleClass,
+          creation.blueprint?.stats?.footprintX ?? 14,
+          creation.blueprint?.stats?.footprintZ ?? 14,
+        );
     this.topY = Math.max(1.8, (creation.blueprint?.stats?.maxY || 14) * worldUnit);
     this.feedReading = null;
     this.feedBadgeText = "";
@@ -855,11 +1149,16 @@ class CreationSimEntity {
     this.routeDir = 1;
     this.routeLength = 1;
     this.routeDist = (index * 37.3) % 120;
+    this.effectiveSpeed = splitGroups ? 8.4 : null;
+    this.deBunchedOnce = false;
     this.stopArcPositions = [];
     this.dwellingStop = null;
     this.dwellTimer = 0;
     this.lastStoppedId = null;
     this.currentLaneOffset = 0.92;
+    this.buildingDetourOffset = 0;
+    this.smoothVelX = Math.sin(this.yaw);
+    this.smoothVelZ = Math.cos(this.yaw);
     this.yieldTimer = 0;
     this.doorX = this.x;
     this.doorZ = this.z;
@@ -875,15 +1174,53 @@ class CreationSimEntity {
     this.wanderCheckX = this.x;
     this.wanderCheckZ = this.z;
     this.wanderAvoidSide = index % 2 === 0 ? 1 : -1;
+    this.wanderDirX = Math.sin(this.yaw);
+    this.wanderDirZ = Math.cos(this.yaw);
     this.hopPhase = 0;
 
     this.orbitAngle = (index * 1.9) % (Math.PI * 2);
     this.interactive = null;
 
-    this.rebuildBehavior(creation);
+    // Las Vegas Emoji Sphere eye-tracking & playful spin state
+    this.eyeGazeX = 0;
+    this.eyeGazeY = 0;
+    this.eyeSpinFlourishTimer = 1.35;
+    this.lastTrackedCarId = null;
+    this.nextAutoSpinAt = 8.5 + (index % 4);
+
+    this.rebuildBehavior(creation, creationsGroup);
     this.group.position.set(this.x, this.y, this.z);
     this.group.rotation.y = this.yaw;
     this.group.scale.setScalar(this.spawnScale);
+  }
+
+  createSecondaryVehicleState(secGroup) {
+    secGroup.rotation.order = "YXZ";
+    secGroup.userData.creationId = this.id;
+    return {
+      group: secGroup,
+      x: this.data?.x || 0,
+      y: 0.092,
+      z: this.data?.z || 0,
+      yaw: this.data?.yaw || 0,
+      speed: 4.35,
+      routeDist: 0,
+      routeDir: -1,
+      initializedDist: false,
+      currentLaneOffset: 1.18,
+      buildingDetourOffset: 0,
+      wheelAngle: 0,
+      moveFactor: 1,
+      dwellingStop: null,
+      dwellTimer: 0,
+      lastStoppedId: null,
+    };
+  }
+
+  triggerEyeSpinFlourish() {
+    if (this.isVegasSphere) {
+      this.eyeSpinFlourishTimer = 1.65;
+    }
   }
 
   setLiveFeedReading(reading, maxAniso = 4) {
@@ -922,11 +1259,17 @@ class CreationSimEntity {
   rebuildBehavior(creation, creationsGroup = null) {
     const wasStationary = this.data?.behavior?.type === "landmark";
     this.data = creation;
-    this.footprintRadius = getCreationFootprintRadius(
-      creation.scaleClass,
-      creation.blueprint?.stats?.footprintX ?? 14,
-      creation.blueprint?.stats?.footprintZ ?? 14,
-    );
+    this.isDualTransit = isDualTransitCreation(creation);
+    this.isVegasSphere =
+      creation.id === "c-mvoo26uh-4e0810" ||
+      /vegas.*sphere|emoji.*sphere/i.test(creation.name || "");
+    this.footprintRadius = this.isDualTransit
+      ? 3.1
+      : getCreationFootprintRadius(
+          creation.scaleClass,
+          creation.blueprint?.stats?.footprintX ?? 14,
+          creation.blueprint?.stats?.footprintZ ?? 14,
+        );
     if (wasStationary && creation.behavior?.type === "landmark") {
       this.x = creation.x;
       this.z = creation.z;
@@ -947,10 +1290,28 @@ class CreationSimEntity {
       }
       creationsGroup.remove(this.group);
       this.group.userData.dispose?.();
-      this.group = buildCreationGroup(creation.blueprint, {
-        seed: 17 + this.index * 13,
-        useWorldScale: true,
-      });
+      if (this.secondaryVehicle) {
+        creationsGroup.remove(this.secondaryVehicle.group);
+        this.secondaryVehicle.group.userData.dispose?.();
+        this.secondaryVehicle = null;
+      }
+      const splitGroups = this.isDualTransit
+        ? buildSplitDualVehicleGroups(creation.blueprint, {
+            seed: 17 + this.index * 13,
+            useWorldScale: true,
+          })
+        : null;
+      if (splitGroups) {
+        this.group = splitGroups.leftGroup;
+        this.effectiveSpeed = 8.4;
+        this.secondaryVehicle = this.createSecondaryVehicleState(splitGroups.rightGroup);
+        creationsGroup.add(this.secondaryVehicle.group);
+      } else {
+        this.group = buildCreationGroup(creation.blueprint, {
+          seed: 17 + this.index * 13,
+          useWorldScale: true,
+        });
+      }
       this.group.rotation.order = "YXZ";
       this.group.userData.creationId = this.id;
       const worldUnit = getWorldVoxelSize(creation.scaleClass);
@@ -962,6 +1323,8 @@ class CreationSimEntity {
       this.group.position.set(this.x, this.y, this.z);
       this.group.rotation.y = this.yaw;
       creationsGroup.add(this.group);
+    } else if (creationsGroup && this.secondaryVehicle && !this.secondaryVehicle.group.parent) {
+      creationsGroup.add(this.secondaryVehicle.group);
     }
     const desiredInteractionKind = creation.blueprint?.interaction?.kind || null;
     if (!this.interactive || rebuiltGroup || this.interactive.kind !== desiredInteractionKind) {
@@ -984,6 +1347,13 @@ class CreationSimEntity {
       this.routeDist = this.routeClosed
         ? this.routeDist % this.routeLength
         : Math.max(0.2, Math.min(this.routeLength - 0.2, this.routeDist % this.routeLength));
+      if (this.secondaryVehicle && !this.secondaryVehicle.initializedDist) {
+        this.secondaryVehicle.routeDist = this.routeClosed
+          ? (this.routeDist + this.routeLength * 0.5) % this.routeLength
+          : Math.max(0.4, this.routeLength * 0.82);
+        this.secondaryVehicle.routeDir = -1;
+        this.secondaryVehicle.initializedDist = true;
+      }
 
       const samples = 160;
       this.stopArcPositions = (b.stops || []).map((stop) => {
@@ -1020,6 +1390,288 @@ class CreationSimEntity {
     }
   }
 
+  sanitizeWanderTarget(rawX, rawZ, selfPad, isGlide, ponds, allEntities) {
+    let [tx, tz] = clampPointToIsland(rawX, rawZ, selfPad + 2.4);
+    for (let pass = 0; pass < 2; pass++) {
+      // Town signboard
+      {
+        const clearR = 2.95 + selfPad;
+        const dx = tx - CITY_SIGN_POS[0];
+        const dz = tz - CITY_SIGN_POS[1];
+        const d = Math.hypot(dx, dz);
+        if (d < clearR) {
+          const ang = d > 0.01 ? Math.atan2(dz, dx) : (this.index * 2.399) % (Math.PI * 2);
+          tx = CITY_SIGN_POS[0] + Math.cos(ang) * clearR;
+          tz = CITY_SIGN_POS[1] + Math.sin(ang) * clearR;
+        }
+      }
+      if (!isGlide) {
+        for (const pond of ponds) {
+          const pr = (pond.radius || 6.4) + selfPad * 0.6 + 1.05;
+          const dx = tx - pond.x;
+          const dz = tz - pond.z;
+          const d = Math.hypot(dx, dz);
+          if (d < pr) {
+            const ang = d > 0.01 ? Math.atan2(dz, dx) : (this.index * 2.399) % (Math.PI * 2);
+            tx = pond.x + Math.cos(ang) * pr;
+            tz = pond.z + Math.sin(ang) * pr;
+          }
+        }
+      }
+      for (const other of allEntities) {
+        if (other === this) continue;
+        if (other.data.category !== "building" && other.data.behavior?.type !== "landmark") continue;
+        const br = (other.footprintRadius || 4.0) + selfPad + 1.25;
+        const dx = tx - other.x;
+        const dz = tz - other.z;
+        const d = Math.hypot(dx, dz);
+        if (d < br) {
+          const ang = d > 0.01 ? Math.atan2(dz, dx) : (this.index * 2.399) % (Math.PI * 2);
+          tx = other.x + Math.cos(ang) * br;
+          tz = other.z + Math.sin(ang) * br;
+        }
+      }
+      [tx, tz] = clampPointToIsland(tx, tz, selfPad + 2.4);
+    }
+    return [tx, tz];
+  }
+
+  stepSecondaryVehicle(dt, t, allEntities, popEase) {
+    const sv = this.secondaryVehicle;
+    if (!sv || !this.routeCurve) return;
+
+    let targetLane = 1.22;
+    if (sv.dwellingStop) {
+      const isTurn = sv.dwellingStop.id === "__turn_end__" || sv.dwellingStop.id === "__turn_start__";
+      targetLane = isTurn ? 1.05 : 1.72;
+      sv.dwellTimer -= dt;
+      sv.moveFactor = 0;
+      if (sv.dwellTimer <= 0) {
+        sv.lastStoppedId = sv.dwellingStop.id;
+        sv.dwellingStop = null;
+      }
+    } else {
+      let speedScale = 1.0;
+      let pullingOver = false;
+      for (const sp of this.stopArcPositions) {
+        let ahead = this.routeClosed
+          ? sp.distOnCurve - sv.routeDist
+          : (sp.distOnCurve - sv.routeDist) * sv.routeDir;
+        if (this.routeClosed) {
+          if (ahead < -this.routeLength * 0.5) ahead += this.routeLength;
+          if (ahead > this.routeLength * 0.5) ahead -= this.routeLength;
+        }
+        if (Math.abs(ahead) > 4.2 && sv.lastStoppedId === sp.stop.id) {
+          sv.lastStoppedId = null;
+        }
+        if (sp.stop.id !== sv.lastStoppedId && ahead >= -0.4 && ahead < 4.6) {
+          pullingOver = true;
+          speedScale = Math.max(0.28, ahead / 4.6);
+          if (ahead <= 0.45) {
+            sv.routeDist = sp.distOnCurve;
+            sv.dwellingStop = sp.stop;
+            sv.dwellTimer = Math.min(2.0, sp.stop.dwellSec || 1.6);
+            if (!this.routeClosed) {
+              if (sv.routeDir > 0 && sp.distOnCurve >= this.routeLength - 2.2) sv.routeDir = -1;
+              else if (sv.routeDir < 0 && sp.distOnCurve <= 2.2) sv.routeDir = 1;
+            }
+            speedScale = 0;
+            break;
+          }
+        }
+      }
+      if (pullingOver) targetLane = 1.68;
+
+      // Pull slightly to the outer curb when the express Waratah Train is overtaking from behind!
+      const sameDir = this.routeClosed || sv.routeDir === this.routeDir;
+      if (sameDir && Math.hypot(this.x - sv.x, this.z - sv.z) < 13.5) {
+        targetLane = 1.62;
+      }
+
+      const stepDist = sv.speed * speedScale * dt;
+      if (this.routeClosed) {
+        sv.routeDist = (sv.routeDist + stepDist) % this.routeLength;
+      } else {
+        sv.routeDist += sv.routeDir * stepDist;
+        if (sv.routeDir > 0 && sv.routeDist >= this.routeLength - 0.12) {
+          sv.routeDist = this.routeLength - 0.12;
+          sv.routeDir = -1;
+          sv.dwellingStop = { id: "__turn_end__", dwellSec: 0.9 };
+          sv.dwellTimer = 0.9;
+          speedScale = 0;
+        } else if (sv.routeDir < 0 && sv.routeDist <= 0.12) {
+          sv.routeDist = 0.12;
+          sv.routeDir = 1;
+          sv.dwellingStop = { id: "__turn_start__", dwellSec: 0.9 };
+          sv.dwellTimer = 0.9;
+          speedScale = 0;
+        }
+      }
+      sv.wheelAngle += stepDist / 0.62;
+      sv.moveFactor = speedScale;
+    }
+
+    const u = this.routeClosed
+      ? (((sv.routeDist % this.routeLength) + this.routeLength) % this.routeLength) / this.routeLength
+      : Math.max(0.002, Math.min(0.998, sv.routeDist / this.routeLength));
+    const pos = this.routeCurve.getPointAt(u);
+    const tan = this.routeCurve.getTangentAt(u);
+    const dirSign = this.routeClosed ? 1 : sv.routeDir;
+    const baseYaw = Math.atan2(tan.x * dirSign, tan.z * dirSign);
+
+    sv.currentLaneOffset += (targetLane - sv.currentLaneOffset) * Math.min(1, dt * 5.0);
+    const rightX = -Math.cos(baseYaw);
+    const rightZ = Math.sin(baseYaw);
+    const detourTarget = computeRouteBuildingDetour(
+      pos.x,
+      pos.z,
+      rightX,
+      rightZ,
+      sv.currentLaneOffset,
+      allEntities,
+      this,
+    );
+    sv.buildingDetourOffset += (detourTarget - sv.buildingDetourOffset) * Math.min(1, dt * 5.2);
+    const prevX = sv.x;
+    const prevZ = sv.z;
+    const totalLane = sv.currentLaneOffset + sv.buildingDetourOffset;
+    sv.x = pos.x + rightX * totalLane;
+    sv.z = pos.z + rightZ * totalLane;
+    sv.y = 0.092;
+    const mv = Math.hypot(sv.x - prevX, sv.z - prevZ);
+    if (mv > 0.002) {
+      const travelYaw = Math.atan2(sv.x - prevX, sv.z - prevZ);
+      let dYaw = travelYaw - sv.yaw;
+      while (dYaw > Math.PI) dYaw -= Math.PI * 2;
+      while (dYaw < -Math.PI) dYaw += Math.PI * 2;
+      sv.yaw += dYaw * Math.min(1, dt * 9.0);
+    } else {
+      sv.yaw = baseYaw;
+    }
+    const secPitch = sv.dwellingStop ? 0 : Math.sin(t * 13 + 1.4) * 0.007 * sv.moveFactor;
+    sv.group.position.set(sv.x, sv.y, sv.z);
+    sv.group.rotation.set(secPitch, sv.yaw, 0);
+    sv.group.scale.setScalar(popEase);
+    sv.group.userData.animate?.(t, {
+      wheelAngle: sv.wheelAngle,
+      moveFactor: sv.moveFactor,
+    });
+  }
+
+  updateVegasSphereEyes(dt, t, allEntities) {
+    const pivots = this.group.userData?.partPivots;
+    const leftEye = pivots?.["pupil-left"];
+    const rightEye = pivots?.["pupil-right"];
+    if (!leftEye || !rightEye) return;
+
+    const voxScale = leftEye.voxScale || 0.43;
+    const cosY = Math.cos(this.yaw);
+    const sinY = Math.sin(this.yaw);
+    const eyeWorldY = this.y + 21.8 * voxScale;
+
+    // Gather all active road vehicles (including split secondary transit vehicles)
+    let bestCar = null;
+    let bestScore = Infinity;
+    for (const ent of allEntities) {
+      if (ent === this || ent.data.behavior?.type !== "vehicle_route") continue;
+      const candidates = [{ id: ent.id, x: ent.x, y: ent.y || 0.5, z: ent.z, move: ent.moveFactor ?? 1 }];
+      if (ent.secondaryVehicle) {
+        candidates.push({
+          id: `${ent.id}#tram`,
+          x: ent.secondaryVehicle.x,
+          y: ent.secondaryVehicle.y || 0.5,
+          z: ent.secondaryVehicle.z,
+          move: ent.secondaryVehicle.moveFactor ?? 1,
+        });
+      }
+      for (const c of candidates) {
+        const dx = c.x - this.x;
+        const dz = c.z - this.z;
+        const dist = Math.hypot(dx, dz);
+        if (dist > 102 || dist < 1) continue;
+        // Convert world offset into Sphere local coordinates (+Z = front face, +X = Sphere's right/North)
+        const lx = dx * cosY - dz * sinY;
+        const lz = dx * sinY + dz * cosY;
+        if (lz < -8) continue;
+        const movingBonus = c.move > 0.08 ? 0.68 : 1.18;
+        const frontBonus = lz > 8 ? 0.85 : 1.15;
+        const score = dist * movingBonus * frontBonus;
+        if (score < bestScore) {
+          bestScore = score;
+          bestCar = { ...c, dist, lx, lz };
+        }
+      }
+    }
+
+    // Trigger a playful 360° eye-roll flourish when switching tracked cars or every ~10.5s
+    if (bestCar && bestCar.id !== this.lastTrackedCarId) {
+      if (this.lastTrackedCarId !== null && this.eyeSpinFlourishTimer <= 0) {
+        this.eyeSpinFlourishTimer = 0.95;
+      }
+      this.lastTrackedCarId = bestCar.id;
+    }
+    if (t >= this.nextAutoSpinAt) {
+      this.eyeSpinFlourishTimer = Math.max(this.eyeSpinFlourishTimer, 1.15);
+      this.nextAutoSpinAt = t + 9.5 + Math.sin(t * 0.7) * 2.0;
+    }
+    if (this.eyeSpinFlourishTimer > 0) {
+      this.eyeSpinFlourishTimer = Math.max(0, this.eyeSpinFlourishTimer - dt);
+    }
+
+    // Playful spinning / looking-around gaze vector
+    const spinAngle = t * 3.85;
+    const wanderGx = Math.cos(t * 1.45) * 0.72 + Math.sin(t * 3.1) * 0.28;
+    const wanderGy = Math.sin(t * 1.85) * 0.62 + Math.cos(t * 2.7) * 0.25;
+    const flourishSpinGx = Math.cos(spinAngle) * 0.95;
+    const flourishSpinGy = Math.sin(spinAngle) * 0.92;
+
+    let targetGx = wanderGx;
+    let targetGy = wanderGy;
+    let pupilRollZ = Math.sin(t * 2.4) * 0.28;
+
+    if (bestCar && bestCar.dist < 88) {
+      const carHoriz = Math.max(11.0, Math.abs(bestCar.lz) * 0.68 + 4.0);
+      const carGx = Math.max(-1, Math.min(1, (bestCar.lx / carHoriz) * 1.22));
+      const carVert = (bestCar.y + 1.2 - eyeWorldY) / Math.max(14.0, bestCar.dist * 0.48);
+      const carGy = Math.max(-0.92, Math.min(0.82, carVert * 1.35 + 0.08));
+
+      // Blend smoothly: close moving road cars command crisp tracking; distant/stopped cars mix in curious eye rolls
+      const trackWeight =
+        bestCar.move > 0.05
+          ? Math.max(0.25, Math.min(1.0, 1.0 - Math.max(0, bestCar.dist - 58) / 30))
+          : 0.55;
+      targetGx = wanderGx * (1 - trackWeight) + carGx * trackWeight;
+      targetGy = wanderGy * (1 - trackWeight) + carGy * trackWeight;
+      pupilRollZ = carGx * -0.22;
+    }
+
+    if (this.eyeSpinFlourishTimer > 0) {
+      const w = Math.min(1, this.eyeSpinFlourishTimer / 0.35);
+      targetGx = targetGx * (1 - w) + flourishSpinGx * w;
+      targetGy = targetGy * (1 - w) + flourishSpinGy * w;
+      pupilRollZ = spinAngle;
+    }
+
+    const damp = Math.min(1, dt * (this.eyeSpinFlourishTimer > 0 ? 14.0 : 8.2));
+    this.eyeGazeX += (targetGx - this.eyeGazeX) * damp;
+    this.eyeGazeY += (targetGy - this.eyeGazeY) * damp;
+
+    // Position left & right pupils cleanly across the curved sclera (`eyeWhite` spheres at cx=-5.5 / +4.5, cy=21.9, cz=14.8..17.8)
+    const applyEye = (eyeInfo, scleraCx, scleraCy, rxMax, ryMax, convergeSign) => {
+      const gx = Math.max(-1.02, Math.min(1.02, this.eyeGazeX + convergeSign * 0.06));
+      const gy = Math.max(-1.0, Math.min(1.0, this.eyeGazeY));
+      const r2 = Math.min(1.35, gx * gx + gy * gy);
+      const vx = scleraCx + gx * rxMax;
+      const vy = scleraCy + gy * ryMax;
+      const vz = 19.48 - 0.82 * r2;
+      eyeInfo.pivot.position.set(vx * voxScale, vy * voxScale, vz * voxScale);
+      eyeInfo.pivot.rotation.set(-gy * 0.38, gx * 0.44, pupilRollZ);
+    };
+
+    applyEye(leftEye, -5.5, 21.85, 2.32, 2.72, 1);
+    applyEye(rightEye, 4.5, 21.85, 2.48, 2.85, -1);
+  }
+
   step(dt, t, allEntities = [], ponds = [], camAz = 0.62, viewerPos = null) {
     if (this.spawnScale < 1.0) {
       this.spawnScale = Math.min(1.0, this.spawnScale + dt * 3.2);
@@ -1031,7 +1683,9 @@ class CreationSimEntity {
     let rollZ = 0;
 
     if (b?.type === "vehicle_route" && this.routeCurve) {
-      let targetLane = 0.92;
+      const prevWorldX = this.x;
+      const prevWorldZ = this.z;
+      let targetLane = this.isDualTransit ? 0.58 : 0.92;
       if (this.dwellingStop) {
         const isTurnStop =
           this.dwellingStop.id === "__turn_end__" || this.dwellingStop.id === "__turn_start__";
@@ -1081,6 +1735,15 @@ class CreationSimEntity {
           targetLane = 1.65;
         }
 
+        // Express Waratah Train pulls smoothly into the inner passing lane when overtaking the Melbourne Tram
+        if (this.secondaryVehicle) {
+          const sv = this.secondaryVehicle;
+          const sameDir = this.routeClosed || sv.routeDir === this.routeDir;
+          if (sameDir && Math.hypot(sv.x - this.x, sv.z - this.z) < 13.5 && !pullingOver) {
+            targetLane = 0.08;
+          }
+        }
+
         if (speedScale > 0) {
           const fwdX = Math.sin(this.yaw);
           const fwdZ = Math.cos(this.yaw);
@@ -1093,7 +1756,7 @@ class CreationSimEntity {
             const dx = other.x - this.x;
             const dz = other.z - this.z;
             const dist = Math.hypot(dx, dz);
-            if (dist >= 9.5 || dist < 0.01) continue;
+            if (dist >= 12.5 || dist < 0.01) continue;
 
             const otherFwdX = Math.sin(other.yaw);
             const otherFwdZ = Math.cos(other.yaw);
@@ -1104,25 +1767,26 @@ class CreationSimEntity {
             // Oncoming traffic in the opposite lane (`headingDot < -0.25`) passes freely!
             if (headingDot > 0.45) {
               if (other.dwellingStop) {
-                // Overtake curb-parked vehicles smoothly instead of queuing behind them
-                if (aheadDist > -2.5 && aheadDist < 9.0 && !pullingOver) {
-                  targetLane = 0.24;
-                  speedScale = Math.min(speedScale, 0.85);
+                // Overtake curb-parked vehicles cleanly so buses never queue or stall
+                if (aheadDist > -2.5 && aheadDist < 9.5 && !pullingOver) {
+                  targetLane = 0.18;
+                  speedScale = Math.min(speedScale, 0.92);
                 }
-              } else if (aheadDist > 0 && aheadDist < 7.6 && latDist < 1.3) {
-                speedScale = Math.min(speedScale, Math.max(0.08, (aheadDist - 4.2) / 3.4));
+              } else if (aheadDist > -1.2 && aheadDist < 11.2 && latDist < 2.2) {
+                // Single-file headway behind moving same-direction vehicles (never linger side-by-side!)
+                speedScale = Math.min(speedScale, Math.max(0.12, (aheadDist - 5.8) / 5.4));
               }
             } else if (
               headingDot >= -0.25 &&
               !other.dwellingStop &&
               other.moveFactor > 0.15 &&
               aheadDist > 0.4 &&
-              aheadDist < 5.4 &&
-              dist < 5.6 &&
+              aheadDist < 5.6 &&
+              dist < 5.8 &&
               this.id > other.id
             ) {
               if (this.yieldTimer < 1.6) {
-                speedScale = Math.min(speedScale, Math.max(0.05, (dist - 3.8) / 1.8));
+                speedScale = Math.min(speedScale, Math.max(0.05, (dist - 3.8) / 2.0));
                 yielding = true;
               }
             }
@@ -1135,7 +1799,8 @@ class CreationSimEntity {
           }
         }
 
-        const stepDist = (b.speed || 6.0) * speedScale * dt;
+        const baseSpeed = this.effectiveSpeed || b.speed || 6.0;
+        const stepDist = baseSpeed * speedScale * dt;
         if (this.routeClosed) {
           this.routeDist = (this.routeDist + stepDist) % this.routeLength;
         } else {
@@ -1170,15 +1835,46 @@ class CreationSimEntity {
       const pos = this.routeCurve.getPointAt(u);
       const tan = this.routeCurve.getTangentAt(u);
       const dirSign = this.routeClosed ? 1 : this.routeDir;
-      this.yaw = Math.atan2(tan.x * dirSign, tan.z * dirSign);
+      const curveYaw = Math.atan2(tan.x * dirSign, tan.z * dirSign);
 
       this.currentLaneOffset += (targetLane - this.currentLaneOffset) * Math.min(1, dt * 5.2);
-      const rightX = -Math.cos(this.yaw);
-      const rightZ = Math.sin(this.yaw);
-      const laneOffset = this.currentLaneOffset;
+      const rightX = -Math.cos(curveYaw);
+      const rightZ = Math.sin(curveYaw);
+      const detourTarget = computeRouteBuildingDetour(
+        pos.x,
+        pos.z,
+        rightX,
+        rightZ,
+        this.currentLaneOffset,
+        allEntities,
+        this,
+      );
+      this.buildingDetourOffset += (detourTarget - this.buildingDetourOffset) * Math.min(1, dt * 5.2);
+      const laneOffset = this.currentLaneOffset + this.buildingDetourOffset;
       this.x = pos.x + rightX * laneOffset;
       this.z = pos.z + rightZ * laneOffset;
       this.y = 0.092;
+
+      const movedDist = Math.hypot(this.x - prevWorldX, this.z - prevWorldZ);
+      if (movedDist > 0.003 && !this.dwellingStop) {
+        const vx = (this.x - prevWorldX) / movedDist;
+        const vz = (this.z - prevWorldZ) / movedDist;
+        this.smoothVelX += (vx - this.smoothVelX) * Math.min(1, dt * 10.0);
+        this.smoothVelZ += (vz - this.smoothVelZ) * Math.min(1, dt * 10.0);
+        const sLen = Math.hypot(this.smoothVelX, this.smoothVelZ) || 1;
+        this.smoothVelX /= sLen;
+        this.smoothVelZ /= sLen;
+        const desiredYaw = Math.atan2(this.smoothVelX, this.smoothVelZ);
+        let dYaw = desiredYaw - this.yaw;
+        while (dYaw > Math.PI) dYaw -= Math.PI * 2;
+        while (dYaw < -Math.PI) dYaw += Math.PI * 2;
+        this.yaw += dYaw * Math.min(1, dt * 10.0);
+      } else {
+        this.yaw = curveYaw;
+        this.smoothVelX = Math.sin(curveYaw);
+        this.smoothVelZ = Math.cos(curveYaw);
+      }
+
       this.doorX = this.x + rightX * 1.9 + Math.sin(this.yaw) * 0.9;
       this.doorZ = this.z + rightZ * 1.9 + Math.cos(this.yaw) * 0.9;
 
@@ -1187,7 +1883,7 @@ class CreationSimEntity {
       const isGlide = b.style === "glide";
       const glideBaseY = b.hoverHeight || 1.9;
       const selfPad = Math.min(3.8, Math.max(0.85, (this.footprintRadius || 1.5) * 0.48));
-      const targets =
+      const rawTargets =
         b.targets && b.targets.length
           ? b.targets
           : [
@@ -1203,41 +1899,21 @@ class CreationSimEntity {
         this.wanderCheckX = this.x;
         this.wanderCheckZ = this.z;
       } else {
-        // Auto-skip any target that sits inside a pond or stationary building/landmark footprint
-        for (let skipTry = 0; skipTry < targets.length; skipTry++) {
-          const cand = targets[this.wanderIdx % targets.length];
-          let blocked = false;
-          if (!isGlide) {
-            for (const pond of ponds) {
-              const pr = (pond.radius || 6.4) + selfPad * 0.6 + 0.8;
-              if (Math.hypot(cand[0] - pond.x, cand[1] - pond.z) < pr + 0.55) {
-                blocked = true;
-                break;
-              }
-            }
-          }
-          if (!blocked) {
-            for (const other of allEntities) {
-              if (other === this) continue;
-              if (other.data.category !== "building" && other.data.behavior?.type !== "landmark") continue;
-              const br = (other.footprintRadius || 4.0) + selfPad + 0.95;
-              if (Math.hypot(cand[0] - other.x, cand[1] - other.z) < br + 0.55) {
-                blocked = true;
-                break;
-              }
-            }
-          }
-          if (!blocked) break;
-          this.wanderIdx = (this.wanderIdx + 1) % targets.length;
-        }
-
-        const tgt = targets[this.wanderIdx % targets.length];
-        const dx = tgt[0] - this.x;
-        const dz = tgt[1] - this.z;
+        const candRaw = rawTargets[this.wanderIdx % rawTargets.length];
+        const [tgtX, tgtZ] = this.sanitizeWanderTarget(
+          candRaw[0],
+          candRaw[1],
+          selfPad,
+          isGlide,
+          ponds,
+          allEntities,
+        );
+        const dx = tgtX - this.x;
+        const dz = tgtZ - this.z;
         const dist = Math.hypot(dx, dz);
-        const reachTol = Math.max(0.65, selfPad * 0.35);
+        const reachTol = Math.max(0.8, selfPad * 0.42);
         if (dist < reachTol) {
-          this.wanderIdx = (this.wanderIdx + 1) % targets.length;
+          this.wanderIdx = (this.wanderIdx + 1) % rawTargets.length;
           this.wanderPause = isGlide ? 0.6 : 1.5 + (this.wanderIdx % 2) * 0.8;
           this.wanderStuckSec = 0;
           this.wanderCheckX = this.x;
@@ -1249,10 +1925,10 @@ class CreationSimEntity {
           const ux = dx / dist;
           const uz = dz / dist;
 
-          // Proactive tangential steering around blocking buildings, quarries, and ponds
+          // Proactive tangential steering with hysteretic passing side (no 60Hz yaw flip!)
           let steerX = ux;
           let steerZ = uz;
-          const lookAhead = Math.min(dist, Math.max(6.0, selfPad * 2.4 + 4.5));
+          const lookAhead = Math.min(dist, Math.max(6.5, selfPad * 2.4 + 4.8));
 
           const applyAvoidance = (obsX, obsZ, clearR) => {
             const ox = obsX - this.x;
@@ -1261,38 +1937,31 @@ class CreationSimEntity {
             if (od < 0.01 || od > lookAhead + clearR) return;
             const fwd = ox * ux + oz * uz;
             const lat = ox * -uz + oz * ux;
-            const corridor = clearR + 1.5;
+            const corridor = clearR + 1.65;
             if (fwd > -clearR * 0.35 && Math.abs(lat) < corridor) {
-              // Pick passing side: steer away from obstacle center, or inward from world edge if near dead-center
-              let side;
-              if (Math.abs(lat) > 0.45) {
-                side = lat > 0 ? -1 : 1;
-              } else {
-                const leftCandX = obsX + -uz * clearR;
-                const leftCandZ = obsZ + ux * clearR;
-                const rightCandX = obsX - -uz * clearR;
-                const rightCandZ = obsZ - ux * clearR;
-                const leftDistCenter = Math.hypot(leftCandX, leftCandZ);
-                const rightDistCenter = Math.hypot(rightCandX, rightCandZ);
-                side =
-                  Math.abs(leftDistCenter - rightDistCenter) > 4.0
-                    ? leftDistCenter < rightDistCenter
-                      ? 1
-                      : -1
-                    : this.wanderAvoidSide;
+              if (Math.abs(lat) > 0.85 && od > clearR + 0.5) {
+                this.wanderAvoidSide = lat > 0 ? -1 : 1;
               }
+              const side = Math.abs(lat) > 1.15 ? (lat > 0 ? -1 : 1) : this.wanderAvoidSide;
               const urgency = Math.max(
                 0,
-                Math.min(1.6, ((corridor - Math.abs(lat)) / corridor) * (1.25 - Math.max(0, od - clearR) / lookAhead)),
+                Math.min(
+                  1.75,
+                  ((corridor - Math.abs(lat)) / corridor) *
+                    (1.3 - Math.max(0, od - clearR) / lookAhead),
+                ),
               );
-              steerX += -uz * side * urgency * 1.45;
-              steerZ += ux * side * urgency * 1.45;
+              const outUx = -ox / od;
+              const outUz = -oz / od;
+              steerX += -uz * side * urgency * 1.6 + outUx * urgency * 0.65;
+              steerZ += ux * side * urgency * 1.6 + outUz * urgency * 0.65;
             }
           };
 
+          applyAvoidance(CITY_SIGN_POS[0], CITY_SIGN_POS[1], 2.95 + selfPad);
           if (!isGlide) {
             for (const pond of ponds) {
-              applyAvoidance(pond.x, pond.z, (pond.radius || 6.4) + selfPad * 0.6 + 0.8);
+              applyAvoidance(pond.x, pond.z, (pond.radius || 6.4) + selfPad * 0.6 + 0.85);
             }
           }
           for (const other of allEntities) {
@@ -1310,11 +1979,21 @@ class CreationSimEntity {
           this.x += steerX * stepLen;
           this.z += steerZ * stepLen;
 
-          // Two-pass hard non-penetration resolution
+          // Two-pass hard non-penetration resolution (including town signboard + island coastline)
           for (let pass = 0; pass < 2; pass++) {
+            {
+              const sr = 2.95 + selfPad;
+              const sdx = this.x - CITY_SIGN_POS[0];
+              const sdz = this.z - CITY_SIGN_POS[1];
+              const sd = Math.hypot(sdx, sdz);
+              if (sd < sr && sd > 0.01) {
+                this.x = CITY_SIGN_POS[0] + (sdx / sd) * sr;
+                this.z = CITY_SIGN_POS[1] + (sdz / sd) * sr;
+              }
+            }
             if (!isGlide) {
               for (const pond of ponds) {
-                const pr = (pond.radius || 6.4) + selfPad * 0.6 + 0.8;
+                const pr = (pond.radius || 6.4) + selfPad * 0.6 + 0.85;
                 const pdx = this.x - pond.x;
                 const pdz = this.z - pond.z;
                 const pd = Math.hypot(pdx, pdz);
@@ -1336,49 +2015,68 @@ class CreationSimEntity {
                 this.z = other.z + (bdz / bd) * br;
               }
             }
-          }
-          this.x = Math.max(-142, Math.min(142, this.x));
-          this.z = Math.max(-142, Math.min(142, this.z));
-
-          // Progress watchdog: never march in place if boxed in by multiple obstacles
-          this.wanderStuckSec += dt;
-          if (this.wanderStuckSec >= 1.6) {
-            const netMoved = Math.hypot(this.x - this.wanderCheckX, this.z - this.wanderCheckZ);
-            this.wanderCheckX = this.x;
-            this.wanderCheckZ = this.z;
-            this.wanderStuckSec = 0;
-            if (netMoved < Math.max(0.55, speed * 0.28)) {
-              this.wanderAvoidSide *= -1;
-              this.wanderIdx = (this.wanderIdx + 1) % targets.length;
-            }
+            const [ix, iz] = clampPointToIsland(this.x, this.z, selfPad + 2.0);
+            this.x = ix;
+            this.z = iz;
           }
 
           const actualDx = this.x - prevX;
           const actualDz = this.z - prevZ;
           const actualMove = Math.hypot(actualDx, actualDz);
-          this.wheelAngle += actualMove / 0.45;
-          this.moveFactor = 1.0;
+          const fwdProg = actualDx * steerX + actualDz * steerZ;
+          const progressRatio =
+            stepLen > 1e-4
+              ? Math.max(0, Math.min(1, (fwdProg > -0.002 ? actualMove : 0) / stepLen))
+              : 0;
 
-          const desiredYaw = actualMove > 0.0004 ? Math.atan2(actualDx, actualDz) : Math.atan2(dx, dz);
-          let dyaw = desiredYaw - this.yaw;
-          while (dyaw > Math.PI) dyaw -= Math.PI * 2;
-          while (dyaw < -Math.PI) dyaw += Math.PI * 2;
-          this.yaw += dyaw * Math.min(1, dt * 7.5);
+          // Fast stuck watchdog: smoothly advance target instead of twitching against a wall
+          if (progressRatio < 0.32) {
+            this.wanderStuckSec += dt;
+            if (this.wanderStuckSec >= 0.55) {
+              this.wanderStuckSec = 0;
+              this.wanderAvoidSide *= -1;
+              this.wanderIdx = (this.wanderIdx + 1) % rawTargets.length;
+              this.wanderPause = 0.35;
+            }
+          } else {
+            this.wanderStuckSec = Math.max(0, this.wanderStuckSec - dt * 1.5);
+          }
+
+          this.wheelAngle += actualMove / 0.45;
+          this.moveFactor = isGlide ? 0.85 : Math.max(0.05, progressRatio);
+
+          // Smooth heading along intended steer direction (never snap 180° to collision rebound!)
+          const dirBlend = Math.min(1, dt * 6.5);
+          this.wanderDirX += (steerX - this.wanderDirX) * dirBlend;
+          this.wanderDirZ += (steerZ - this.wanderDirZ) * dirBlend;
+          const wdLen = Math.hypot(this.wanderDirX, this.wanderDirZ) || 1;
+          this.wanderDirX /= wdLen;
+          this.wanderDirZ /= wdLen;
+
+          let dyaw = 0;
+          if (progressRatio > 0.14 || isGlide) {
+            const desiredYaw = Math.atan2(this.wanderDirX, this.wanderDirZ);
+            dyaw = desiredYaw - this.yaw;
+            while (dyaw > Math.PI) dyaw -= Math.PI * 2;
+            while (dyaw < -Math.PI) dyaw += Math.PI * 2;
+            const maxTurn = dt * 4.8;
+            this.yaw += Math.max(-maxTurn, Math.min(maxTurn, dyaw * Math.min(1, dt * 6.2)));
+          }
 
           if (isGlide) {
             this.y = glideBaseY + Math.sin(t * 2.5 + this.index) * 0.26;
             pitchX = 0.06;
             rollZ = Math.max(-0.22, Math.min(0.22, -dyaw * 0.35));
           } else if (b.style === "hop") {
-            this.hopPhase = (this.hopPhase + dt * 3.4) % 1;
+            this.hopPhase = (this.hopPhase + dt * 3.4 * Math.max(0.15, progressRatio)) % 1;
             const u = this.hopPhase;
-            this.y = 4 * 0.58 * u * (1 - u);
-            pitchX = (0.5 - u) * 0.22;
+            this.y = 4 * 0.58 * u * (1 - u) * progressRatio;
+            pitchX = (0.5 - u) * 0.22 * progressRatio;
           } else if (b.style === "trot") {
-            this.y = Math.abs(Math.sin(t * 9.0)) * 0.12;
-            rollZ = Math.sin(t * 9.0) * 0.04;
+            this.y = Math.abs(Math.sin(t * 9.0)) * 0.12 * progressRatio;
+            rollZ = Math.sin(t * 9.0) * 0.04 * progressRatio;
           } else {
-            this.y = Math.abs(Math.sin(t * 6.5)) * 0.06;
+            this.y = Math.abs(Math.sin(t * 6.5)) * 0.06 * progressRatio;
           }
         }
       }
@@ -1474,6 +2172,10 @@ class CreationSimEntity {
     const popEase = this.spawnScale < 1 ? 1 - (1 - this.spawnScale) ** 3 : 1;
     this.group.scale.setScalar(popEase);
 
+    if (this.secondaryVehicle) {
+      this.stepSecondaryVehicle(dt, t, allEntities, popEase);
+    }
+
     if (this.feedMesh && this.feedMesh.visible) {
       this.feedMesh.position.y = this.topY + 1.15 + Math.sin(t * 2.1) * 0.05;
       const targetAz = viewerPos
@@ -1486,9 +2188,13 @@ class CreationSimEntity {
       wheelAngle: this.wheelAngle,
       moveFactor: this.moveFactor,
     });
+
+    if (this.isVegasSphere) {
+      this.updateVegasSphereEyes(dt, t, allEntities);
+    }
   }
 
-  dispose() {
+  dispose(creationsGroup = null) {
     this.interactive?.dispose?.();
     this.interactive = null;
     if (this.feedMesh) {
@@ -1496,7 +2202,114 @@ class CreationSimEntity {
       this.feedMesh.material.dispose();
       this.feedTex?.dispose();
     }
+    if (this.secondaryVehicle) {
+      if (creationsGroup) {
+        creationsGroup.remove(this.secondaryVehicle.group);
+      } else {
+        this.secondaryVehicle.group.parent?.remove(this.secondaryVehicle.group);
+      }
+      this.secondaryVehicle.group.userData.dispose?.();
+      this.secondaryVehicle = null;
+    }
     this.group.userData.dispose?.();
+  }
+}
+
+/**
+ * Ensures vehicles sharing any road corridor (especially Sunnyvale School Bus + Sweet Swirl Ice Cream Van
+ * on `path-main-loop`) start maximally spaced in world coordinates and run at clearly distinct speeds
+ * so two buses/vans never cruise side-by-side at the same pace.
+ */
+function deBunchVehicleRoutes(creationEntities) {
+  const vehicles = [];
+  for (const ent of creationEntities.values()) {
+    if (ent.data?.behavior?.type === "vehicle_route" && ent.routeCurve) {
+      const samples = [];
+      for (let i = 0; i < 32; i++) {
+        samples.push(ent.routeCurve.getPointAt(i / 32));
+      }
+      vehicles.push({ ent, samples });
+    }
+  }
+  if (vehicles.length < 2) return;
+
+  const visited = new Set();
+  const sharedSpeedSlots = [6.45, 4.55, 5.45];
+
+  for (let i = 0; i < vehicles.length; i++) {
+    if (visited.has(i)) continue;
+    const cluster = [vehicles[i]];
+    visited.add(i);
+
+    for (let j = i + 1; j < vehicles.length; j++) {
+      if (visited.has(j)) continue;
+      let sharedCount = 0;
+      for (const pa of vehicles[i].samples) {
+        for (const pb of vehicles[j].samples) {
+          if (Math.hypot(pa.x - pb.x, pa.z - pb.z) < 4.8) {
+            sharedCount++;
+            break;
+          }
+        }
+      }
+      if (sharedCount >= 8) {
+        cluster.push(vehicles[j]);
+        visited.add(j);
+      }
+    }
+
+    if (cluster.length < 2) continue;
+    // Sort deterministically so seed vehicles keep slot 0
+    cluster.sort((a, b) => {
+      if (Boolean(a.ent.data.isSeed) !== Boolean(b.ent.data.isSeed)) {
+        return a.ent.data.isSeed ? -1 : 1;
+      }
+      return a.ent.id.localeCompare(b.ent.id);
+    });
+
+    const anchor = cluster[0].ent;
+    const u0 = anchor.routeClosed
+      ? (((anchor.routeDist % anchor.routeLength) + anchor.routeLength) % anchor.routeLength) /
+        anchor.routeLength
+      : 0.16;
+    if (!anchor.deBunchedOnce && !anchor.routeClosed) {
+      anchor.routeDist = anchor.routeLength * 0.16;
+      anchor.routeDir = 1;
+    }
+    const anchorPos = anchor.routeCurve.getPointAt(u0);
+    const anchorTan = anchor.routeCurve.getTangentAt(u0);
+
+    for (let k = 0; k < cluster.length; k++) {
+      const v = cluster[k].ent;
+      if (!v.isDualTransit) {
+        v.effectiveSpeed = sharedSpeedSlots[k % sharedSpeedSlots.length];
+      }
+      if (k > 0 && !v.deBunchedOnce) {
+        if (v.routeClosed) {
+          // Find u on `v.routeCurve` matching `anchorPos` in world space, then offset by +k/N of the loop!
+          let bestU = 0;
+          let bestD = Infinity;
+          for (let s = 0; s < 64; s++) {
+            const u = s / 64;
+            const pt = v.routeCurve.getPointAt(u);
+            const d = Math.hypot(pt.x - anchorPos.x, pt.z - anchorPos.z);
+            if (d < bestD) {
+              bestD = d;
+              bestU = u;
+            }
+          }
+          const vTan = v.routeCurve.getTangentAt(bestU);
+          const dirSign = anchorTan.x * vTan.x + anchorTan.z * vTan.z >= 0 ? 1 : -1;
+          const targetU = (((bestU + dirSign * (k / cluster.length)) % 1) + 1) % 1;
+          v.routeDist = targetU * v.routeLength;
+        } else {
+          const frac = k % 2 === 1 ? 0.84 : 0.48;
+          v.routeDist = v.routeLength * frac;
+          v.routeDir = k % 2 === 1 ? -1 : 1;
+        }
+      }
+      v.deBunchedOnce = true;
+    }
   }
 }
 
@@ -1534,10 +2347,10 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     BASE_FRUSTUM * aspect0,
     BASE_FRUSTUM,
     -BASE_FRUSTUM,
-    18,
-    560,
+    12,
+    980,
   );
-  const fpCamera = new THREE.PerspectiveCamera(aspect0 < 0.8 ? 72 : 62, aspect0, 0.14, 520);
+  const fpCamera = new THREE.PerspectiveCamera(aspect0 < 0.8 ? 72 : 62, aspect0, 0.14, 820);
   fpCamera.rotation.order = "YXZ";
 
   const composer = isSoftwareGpu ? null : new EffectComposer(renderer);
@@ -1615,7 +2428,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   rim.position.set(-85, 70, -90);
   scene.add(rim);
 
-  // Endless Voxel Turf + Multi-Biome Ground Plane
+  // Sculpted 3D GeminIsland Plateau + Beaches/Cliffs + Sunlit Surrounding Ocean
   const grassUniforms = {
     uTime: { value: 0 },
     uFocusXZ: { value: new THREE.Vector2(0, 0) },
@@ -1623,11 +2436,17 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     uZones: { value: Array.from({ length: MAX_SHADER_ZONES }, () => new THREE.Vector4(0, 0, 0, 0)) },
     uZoneCount: { value: 0 },
   };
-  const groundGeo = new THREE.PlaneGeometry(3600, 3600, 1, 1);
-  groundGeo.rotateX(-Math.PI / 2);
+  const groundGeo = buildIslandTerrainGeometry();
   const groundMesh = new THREE.Mesh(groundGeo, buildEndlessGrassMaterial(grassUniforms));
   groundMesh.receiveShadow = true;
   scene.add(groundMesh);
+
+  const oceanGeo = new THREE.PlaneGeometry(4600, 4600, 1, 1);
+  oceanGeo.rotateX(-Math.PI / 2);
+  const oceanMesh = new THREE.Mesh(oceanGeo, buildIslandOceanMaterial(grassUniforms));
+  oceanMesh.position.set(0, -0.56, 0);
+  oceanMesh.raycast = () => {};
+  scene.add(oceanMesh);
 
   const skyDome = buildFirstPersonSkyDome(grassUniforms.uTime);
   scene.add(skyDome);
@@ -1635,35 +2454,52 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   const citySignboard = createContributorSignboard(maxAniso);
   scene.add(citySignboard.group);
 
-  // Scattered scenic perimeter Meadow Groves (auto-hidden when a new creation claims that clearing!)
+  // Scattered scenic perimeter Meadow Groves + Coastal Shoreline Boulders
   const perimeterTreesGroup = new THREE.Group();
   scene.add(perimeterTreesGroup);
   const treeProtos = [buildMeadowTreeMesh(0), buildMeadowTreeMesh(1), buildMeadowTreeMesh(2)];
   const bushProtos = [buildMeadowBushMesh(0), buildMeadowBushMesh(1), buildMeadowBushMesh(2)];
+  const rockProtos = [buildCoastalRockMesh(0), buildCoastalRockMesh(1), buildCoastalRockMesh(2)];
   const perimeterScenery = [];
   for (let i = 0; i < 46; i++) {
     const r = 44 + ((i * 19) % 92);
     const ang = i * 2.399963 + 0.4;
     const tx = Math.cos(ang) * r;
     const tz = Math.sin(ang) * r;
-    const tree = treeProtos[i % 3].clone();
-    tree.position.set(tx, 0, tz);
-    tree.rotation.y = (i * 1.7) % (Math.PI * 2);
-    const sc = 0.85 + (i % 4) * 0.14;
-    tree.scale.setScalar(sc);
-    perimeterTreesGroup.add(tree);
-    perimeterScenery.push({ mesh: tree, x: tx, z: tz, isTree: true });
+    if (getIslandInlandMargin(tx, tz) >= 6.5) {
+      const tree = treeProtos[i % 3].clone();
+      tree.position.set(tx, 0, tz);
+      tree.rotation.y = (i * 1.7) % (Math.PI * 2);
+      const sc = 0.85 + (i % 4) * 0.14;
+      tree.scale.setScalar(sc);
+      perimeterTreesGroup.add(tree);
+      perimeterScenery.push({ mesh: tree, x: tx, z: tz, isTree: true });
+    }
 
     if (i % 2 === 0) {
-      const bush = bushProtos[i % 3].clone();
       const bAng = ang + 0.05;
       const bx = tx + Math.cos(bAng * 7) * 2.4;
       const bz = tz + Math.sin(bAng * 5) * 2.4;
-      bush.position.set(bx, 0, bz);
-      bush.rotation.y = (i * 2.3) % (Math.PI * 2);
-      perimeterTreesGroup.add(bush);
-      perimeterScenery.push({ mesh: bush, x: bx, z: bz, isTree: false });
+      if (getIslandInlandMargin(bx, bz) >= 6.0) {
+        const bush = bushProtos[i % 3].clone();
+        bush.position.set(bx, 0, bz);
+        bush.rotation.y = (i * 2.3) % (Math.PI * 2);
+        perimeterTreesGroup.add(bush);
+        perimeterScenery.push({ mesh: bush, x: bx, z: bz, isTree: false });
+      }
     }
+  }
+  for (let k = 0; k < 28; k++) {
+    const ang = (k / 28) * Math.PI * 2 + ((k % 3) - 1) * 0.042;
+    const shoreMargin = -3.3 + (k % 4) * 0.85;
+    const [rx, rz] = clampPointToIsland(Math.cos(ang) * 260, Math.sin(ang) * 260, shoreMargin);
+    const ry = getIslandGroundHeight(rx, rz) - 0.12;
+    const rock = rockProtos[k % 3].clone();
+    rock.position.set(rx, ry, rz);
+    rock.rotation.y = (k * 2.17) % (Math.PI * 2);
+    rock.scale.setScalar(0.88 + (k % 4) * 0.18);
+    perimeterTreesGroup.add(rock);
+    perimeterScenery.push({ mesh: rock, x: rx, z: rz, isTree: false, isCoastalRock: true });
   }
 
   // Shared voxel prototypes for the 6 path styles
@@ -1845,7 +2681,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     introSweep.usingFpCam = false;
     fpCamera.fov = getBaseFpFov();
     fpCamera.near = 0.14;
-    fpCamera.far = 520;
+    fpCamera.far = 820;
     fpCamera.updateProjectionMatrix();
 
     if (wasFpSwoop) {
@@ -1862,7 +2698,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         const [rx, rz] = resolveWalkPosition(introSweep.walkX, introSweep.walkZ);
         fp.x = rx;
         fp.z = rz;
-        fp.y = FP_EYE_HEIGHT;
+        fp.y = getIslandGroundHeight(rx, rz) + FP_EYE_HEIGHT;
         fp.yaw = fp.goalYaw = introSweep.walkYaw;
         fp.pitch = fp.goalPitch = introSweep.walkPitch;
         fp.vx = 0;
@@ -1893,7 +2729,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     cam.goalEl = cam.el;
   }
 
-  const CLAMP_BOUND = 175;
+  const CLAMP_BOUND = 185;
   function clampTarget() {
     cam.goalTx = Math.max(-CLAMP_BOUND, Math.min(CLAMP_BOUND, cam.goalTx));
     cam.goalTz = Math.max(-CLAMP_BOUND, Math.min(CLAMP_BOUND, cam.goalTz));
@@ -1901,8 +2737,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
   function isClientSpotClear(x, z, candidateRadius = previewPlotRadius) {
     const rNew = Math.max(1.3, Number(candidateRadius) || 3.3);
-    const bound = Math.max(112, 138 - rNew);
-    if (Math.abs(x) > bound || Math.abs(z) > bound) return false;
+    if (getIslandInlandMargin(x, z) < rNew + 2.2) return false;
     if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < rNew + 2.2) return false;
     if (!currentWorld) return true;
     for (const c of currentWorld.creations || []) {
@@ -1933,8 +2768,8 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   function snapToClearMeadowSpot(rawX, rawZ, candidateRadius = previewPlotRadius) {
-    const cx = Math.max(-132, Math.min(132, rawX));
-    const cz = Math.max(-132, Math.min(132, rawZ));
+    const rNew = Math.max(1.3, Number(candidateRadius) || 3.3);
+    const [cx, cz] = clampPointToIsland(rawX, rawZ, rNew + 2.6);
     if (isClientSpotClear(cx, cz, candidateRadius)) {
       return [Number(cx.toFixed(1)), Number(cz.toFixed(1))];
     }
@@ -2047,7 +2882,10 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   function getCitySignHoverItem() {
-    const n = currentWorld?.contributorCount ?? 0;
+    const n =
+      typeof currentWorld?.contributionCount === "number"
+        ? currentWorld.contributionCount
+        : (currentWorld?.creations || []).filter((c) => !c.isSeed && !c.isCompanion).length;
     const total = currentWorld?.creations?.length ?? 0;
     return {
       id: "__city_sign__",
@@ -2056,9 +2894,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       data: {
         id: "__city_sign__",
         name: "GeminIsland Sign",
-        description: `Timber town signboard displaying ${n} ${n === 1 ? "contributor" : "contributors"} and ${total} creations.`,
+        description: `Timber town signboard displaying ${n} ${n === 1 ? "contribution" : "contributions"} (${total} total builds on the island).`,
         behavior: {
-          statusLine: `${n} ${n === 1 ? "contributor" : "contributors"} · ${total} creations`,
+          statusLine: `${n} ${n === 1 ? "contribution" : "contributions"} · ${total} creations`,
         },
       },
     };
@@ -2443,8 +3281,8 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   function applyWorldSnapshot(world) {
     currentWorld = world;
     const contribCount =
-      typeof world.contributorCount === "number"
-        ? world.contributorCount
+      typeof world.contributionCount === "number"
+        ? world.contributionCount
         : (world.creations || []).filter((c) => !c.isSeed && !c.isCompanion).length;
     citySignboard.updateCount(contribCount);
     updateBiomeShaderUniforms(world.terrainZones || []);
@@ -2460,7 +3298,12 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         existing.rebuildBehavior(c, creationsGroup);
         existing.setLiveFeedReading(liveFeedsById[c.id] || null, maxAniso);
       } else {
-        const ent = new CreationSimEntity(c, idx, callbacks.onInteractiveEvent || null);
+        const ent = new CreationSimEntity(
+          c,
+          idx,
+          callbacks.onInteractiveEvent || null,
+          creationsGroup,
+        );
         if (ogMode) ent.spawnScale = 1.0;
         ent.setLiveFeedReading(liveFeedsById[c.id] || null, maxAniso);
         creationEntities.set(c.id, ent);
@@ -2470,10 +3313,12 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     for (const [id, ent] of creationEntities.entries()) {
       if (!seenIds.has(id)) {
         creationsGroup.remove(ent.group);
-        ent.dispose();
+        ent.dispose(creationsGroup);
         creationEntities.delete(id);
       }
     }
+
+    deBunchVehicleRoutes(creationEntities);
 
     const seenVillagers = new Set();
     world.villagers.forEach((v, idx) => {
@@ -2567,7 +3412,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   function isWalkPointClear(x, z, extraMargin = 0) {
-    if (Math.hypot(x, z) > FP_MAX_RADIUS - extraMargin) return false;
+    if (getIslandInlandMargin(x, z) < -5.0 + extraMargin) return false;
     if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < 2.35 + extraMargin) return false;
     for (const pr of currentWorld?.props || []) {
       if (pr.kind === "pond") {
@@ -2619,18 +3464,17 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           pushOut(ent.x, ent.z, (ent.footprintRadius || 3.4) + 0.58);
         } else if (ent.data.behavior?.type === "vehicle_route") {
           pushOut(ent.x, ent.z, 2.35);
+          if (ent.secondaryVehicle) {
+            pushOut(ent.secondaryVehicle.x, ent.secondaryVehicle.z, 2.35);
+          }
         }
       }
       for (const sc of perimeterScenery) {
-        if (sc.isTree && sc.mesh.visible) {
-          pushOut(sc.x, sc.z, 0.72);
+        if ((sc.isTree || sc.isCoastalRock) && sc.mesh.visible) {
+          pushOut(sc.x, sc.z, sc.isCoastalRock ? 1.15 : 0.72);
         }
       }
-      const r = Math.hypot(x, z);
-      if (r > FP_MAX_RADIUS) {
-        x = (x / r) * FP_MAX_RADIUS;
-        z = (z / r) * FP_MAX_RADIUS;
-      }
+      [x, z] = clampPointToIsland(x, z, -5.0);
     }
     return [x, z];
   }
@@ -2696,7 +3540,8 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     fp.jumpY = 0;
     fp.jumpVy = 0;
     fp.settleT = prefersReducedMotion ? 1 : 0;
-    fp.y = prefersReducedMotion ? FP_EYE_HEIGHT : FP_EYE_HEIGHT + 1.15;
+    const gY = getIslandGroundHeight(fp.x, fp.z);
+    fp.y = gY + (prefersReducedMotion ? FP_EYE_HEIGHT : FP_EYE_HEIGHT + 1.15);
   }
 
   function enterFirstPerson() {
@@ -2791,9 +3636,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   function zoomAt(factor, clientX, clientY) {
-    const next = Math.min(3.4, Math.max(0.38, cam.goalZoom * factor));
+    const next = Math.min(3.4, Math.max(0.22, cam.goalZoom * factor));
     const p = screenToGround(clientX, clientY);
-    if (p && Math.hypot(p[0] - cam.goalTx, p[1] - cam.goalTz) < 95) {
+    if (p && Math.hypot(p[0] - cam.goalTx, p[1] - cam.goalTz) < 135) {
       const k = 1 - cam.goalZoom / next;
       cam.goalTx += (p[0] - cam.goalTx) * k;
       cam.goalTz += (p[1] - cam.goalTz) * k;
@@ -3177,6 +4022,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       if (picked.id !== "__city_sign__") {
         highlightedId = picked.id;
       }
+      picked.triggerEyeSpinFlourish?.();
       picked.interactive?.onInspectFocus?.();
       callbacks.onSelectCreation?.(picked.data, liveFeedsById[picked.id] || null);
     }
@@ -3277,6 +4123,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         if (picked.id !== "__city_sign__") {
           highlightedId = picked.id;
         }
+        picked.triggerEyeSpinFlourish?.();
         const scaleCls = picked.data?.scaleClass;
         let targetZoom =
           scaleCls === "colossal" ? 0.86 : scaleCls === "large" ? 1.28 : scaleCls === "tiny" ? 2.0 : 1.55;
@@ -3371,7 +4218,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     if (fp.active) exitFirstPerson(false);
     if (typeof tx === "number") cam.goalTx = tx;
     if (typeof tz === "number") cam.goalTz = tz;
-    if (typeof zoom === "number") cam.goalZoom = Math.min(3.4, Math.max(0.32, zoom));
+    if (typeof zoom === "number") cam.goalZoom = Math.min(3.4, Math.max(0.22, zoom));
     if (typeof az === "number") cam.goalAz = az;
     if (typeof el === "number") cam.goalEl = Math.max(MIN_EL, Math.min(MAX_EL, el));
     cam.goalTy = typeof ty === "number" ? ty : lowAngleTargetY(cam.goalEl);
@@ -3390,6 +4237,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     const ent = creationEntities.get(id);
     if (!ent) return;
     highlightedId = id;
+    ent.triggerEyeSpinFlourish?.();
     if (fp.active) {
       const stand = Math.max(7.5, (ent.footprintRadius || 3.4) + 5.0);
       placeFirstPersonNear(ent.x, ent.z, fp.yaw, stand, ent.topY);
@@ -3561,7 +4409,8 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       const bobY = Math.sin(fp.bobPhase * 2) * 0.036 * bobBlend;
       const swayX = Math.cos(fp.bobPhase) * 0.016 * bobBlend;
 
-      fp.y = FP_EYE_HEIGHT + settleLift + fp.jumpY + bobY;
+      const groundY = getIslandGroundHeight(fp.x, fp.z);
+      fp.y = groundY + FP_EYE_HEIGHT + settleLift + fp.jumpY + bobY;
       fpCamera.position.set(fp.x + rightX * swayX, fp.y, fp.z + rightZ * swayX);
       fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
       fpCamera.updateMatrixWorld();
@@ -3595,7 +4444,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         });
       }
 
-      groundMesh.position.set(fp.x, 0, fp.z);
+      oceanMesh.position.set(fp.x, -0.56, fp.z);
       grassUniforms.uFocusXZ.value.set(fp.x, fp.z);
       grassUniforms.uHorizonRange.value.set(96, 238);
       updateTexelSnappedSun(fp.x + fwdX * 18, fp.z + fwdZ * 18);
@@ -3616,7 +4465,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         const walkStart = orbitStart + introSweep.orbitDurSec;
 
         if (introSweep.elapsed < panStart) {
-          // Stage 0: Hold close on the GeminIsland Contributor Sign
+          // Stage 0: Hold close on the GeminIsland Contributions Sign
           cam.tx = introSweep.fromTx;
           cam.ty = introSweep.fromTy;
           cam.tz = introSweep.fromTz;
@@ -3701,7 +4550,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
             skyDome.position.set(px, Math.max(0, py - FP_EYE_HEIGHT), pz);
             fpCamera.fov = curFov;
             fpCamera.near = 0.14 + (18.0 - 0.14) * ((1 - e) * (1 - e));
-            fpCamera.far = 520 + 420 * (1 - e);
+            fpCamera.far = 820 + 260 * (1 - e);
             fpCamera.position.set(px, py, pz);
             fpCamera.rotation.set(-curEl, curAz, 0);
             fpCamera.updateProjectionMatrix();
@@ -3733,7 +4582,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
               });
             }
 
-            groundMesh.position.set(groundFocusX, 0, groundFocusZ);
+            oceanMesh.position.set(groundFocusX, -0.56, groundFocusZ);
             grassUniforms.uFocusXZ.value.set(groundFocusX, groundFocusZ);
             grassUniforms.uHorizonRange.value.set(
               145 + (96 - 145) * e,
@@ -3752,7 +4601,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
             const [rx, rz] = resolveWalkPosition(introSweep.walkX, introSweep.walkZ);
             fp.x = rx;
             fp.z = rz;
-            fp.y = FP_EYE_HEIGHT;
+            fp.y = getIslandGroundHeight(rx, rz) + FP_EYE_HEIGHT;
             fp.yaw = fp.goalYaw = introSweep.walkYaw;
             fp.pitch = fp.goalPitch = introSweep.walkPitch;
             fp.vx = 0;
@@ -3774,7 +4623,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
             skyDome.position.set(fp.x, 0, fp.z);
             fpCamera.fov = getBaseFpFov();
             fpCamera.near = 0.14;
-            fpCamera.far = 520;
+            fpCamera.far = 820;
             fpCamera.position.set(fp.x, fp.y, fp.z);
             fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
             fpCamera.updateProjectionMatrix();
@@ -3787,7 +4636,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
             focusWorldZ = fp.z;
             activeAz = fp.yaw;
             viewerPos = fp;
-            groundMesh.position.set(fp.x, 0, fp.z);
+            oceanMesh.position.set(fp.x, -0.56, fp.z);
             grassUniforms.uFocusXZ.value.set(fp.x, fp.z);
             grassUniforms.uHorizonRange.value.set(96, 238);
             updateTexelSnappedSun(
@@ -3847,7 +4696,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           });
         }
 
-        groundMesh.position.set(cam.tx, 0, cam.tz);
+        oceanMesh.position.set(cam.tx, -0.56, cam.tz);
         grassUniforms.uFocusXZ.value.set(cam.tx, cam.tz);
         const lowHorizonT = Math.max(0, Math.min(1, (cam.el - 0.14) / 0.24));
         const lowHorizonSmooth = lowHorizonT * lowHorizonT * (3 - 2 * lowHorizonT);

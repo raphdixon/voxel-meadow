@@ -65,6 +65,7 @@ import {
   computeIntelligentBuildingYaw,
   decongestWorldTraffic,
   FACTUAL_CREATION_DESCRIPTIONS,
+  getIslandInlandMargin,
   normalizeFactualDescription,
   nudgeWanderPointClearOfWorld,
   PERIMETER_TITAN_SEED_LOOP,
@@ -2133,6 +2134,7 @@ export class WorldDO extends DurableObject<Env> {
           .toArray()[0]?.c,
       ) || 0;
     const contributorCount = distinctContributors + unattributedNonSeed;
+    const contributionCount = creations.filter((c) => !c.isSeed && !c.isCompanion).length;
 
     return {
       version: parseInt(this.getMeta("version", "1"), 10) || 1,
@@ -2142,6 +2144,7 @@ export class WorldDO extends DurableObject<Env> {
       terrainZones,
       villagers,
       contributorCount,
+      contributionCount,
       lastWeaveNote: this.getMeta("lastWeaveNote", "GeminIsland humming quietly in the sun."),
     };
   }
@@ -2933,8 +2936,8 @@ export class WorldDO extends DurableObject<Env> {
     ignoreId?: string,
     tightInfill = false,
   ): boolean {
-    const bound = Math.max(115, 142 - newRadius);
-    if (Math.abs(x) > bound || Math.abs(z) > bound) return false;
+    const coastalPad = tightInfill ? 1.8 : 2.6;
+    if (getIslandInlandMargin(x, z) < newRadius + coastalPad) return false;
     const signPad = tightInfill ? 2.15 : 2.8;
     if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < newRadius + signPad) return false;
 

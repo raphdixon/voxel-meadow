@@ -833,6 +833,7 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
     terrainZones,
     villagers,
     contributorCount: 0,
+    contributionCount: 0,
     lastWeaveNote: "Sunnyvale School Bus operating on the Downtown Avenue loop.",
   };
 }

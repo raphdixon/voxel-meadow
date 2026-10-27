@@ -179,7 +179,50 @@ function buildTallyPipMesh(color, emit = 1.2) {
   return buildVoxelMesh(v, { scale: 0.055, depthLayer: 4 });
 }
 
-// ─── 1. Naughts & Crosses (Tic-Tac-Toe) vs Computer AI ───────────────────────
+// ─── Live Gemini Flash-Lite Opponent Client (/api/minigame-move) ─────────────
+async function requestGeminiFlashLiteMove(payload, fallbackValidMoves) {
+  const minBeat = new Promise((r) => setTimeout(r, 260));
+  if (typeof fetch !== "function" || typeof window === "undefined") {
+    await minBeat;
+    return {
+      move: fallbackValidMoves[Math.floor(fallbackValidMoves.length / 2)] ?? fallbackValidMoves[0] ?? -1,
+      quip: "",
+      modelUsed: "offline",
+    };
+  }
+  try {
+    const [res] = await Promise.all([
+      fetch("/api/minigame-move", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-meadow-client": "1",
+        },
+        body: JSON.stringify(payload),
+      }),
+      minBeat,
+    ]);
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.ok && fallbackValidMoves.includes(data.move)) {
+        return {
+          move: data.move,
+          quip: typeof data.quip === "string" ? data.quip.trim() : "",
+          modelUsed: data.modelUsed || "gemini-flash-lite",
+        };
+      }
+    }
+  } catch {
+    // Graceful network hiccup fallback so the 3D board never locks up
+  }
+  return {
+    move: fallbackValidMoves[Math.floor(fallbackValidMoves.length / 2)] ?? fallbackValidMoves[0] ?? -1,
+    quip: "",
+    modelUsed: "fallback",
+  };
+}
+
+// ─── 1. Naughts & Crosses (Tic-Tac-Toe) vs Gemini Flash-Lite ─────────────────
 const TTT_LINES = [
   [0, 1, 2],
   [3, 4, 5],
@@ -202,67 +245,7 @@ function checkTttWinner(board) {
   return null;
 }
 
-function chooseTttComputerMove(board) {
-  const empty = [];
-  for (let i = 0; i < 9; i++) if (board[i] === 0) empty.push(i);
-  if (!empty.length) return -1;
-
-  // 1. Take immediate winning move (CPU = 2)
-  for (const idx of empty) {
-    board[idx] = 2;
-    const res = checkTttWinner(board);
-    board[idx] = 0;
-    if (res?.winner === 2) return idx;
-  }
-  // 2. Block immediate player threat (Player = 1)
-  for (const idx of empty) {
-    board[idx] = 1;
-    const res = checkTttWinner(board);
-    board[idx] = 0;
-    if (res?.winner === 1) return idx;
-  }
-  // 3. Slight human-like variety on opening response so games stay dynamic & winnable by clever forks
-  if (empty.length >= 7 && Math.random() < 0.24) {
-    const cornersAndCenter = empty.filter((i) => i === 4 || i === 0 || i === 2 || i === 6 || i === 8);
-    if (cornersAndCenter.length) {
-      return cornersAndCenter[Math.floor(Math.random() * cornersAndCenter.length)];
-    }
-  }
-  // 4. Minimax optimal scoring
-  const minimax = (b, turn) => {
-    const w = checkTttWinner(b);
-    if (w) return w.winner === 2 ? 10 : w.winner === 1 ? -10 : 0;
-    let best = turn === 2 ? -99 : 99;
-    for (let i = 0; i < 9; i++) {
-      if (b[i] !== 0) continue;
-      b[i] = turn;
-      const sc = minimax(b, turn === 2 ? 1 : 2);
-      b[i] = 0;
-      if (turn === 2) {
-        if (sc > best) best = sc;
-      } else if (sc < best) {
-        best = sc;
-      }
-    }
-    return best;
-  };
-  let bestScore = -999;
-  let candidates = [];
-  for (const idx of empty) {
-    board[idx] = 2;
-    const sc = minimax(board, 1);
-    board[idx] = 0;
-    if (sc > bestScore) {
-      bestScore = sc;
-      candidates = [idx];
-    } else if (sc === bestScore) {
-      candidates.push(idx);
-    }
-  }
-  return candidates[Math.floor(Math.random() * candidates.length)];
-}
-
-function createTicTacToeController(creation, group) {
+function createTicTacToeController(creation, group, onEvent) {
   const root = new THREE.Group();
   group.add(root);
 
@@ -357,8 +340,10 @@ function createTicTacToeController(creation, group) {
   root.add(tallyGroup);
   let playerWins = 0;
   let cpuWins = 0;
-  let cpuPendingSec = -1;
-  let gameOver = null; // { winner: 1|2|3, line, settleSec }
+  let cpuThinking = false;
+  let turnToken = 0;
+  let disposed = false;
+  let gameOver = null; // { winner: 1|2|3, line, age }
 
   function rebuildTally() {
     while (tallyGroup.children.length) tallyGroup.remove(tallyGroup.children[0]);
@@ -391,38 +376,65 @@ function createTicTacToeController(creation, group) {
   }
 
   function resetBoard() {
+    turnToken++;
     board.fill(0);
     gameOver = null;
-    cpuPendingSec = -1;
+    cpuThinking = false;
     thinkOrb.visible = false;
     syncBoardMeshes();
   }
 
-  function placeMark(idx, who) {
+  function placeMark(idx, who, quip = "") {
     board[idx] = who;
     cellHolders[idx].pop = 0.05;
     const outcome = checkTttWinner(board);
     if (outcome) {
       gameOver = { ...outcome, age: 0 };
       syncBoardMeshes();
+      const quipSuffix = quip ? ` · "${quip}"` : "";
       if (outcome.winner === 1) {
         playerWins++;
         rebuildTally();
         playArpeggio([523.25, 659.25, 783.99, 1046.5], 0.075, 0.22, "triangle", 0.085);
-        return `Naughts & Crosses — You win! (${playerWins}–${cpuWins})`;
+        return `Naughts & Crosses — You beat Gemini Flash-Lite! (${playerWins}–${cpuWins})`;
       } else if (outcome.winner === 2) {
         cpuWins++;
         rebuildTally();
         playArpeggio([440, 392, 329.63], 0.09, 0.22, "sawtooth", 0.055);
-        return `Naughts & Crosses — Computer wins! (${playerWins}–${cpuWins})`;
+        return `Naughts & Crosses — Gemini Flash-Lite wins! (${playerWins}–${cpuWins})${quipSuffix}`;
       } else {
         playArpeggio([440, 523.25, 440], 0.08, 0.18, "triangle", 0.065);
-        return `Naughts & Crosses — Draw! Click any square for rematch`;
+        return `Naughts & Crosses — Draw vs Gemini Flash-Lite!${quipSuffix}`;
       }
     }
     syncBoardMeshes();
     playTone(who === 1 ? 587.33 : 440, 0.11, "triangle", 0.075);
-    return null;
+    return quip ? `Gemini Flash-Lite — "${quip}"` : null;
+  }
+
+  function askGeminiFlashLiteTurn() {
+    const empty = [];
+    for (let i = 0; i < 9; i++) if (board[i] === 0) empty.push(i);
+    if (!empty.length) return;
+    const myToken = ++turnToken;
+    cpuThinking = true;
+    thinkOrb.visible = true;
+    requestGeminiFlashLiteMove(
+      {
+        game: "tic_tac_toe",
+        board: [...board],
+        creationName: creation.name,
+      },
+      empty,
+    ).then((reply) => {
+      if (disposed || myToken !== turnToken || gameOver) return;
+      cpuThinking = false;
+      thinkOrb.visible = false;
+      if (reply.move >= 0 && board[reply.move] === 0) {
+        const aiMsg = placeMark(reply.move, 2, reply.quip);
+        if (aiMsg) onEvent?.(aiMsg);
+      }
+    });
   }
 
   return {
@@ -431,7 +443,13 @@ function createTicTacToeController(creation, group) {
     extraRadius,
     setHovered(action) {
       const idx = action?.cell;
-      if (typeof idx === "number" && idx >= 0 && idx < 9 && (board[idx] === 0 || gameOver)) {
+      if (
+        !cpuThinking &&
+        typeof idx === "number" &&
+        idx >= 0 &&
+        idx < 9 &&
+        (board[idx] === 0 || gameOver)
+      ) {
         const [cx, cz] = cellCenters[idx];
         hoverBracket.position.set(cx, pieceBaseY + 0.02, cz);
         hoverBracket.visible = true;
@@ -447,36 +465,24 @@ function createTicTacToeController(creation, group) {
         resetBoard();
         if (idx >= 0 && idx < 9) {
           const msg = placeMark(idx, 1);
-          if (!gameOver) {
-            cpuPendingSec = 0.42;
-            thinkOrb.visible = true;
-          }
+          if (!gameOver) askGeminiFlashLiteTurn();
           return msg;
         }
         return null;
       }
-      if (cpuPendingSec > 0) return null;
+      if (cpuThinking) return null;
       if (idx < 0 || idx >= 9 || board[idx] !== 0) return null;
       const msg = placeMark(idx, 1);
-      if (!gameOver) {
-        cpuPendingSec = 0.42;
-        thinkOrb.visible = true;
-      }
+      if (!gameOver) askGeminiFlashLiteTurn();
       return msg;
     },
     step(dt, t) {
       if (hoverBracket.visible) {
         hoverBracket.position.y = pieceBaseY + 0.025 + Math.sin(t * 6.0) * 0.015;
       }
-      if (cpuPendingSec > 0) {
+      if (cpuThinking) {
         thinkOrb.position.set(0, pieceBaseY + 0.36 + Math.sin(t * 10) * 0.05, -cellStep * 1.55);
         thinkOrb.rotation.y = t * 4.5;
-        cpuPendingSec -= dt;
-        if (cpuPendingSec <= 0) {
-          thinkOrb.visible = false;
-          const mv = chooseTttComputerMove(board);
-          if (mv >= 0) placeMark(mv, 2);
-        }
       }
       if (gameOver) {
         gameOver.age += dt;
@@ -498,6 +504,8 @@ function createTicTacToeController(creation, group) {
       }
     },
     dispose() {
+      disposed = true;
+      turnToken++;
       protoX.geometry.dispose();
       protoO.geometry.dispose();
       protoXWin.geometry.dispose();
@@ -510,7 +518,7 @@ function createTicTacToeController(creation, group) {
   };
 }
 
-// ─── 2. Connect Four (7x6 Vertical Drop Frame vs Computer AI) ────────────────
+// ─── 2. Connect Four (7x6 Vertical Drop Frame vs Gemini Flash-Lite) ──────────
 function checkConnectFourWin(grid) {
   // grid[col][row], 7 cols x 6 rows (row 0 = bottom)
   const dirs = [
@@ -539,58 +547,7 @@ function checkConnectFourWin(grid) {
   return full ? { winner: 3, cells: [] } : null;
 }
 
-function chooseConnectFourCpuCol(grid) {
-  const openRow = (col) => grid[col].indexOf(0);
-  const validCols = [0, 1, 2, 3, 4, 5, 6].filter((c) => openRow(c) !== -1);
-  if (!validCols.length) return -1;
-
-  // 1. Immediate win (CPU = 2)
-  for (const c of validCols) {
-    const r = openRow(c);
-    grid[c][r] = 2;
-    const w = checkConnectFourWin(grid);
-    grid[c][r] = 0;
-    if (w?.winner === 2) return c;
-  }
-  // 2. Immediate block (Player = 1)
-  for (const c of validCols) {
-    const r = openRow(c);
-    grid[c][r] = 1;
-    const w = checkConnectFourWin(grid);
-    grid[c][r] = 0;
-    if (w?.winner === 1) return c;
-  }
-  // 3. Score columns: prefer center, avoid gifting Player a win directly on r+1
-  let bestScore = -9999;
-  let bestCols = [];
-  for (const c of validCols) {
-    const r = openRow(c);
-    let score = (3 - Math.abs(c - 3)) * 4;
-    grid[c][r] = 2;
-    if (r + 1 < 6) {
-      grid[c][r + 1] = 1;
-      if (checkConnectFourWin(grid)?.winner === 1) score -= 50;
-      grid[c][r + 1] = 0;
-    }
-    // Bonus for adjacent CPU discs
-    for (const [dc, dr] of [[1, 0], [-1, 0], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) {
-      const nc = c + dc;
-      const nr = r + dr;
-      if (nc >= 0 && nc < 7 && nr >= 0 && nr < 6 && grid[nc][nr] === 2) score += 5;
-    }
-    grid[c][r] = 0;
-    score += Math.random() * 2.2;
-    if (score > bestScore) {
-      bestScore = score;
-      bestCols = [c];
-    } else if (Math.abs(score - bestScore) < 0.5) {
-      bestCols.push(c);
-    }
-  }
-  return bestCols[0] ?? validCols[0];
-}
-
-function createConnectFourController(creation, group) {
+function createConnectFourController(creation, group, onEvent) {
   const root = new THREE.Group();
   group.add(root);
 
@@ -639,6 +596,10 @@ function createConnectFourController(creation, group) {
   hoverDisc.visible = false;
   root.add(hoverDisc);
 
+  const thinkDisc = makeDisc("#ffd24c", 1.5);
+  thinkDisc.visible = false;
+  root.add(thinkDisc);
+
   const colX = (c) => (-14 + c * 4 + 1.5) * voxS;
   const rowY = (r) => baseY + (2 + r * 4 + 1.5) * voxS;
   const dropStartY = baseY + 30 * voxS;
@@ -656,18 +617,22 @@ function createConnectFourController(creation, group) {
   const discsGroup = new THREE.Group();
   root.add(discsGroup);
 
-  let cpuDelay = -1;
+  let cpuThinking = false;
+  let turnToken = 0;
+  let disposed = false;
   let gameOver = null;
 
   function clearGame() {
+    turnToken++;
     for (let c = 0; c < 7; c++) grid[c].fill(0);
     discs.length = 0;
     while (discsGroup.children.length) discsGroup.remove(discsGroup.children[0]);
     gameOver = null;
-    cpuDelay = -1;
+    cpuThinking = false;
+    thinkDisc.visible = false;
   }
 
-  function dropInColumn(c, who) {
+  function dropInColumn(c, who, quip = "") {
     const r = grid[c].indexOf(0);
     if (r === -1) return null;
     grid[c][r] = who;
@@ -698,17 +663,42 @@ function createConnectFourController(creation, group) {
           d.mesh.geometry = protoWin.geometry;
         }
       }
+      const quipSuffix = quip ? ` · "${quip}"` : "";
       if (outcome.winner === 1) {
         playArpeggio([523.25, 659.25, 783.99, 1046.5], 0.08, 0.24, "triangle", 0.085);
-        return "Connect Four — Four in a row! You win!";
+        return "Connect Four — Four in a row! You beat Gemini Flash-Lite!";
       }
       if (outcome.winner === 2) {
         playArpeggio([440, 349.23, 293.66], 0.09, 0.24, "sawtooth", 0.055);
-        return "Connect Four — Computer connected four!";
+        return `Connect Four — Gemini Flash-Lite connected four!${quipSuffix}`;
       }
-      return "Connect Four — Full frame draw!";
+      return `Connect Four — Full frame draw vs Gemini Flash-Lite!${quipSuffix}`;
     }
-    return null;
+    return quip ? `Gemini Flash-Lite — "${quip}"` : null;
+  }
+
+  function askGeminiFlashLiteColumn() {
+    const validCols = [0, 1, 2, 3, 4, 5, 6].filter((col) => grid[col].indexOf(0) !== -1);
+    if (!validCols.length) return;
+    const myToken = ++turnToken;
+    cpuThinking = true;
+    thinkDisc.visible = true;
+    requestGeminiFlashLiteMove(
+      {
+        game: "connect_four",
+        grid: grid.map((col) => [...col]),
+        creationName: creation.name,
+      },
+      validCols,
+    ).then((reply) => {
+      if (disposed || myToken !== turnToken || gameOver) return;
+      cpuThinking = false;
+      thinkDisc.visible = false;
+      if (reply.move >= 0 && reply.move < 7 && grid[reply.move].indexOf(0) !== -1) {
+        const aiMsg = dropInColumn(reply.move, 2, reply.quip);
+        if (aiMsg) onEvent?.(aiMsg);
+      }
+    });
   }
 
   return {
@@ -717,7 +707,13 @@ function createConnectFourController(creation, group) {
     extraRadius,
     setHovered(action) {
       const c = action?.col;
-      if (typeof c === "number" && c >= 0 && c < 7 && (grid[c].indexOf(0) !== -1 || gameOver)) {
+      if (
+        !cpuThinking &&
+        typeof c === "number" &&
+        c >= 0 &&
+        c < 7 &&
+        (grid[c].indexOf(0) !== -1 || gameOver)
+      ) {
         hoverDisc.position.set(colX(c), dropStartY, 0);
         hoverDisc.visible = true;
       } else {
@@ -732,26 +728,23 @@ function createConnectFourController(creation, group) {
         clearGame();
         if (c >= 0 && c < 7) {
           const msg = dropInColumn(c, 1);
-          if (!gameOver) cpuDelay = 0.48;
+          if (!gameOver) askGeminiFlashLiteColumn();
           return msg;
         }
         return null;
       }
-      if (cpuDelay > 0 || c < 0 || c >= 7 || grid[c].indexOf(0) === -1) return null;
+      if (cpuThinking || c < 0 || c >= 7 || grid[c].indexOf(0) === -1) return null;
       const msg = dropInColumn(c, 1);
-      if (!gameOver) cpuDelay = 0.48;
+      if (!gameOver) askGeminiFlashLiteColumn();
       return msg;
     },
     step(dt, t) {
       if (hoverDisc.visible) {
         hoverDisc.position.y = dropStartY + Math.sin(t * 6.5) * 0.035;
       }
-      if (cpuDelay > 0) {
-        cpuDelay -= dt;
-        if (cpuDelay <= 0 && !gameOver) {
-          const cpuCol = chooseConnectFourCpuCol(grid);
-          if (cpuCol >= 0) dropInColumn(cpuCol, 2);
-        }
+      if (cpuThinking) {
+        thinkDisc.position.set(Math.sin(t * 3.8) * 3 * voxS, dropStartY + 0.06, 0);
+        thinkDisc.rotation.y = t * 4.2;
       }
       if (gameOver) gameOver.age += dt;
       for (const d of discs) {
@@ -775,11 +768,14 @@ function createConnectFourController(creation, group) {
       }
     },
     dispose() {
+      disposed = true;
+      turnToken++;
       frameMesh.geometry.dispose();
       protoP1.geometry.dispose();
       protoCpu.geometry.dispose();
       protoWin.geometry.dispose();
       hoverDisc.geometry.dispose();
+      thinkDisc.geometry.dispose();
       hitMeshes.forEach((m) => m.geometry.dispose());
     },
   };
@@ -2327,14 +2323,14 @@ function createMarbleRunController(creation, group) {
 }
 
 // ─── Factory Dispatcher ──────────────────────────────────────────────────────
-export function createInteractiveController(creation, group) {
+export function createInteractiveController(creation, group, onEvent = null) {
   const kind = creation?.blueprint?.interaction?.kind;
   if (!kind) return null;
   switch (kind) {
     case "tic_tac_toe":
-      return createTicTacToeController(creation, group);
+      return createTicTacToeController(creation, group, onEvent);
     case "connect_four":
-      return createConnectFourController(creation, group);
+      return createConnectFourController(creation, group, onEvent);
     case "whack_a_mole":
       return createWhackAMoleController(creation, group);
     case "floor_piano":

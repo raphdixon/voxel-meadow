@@ -1,5 +1,6 @@
 import { sculptWithArgon } from "./argon_sculptor";
 import { resolveWorldLiveFeeds } from "./live_feeds";
+import { chooseMoveWithGeminiFlashLite, validateMinigameRequest } from "./minigame_ai";
 import { refreshDailyOgScreenshotsIfDue } from "./og_renderer";
 import {
   buildSecurityHeaders,
@@ -23,7 +24,25 @@ import { WorldDO } from "./world_do";
 
 export { WorldDO };
 
-type AppEnv = Env & { ENABLE_DEV_ENDPOINTS?: string };
+type AppEnv = Env & { ENABLE_DEV_ENDPOINTS?: string; MINIGAME_MODEL?: string };
+
+const minigameBuckets = new Map<string, { windowStart: number; count: number }>();
+function allowMinigameMove(ipHash: string): boolean {
+  const now = Date.now();
+  if (minigameBuckets.size > 1024) {
+    for (const [k, b] of minigameBuckets.entries()) {
+      if (now - b.windowStart > 60_000) minigameBuckets.delete(k);
+    }
+  }
+  const cur = minigameBuckets.get(ipHash);
+  if (!cur || now - cur.windowStart > 60_000) {
+    minigameBuckets.set(ipHash, { windowStart: now, count: 1 });
+    return true;
+  }
+  if (cur.count >= 90) return false;
+  cur.count++;
+  return true;
+}
 
 function jsonResponse(
   request: Request,
@@ -228,6 +247,47 @@ export default {
           200,
           { "cache-control": "public, max-age=5" },
         );
+      }
+
+      // Live in-world board game opponent powered by Gemini Flash-Lite (using env.GEMINI_API_KEY)
+      if (url.pathname === "/api/minigame-move") {
+        if (request.method !== "POST") {
+          return jsonResponse(request, { ok: false, error: "Method not allowed." }, 405);
+        }
+        const csrfErr = verifyMutationSecurity(request);
+        if (csrfErr) {
+          return jsonResponse(request, { ok: false, error: csrfErr }, 403);
+        }
+        if (!env.GEMINI_API_KEY) {
+          return jsonResponse(
+            request,
+            { ok: false, error: "Gemini opponent is temporarily unavailable." },
+            503,
+          );
+        }
+        const id = await resolveVisitorIdentity(request, env);
+        if (!allowMinigameMove(id.ipHash)) {
+          return jsonResponse(
+            request,
+            { ok: false, error: "Too many rapid moves — pause a moment." },
+            429,
+          );
+        }
+        const parsedBody = await readBoundedJsonBody(request, 8_192);
+        if (!parsedBody.ok) {
+          return jsonResponse(request, { ok: false, error: parsedBody.error }, parsedBody.status);
+        }
+        const validated = validateMinigameRequest(parsedBody.data);
+        if (!validated.ok) {
+          return jsonResponse(request, { ok: false, error: validated.error }, 400);
+        }
+        const result = await chooseMoveWithGeminiFlashLite({
+          apiKey: env.GEMINI_API_KEY,
+          configuredModel: env.MINIGAME_MODEL,
+          req: validated.req,
+          validMoves: validated.validMoves,
+        });
+        return jsonResponse(request, { ok: true, ...result }, 200);
       }
 
       // Enqueue build into the multi-user FIFO workshop queue (handles 10-40+ simultaneous builders cleanly)

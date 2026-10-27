@@ -816,10 +816,11 @@ function computeBlueprintSignature(bp) {
 }
 
 class CreationSimEntity {
-  constructor(creation, index = 0) {
+  constructor(creation, index = 0, onInteractiveEvent = null) {
     this.id = creation.id;
     this.index = index;
     this.data = creation;
+    this.onInteractiveEvent = onInteractiveEvent;
     this.blueprintSig = computeBlueprintSignature(creation.blueprint);
     this.group = buildCreationGroup(creation.blueprint, {
       seed: 17 + index * 13,
@@ -965,7 +966,9 @@ class CreationSimEntity {
     const desiredInteractionKind = creation.blueprint?.interaction?.kind || null;
     if (!this.interactive || rebuiltGroup || this.interactive.kind !== desiredInteractionKind) {
       this.interactive?.dispose?.();
-      this.interactive = createInteractiveController(creation, this.group);
+      this.interactive = createInteractiveController(creation, this.group, (msg) => {
+        this.onInteractiveEvent?.(this.data, msg);
+      });
     }
     if (this.interactive?.extraRadius > 0) {
       this.footprintRadius = Math.max(this.footprintRadius, this.interactive.extraRadius);
@@ -2453,10 +2456,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       seenIds.add(c.id);
       const existing = creationEntities.get(c.id);
       if (existing) {
+        existing.onInteractiveEvent = callbacks.onInteractiveEvent || null;
         existing.rebuildBehavior(c, creationsGroup);
         existing.setLiveFeedReading(liveFeedsById[c.id] || null, maxAniso);
       } else {
-        const ent = new CreationSimEntity(c, idx);
+        const ent = new CreationSimEntity(c, idx, callbacks.onInteractiveEvent || null);
         if (ogMode) ent.spawnScale = 1.0;
         ent.setLiveFeedReading(liveFeedsById[c.id] || null, maxAniso);
         creationEntities.set(c.id, ent);

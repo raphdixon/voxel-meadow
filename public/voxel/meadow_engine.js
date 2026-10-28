@@ -15,7 +15,7 @@ import {
   SMAAPass,
   UnrealBloomPass,
 } from "../vendor/three-bundle.js";
-import { VillagerAgent, buildWorldPropMesh } from "./villagers.js";
+import { VillagerAgent, buildBatchedWorldProps, buildWorldPropMesh } from "./villagers.js";
 import { INTERACTIVE_HIT_LAYER, createInteractiveController } from "./interactive_games.js";
 import {
   Vox,
@@ -24,6 +24,7 @@ import {
   buildVoxelMesh,
   getCreationFootprintRadius,
   getWorldVoxelSize,
+  mergeVoxelMeshInstances,
 } from "./vox.js";
 
 const CITY_SIGN_POS = [3.8, -10.8];
@@ -725,18 +726,143 @@ function buildEndlessGrassMaterial(uniforms) {
 
 function buildIslandTerrainGeometry() {
   const size = 408;
-  const segs = 256;
-  const geo = new THREE.PlaneGeometry(size, size, segs, segs);
-  geo.rotateX(-Math.PI / 2);
-  const pos = geo.attributes.position;
-  for (let i = 0; i < pos.count; i++) {
-    const x = pos.getX(i);
-    const z = pos.getZ(i);
-    const y = getIslandGroundHeight(x, z);
-    pos.setY(i, y);
+  const half = size * 0.5;
+  const fineSegs = 256;
+  const macroSegs = 32;
+  const sub = fineSegs / macroSegs; // 8 fine steps per macro cell
+  const step = size / fineSegs;
+  const gridStride = fineSegs + 1;
+
+  // Classify each 12.75m x 12.75m macro cell: coastal slope/cliff band gets full 1.59m resolution;
+  // strictly flat y=0 interior plateau and deep seabed under the opaque ocean use coarse quads.
+  const isFine = new Uint8Array(macroSegs * macroSegs);
+  for (let mz = 0; mz < macroSegs; mz++) {
+    for (let mx = 0; mx < macroSegs; mx++) {
+      let fine = 0;
+      for (let sz = 0; sz <= 2 && !fine; sz++) {
+        const z = -half + (mz * sub + sz * (sub * 0.5)) * step;
+        for (let sx = 0; sx <= 2; sx++) {
+          const x = -half + (mx * sub + sx * (sub * 0.5)) * step;
+          const m = getIslandInlandMargin(x, z);
+          if (m < 5.5 && m > -25.5) {
+            fine = 1;
+            break;
+          }
+        }
+      }
+      isFine[mz * macroSegs + mx] = fine;
+    }
   }
-  pos.needsUpdate = true;
-  geo.computeVertexNormals();
+
+  const vertMap = new Int32Array(gridStride * gridStride);
+  vertMap.fill(-1);
+  const positions = [];
+  const normals = [];
+  const uvs = [];
+  const indices = [];
+
+  const getVert = (gx, gz) => {
+    const key = gz * gridStride + gx;
+    let idx = vertMap[key];
+    if (idx !== -1) return idx;
+    idx = positions.length / 3;
+    vertMap[key] = idx;
+    const x = -half + gx * step;
+    const z = -half + gz * step;
+    const m = getIslandInlandMargin(x, z);
+    const y = m >= 0 ? 0 : getIslandGroundHeight(x, z);
+    positions.push(x, y, z);
+    uvs.push(gx / fineSegs, 1 - gz / fineSegs);
+    if (m >= 1.8) {
+      normals.push(0, 1, 0);
+    } else {
+      const yL = getIslandGroundHeight(x - step, z);
+      const yR = getIslandGroundHeight(x + step, z);
+      const yD = getIslandGroundHeight(x, z - step);
+      const yU = getIslandGroundHeight(x, z + step);
+      const nx = yL - yR;
+      const ny = 2 * step;
+      const nz = yD - yU;
+      const nLen = Math.hypot(nx, ny, nz) || 1;
+      normals.push(nx / nLen, ny / nLen, nz / nLen);
+    }
+    return idx;
+  };
+
+  for (let mz = 0; mz < macroSegs; mz++) {
+    const gz0 = mz * sub;
+    for (let mx = 0; mx < macroSegs; mx++) {
+      const gx0 = mx * sub;
+      if (isFine[mz * macroSegs + mx]) {
+        for (let dz = 0; dz < sub; dz++) {
+          const r0 = gz0 + dz;
+          const r1 = r0 + 1;
+          for (let dx = 0; dx < sub; dx++) {
+            const c0 = gx0 + dx;
+            const c1 = c0 + 1;
+            const nw = getVert(c0, r0);
+            const ne = getVert(c1, r0);
+            const sw = getVert(c0, r1);
+            const se = getVert(c1, r1);
+            indices.push(nw, sw, ne, sw, se, ne);
+          }
+        }
+      } else {
+        const fineN = mz > 0 && isFine[(mz - 1) * macroSegs + mx] === 1;
+        const fineS = mz + 1 < macroSegs && isFine[(mz + 1) * macroSegs + mx] === 1;
+        const fineW = mx > 0 && isFine[mz * macroSegs + (mx - 1)] === 1;
+        const fineE = mx + 1 < macroSegs && isFine[mz * macroSegs + (mx + 1)] === 1;
+        if (!fineN && !fineS && !fineW && !fineE) {
+          const nw = getVert(gx0, gz0);
+          const ne = getVert(gx0 + sub, gz0);
+          const sw = getVert(gx0, gz0 + sub);
+          const se = getVert(gx0 + sub, gz0 + sub);
+          indices.push(nw, sw, ne, sw, se, ne);
+        } else {
+          // Crack-free center-fan stitch between coarse interior cells and 8x8 fine coastal cells
+          const center = getVert(gx0 + (sub >> 1), gz0 + (sub >> 1));
+          if (fineN) {
+            for (let i = 0; i < sub; i++) {
+              indices.push(center, getVert(gx0 + i + 1, gz0), getVert(gx0 + i, gz0));
+            }
+          } else {
+            indices.push(center, getVert(gx0 + sub, gz0), getVert(gx0, gz0));
+          }
+          if (fineW) {
+            for (let i = 0; i < sub; i++) {
+              indices.push(center, getVert(gx0, gz0 + i), getVert(gx0, gz0 + i + 1));
+            }
+          } else {
+            indices.push(center, getVert(gx0, gz0), getVert(gx0, gz0 + sub));
+          }
+          if (fineS) {
+            for (let i = 0; i < sub; i++) {
+              indices.push(center, getVert(gx0 + i, gz0 + sub), getVert(gx0 + i + 1, gz0 + sub));
+            }
+          } else {
+            indices.push(center, getVert(gx0, gz0 + sub), getVert(gx0 + sub, gz0 + sub));
+          }
+          if (fineE) {
+            for (let i = 0; i < sub; i++) {
+              indices.push(center, getVert(gx0 + sub, gz0 + i + 1), getVert(gx0 + sub, gz0 + i));
+            }
+          } else {
+            indices.push(center, getVert(gx0 + sub, gz0 + sub), getVert(gx0 + sub, gz0));
+          }
+        }
+      }
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
+  geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(
+    positions.length / 3 <= 65535
+      ? new THREE.Uint16BufferAttribute(indices, 1)
+      : new THREE.Uint32BufferAttribute(indices, 1),
+  );
   geo.computeBoundingSphere();
   return geo;
 }
@@ -856,14 +982,30 @@ function buildCoastalRockMesh(variant = 0) {
   return buildVoxelMesh(v, { scale: 0.32 });
 }
 
-function buildRibbonMesh(
+const sharedRibbonMatCache = new Map();
+
+function getSharedRibbonMaterial(polyOffset) {
+  let mat = sharedRibbonMatCache.get(polyOffset);
+  if (!mat) {
+    mat = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      roughness: 0.88,
+      metalness: 0.02,
+      polygonOffset: true,
+      polygonOffsetFactor: polyOffset,
+      polygonOffsetUnits: polyOffset * 1.5,
+    });
+    sharedRibbonMatCache.set(polyOffset, mat);
+  }
+  return mat;
+}
+
+function buildRibbonSliceData(
   curve,
   sampleCount,
   halfWidth,
   yOffset,
   colorHex,
-  receiveShadow = true,
-  polyOffset = -1,
   roundCaps = true,
 ) {
   const pts = curve.getSpacedPoints(sampleCount);
@@ -992,23 +1134,68 @@ function buildRibbonMesh(
     appendCap(pts[last], eDx / eLen, eDz / eLen);
   }
 
+  const col = new THREE.Color(colorHex);
+  return {
+    positions,
+    normals,
+    uvs,
+    indices,
+    r: col.r,
+    g: col.g,
+    b: col.b,
+  };
+}
+
+function buildMergedRibbonMesh(slices, polyOffset = -1, receiveShadow = true) {
+  if (!slices || slices.length === 0) return null;
+  let totalVerts = 0;
+  let totalIndices = 0;
+  for (const s of slices) {
+    totalVerts += s.positions.length / 3;
+    totalIndices += s.indices.length;
+  }
+  if (totalVerts === 0 || totalIndices === 0) return null;
+
+  const posOut = new Float32Array(totalVerts * 3);
+  const normOut = new Float32Array(totalVerts * 3);
+  const colOut = new Float32Array(totalVerts * 3);
+  const uvOut = new Float32Array(totalVerts * 2);
+  const idxOut =
+    totalVerts <= 65535 ? new Uint16Array(totalIndices) : new Uint32Array(totalIndices);
+
+  let vCur = 0;
+  let iCur = 0;
+  for (const s of slices) {
+    const vCount = s.positions.length / 3;
+    posOut.set(s.positions, vCur * 3);
+    normOut.set(s.normals, vCur * 3);
+    uvOut.set(s.uvs, vCur * 2);
+    for (let v = 0; v < vCount; v++) {
+      const o3 = (vCur + v) * 3;
+      colOut[o3] = s.r;
+      colOut[o3 + 1] = s.g;
+      colOut[o3 + 2] = s.b;
+    }
+    for (let k = 0; k < s.indices.length; k++) {
+      idxOut[iCur + k] = s.indices[k] + vCur;
+    }
+    vCur += vCount;
+    iCur += s.indices.length;
+  }
+
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  geo.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
-  geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
-  geo.setIndex(indices);
+  geo.setAttribute("position", new THREE.BufferAttribute(posOut, 3));
+  geo.setAttribute("normal", new THREE.BufferAttribute(normOut, 3));
+  geo.setAttribute("color", new THREE.BufferAttribute(colOut, 3));
+  geo.setAttribute("uv", new THREE.BufferAttribute(uvOut, 2));
+  geo.setIndex(new THREE.BufferAttribute(idxOut, 1));
   geo.computeBoundingSphere();
 
-  const mat = new THREE.MeshStandardMaterial({
-    color: colorHex,
-    roughness: 0.88,
-    metalness: 0.02,
-    polygonOffset: true,
-    polygonOffsetFactor: polyOffset,
-    polygonOffsetUnits: polyOffset * 1.5,
-  });
-  const mesh = new THREE.Mesh(geo, mat);
+  const mesh = new THREE.Mesh(geo, getSharedRibbonMaterial(polyOffset));
   mesh.receiveShadow = receiveShadow;
+  mesh.matrixAutoUpdate = false;
+  mesh.updateMatrix();
+  mesh.userData.sharedMaterial = true;
   return mesh;
 }
 
@@ -1058,14 +1245,16 @@ function isDualTransitCreation(creation) {
   return parts.some((p) => /^waratah/i.test(p.name)) && parts.some((p) => /^tram/i.test(p.name));
 }
 
-function computeRouteBuildingDetour(posX, posZ, rightX, rightZ, baseLane, allEntities, selfEnt) {
+function computeRouteBuildingDetour(posX, posZ, rightX, rightZ, baseLane, buildingEntities, selfEnt) {
   let extraOffset = 0;
-  for (const other of allEntities) {
+  for (let i = 0; i < buildingEntities.length; i++) {
+    const other = buildingEntities[i];
     if (other === selfEnt) continue;
     if (other.data.category !== "building" && other.data.behavior?.type !== "landmark") continue;
     const clearR = (other.footprintRadius || 3.8) + 2.25;
     const dx = other.x - posX;
     const dz = other.z - posZ;
+    if (Math.abs(dx) > clearR + 4.5 || Math.abs(dz) > clearR + 4.5) continue;
     const centerDist = Math.hypot(dx, dz);
     if (centerDist > clearR + 4.5) continue;
 
@@ -1182,6 +1371,7 @@ class CreationSimEntity {
 
     this.orbitAngle = (index * 1.9) % (Math.PI * 2);
     this.interactive = null;
+    this.staticRootFrozen = false;
 
     // Las Vegas Emoji Sphere eye-tracking & playful spin state
     this.eyeGazeX = 0;
@@ -1194,6 +1384,17 @@ class CreationSimEntity {
     this.group.position.set(this.x, this.y, this.z);
     this.group.rotation.y = this.yaw;
     this.group.scale.setScalar(this.spawnScale);
+  }
+
+  unfreezeStaticRoot() {
+    if (!this.staticRootFrozen) return;
+    this.staticRootFrozen = false;
+    if (this.group) {
+      this.group.matrixAutoUpdate = true;
+      for (const ch of this.group.children) {
+        if (ch.isMesh) ch.matrixAutoUpdate = true;
+      }
+    }
   }
 
   createSecondaryVehicleState(secGroup) {
@@ -1232,6 +1433,7 @@ class CreationSimEntity {
       return;
     }
     if (!this.feedMesh) {
+      this.unfreezeStaticRoot();
       this.feedCanvas = document.createElement("canvas");
       this.feedCanvas.width = 512;
       this.feedCanvas.height = 116;
@@ -1259,6 +1461,7 @@ class CreationSimEntity {
   }
 
   rebuildBehavior(creation, creationsGroup = null) {
+    this.unfreezeStaticRoot();
     const wasStationary = this.data?.behavior?.type === "landmark";
     this.data = creation;
     this.isDualTransit = isDualTransitCreation(creation);
@@ -1674,17 +1877,64 @@ class CreationSimEntity {
     applyEye(rightEye, 4.5, 21.85, 2.48, 2.85, -1);
   }
 
-  step(dt, t, allEntities = [], ponds = [], camAz = 0.62, viewerPos = null) {
+  step(dt, t, allEntities = [], ponds = [], camAz = 0.62, viewerPos = null, simCtx = null) {
+    const b = this.data.behavior;
+    const bType = b?.type;
+    const isStationaryLandmark =
+      bType !== "vehicle_route" &&
+      bType !== "wander" &&
+      bType !== "water_float" &&
+      bType !== "fly_circle";
+
+    if (isStationaryLandmark && this.staticRootFrozen) {
+      const animFn = this.group.userData?.animate;
+      const hasFeed = Boolean(this.feedMesh && this.feedMesh.visible);
+      if (!this.interactive && !this.isVegasSphere && !hasFeed && !animFn) {
+        return;
+      }
+      if (this.feedReading?.kind === "wind" && typeof this.feedReading.value === "number") {
+        this.moveFactor = Math.max(0.45, Math.min(2.1, this.feedReading.value / 15));
+      } else {
+        this.moveFactor = 1.0;
+      }
+      this.interactive?.step?.(dt, t, {
+        viewerPos,
+        entX: this.x,
+        entZ: this.z,
+        entYaw: this.yaw,
+      });
+      if (hasFeed) {
+        this.feedMesh.position.y = this.topY + 1.15 + Math.sin(t * 2.1) * 0.05;
+        const targetAz = viewerPos
+          ? Math.atan2(viewerPos.x - this.x, viewerPos.z - this.z)
+          : camAz;
+        this.feedMesh.rotation.y = targetAz - this.yaw;
+      }
+      if (animFn) {
+        const dxF = simCtx ? this.x - simCtx.focusX : 0;
+        const dzF = simCtx ? this.z - simCtx.focusZ : 0;
+        const farAway = simCtx && dxF * dxF + dzF * dzF > 95 * 95;
+        if (!farAway || ((simCtx.frameTick + this.index) & 1) === 0) {
+          animFn(t, { wheelAngle: 0, moveFactor: this.moveFactor });
+        }
+      }
+      if (this.isVegasSphere) {
+        this.updateVegasSphereEyes(dt, t, simCtx?.vehicles || allEntities);
+      }
+      return;
+    }
+
     if (this.spawnScale < 1.0) {
       this.spawnScale = Math.min(1.0, this.spawnScale + dt * 3.2);
     }
 
-    const b = this.data.behavior;
+    const vehiclePeers = simCtx?.vehicles || allEntities;
+    const buildingPeers = simCtx?.buildings || allEntities;
     this.moveFactor = 0;
     let pitchX = 0;
     let rollZ = 0;
 
-    if (b?.type === "vehicle_route" && this.routeCurve) {
+    if (bType === "vehicle_route" && this.routeCurve) {
       const prevWorldX = this.x;
       const prevWorldZ = this.z;
       let targetLane = this.isDualTransit ? 0.58 : 0.92;
@@ -1753,7 +2003,7 @@ class CreationSimEntity {
           const curRightZ = Math.sin(this.yaw);
           let yielding = false;
 
-          for (const other of allEntities) {
+          for (const other of vehiclePeers) {
             if (other === this || other.data.behavior?.type !== "vehicle_route") continue;
             const dx = other.x - this.x;
             const dz = other.z - this.z;
@@ -1848,7 +2098,7 @@ class CreationSimEntity {
         rightX,
         rightZ,
         this.currentLaneOffset,
-        allEntities,
+        buildingPeers,
         this,
       );
       this.buildingDetourOffset += (detourTarget - this.buildingDetourOffset) * Math.min(1, dt * 5.2);
@@ -1908,7 +2158,7 @@ class CreationSimEntity {
           selfPad,
           isGlide,
           ponds,
-          allEntities,
+          buildingPeers,
         );
         const dx = tgtX - this.x;
         const dz = tgtZ - this.z;
@@ -1966,7 +2216,7 @@ class CreationSimEntity {
               applyAvoidance(pond.x, pond.z, (pond.radius || 6.4) + selfPad * 0.6 + 0.85);
             }
           }
-          for (const other of allEntities) {
+          for (const other of buildingPeers) {
             if (other === this) continue;
             if (other.data.category !== "building" && other.data.behavior?.type !== "landmark") continue;
             applyAvoidance(other.x, other.z, (other.footprintRadius || 4.0) + selfPad + 0.95);
@@ -2005,7 +2255,7 @@ class CreationSimEntity {
                 }
               }
             }
-            for (const other of allEntities) {
+            for (const other of buildingPeers) {
               if (other === this) continue;
               if (other.data.category !== "building" && other.data.behavior?.type !== "landmark") continue;
               const br = (other.footprintRadius || 4.0) + selfPad + 0.95;
@@ -2174,8 +2424,24 @@ class CreationSimEntity {
     const popEase = this.spawnScale < 1 ? 1 - (1 - this.spawnScale) ** 3 : 1;
     this.group.scale.setScalar(popEase);
 
+    if (
+      isStationaryLandmark &&
+      this.spawnScale >= 1.0 &&
+      !this.interactive?.getPoseOffset &&
+      !this.staticRootFrozen
+    ) {
+      this.group.updateMatrixWorld(true);
+      this.group.matrixAutoUpdate = false;
+      for (const ch of this.group.children) {
+        if (ch.isMesh && ch !== this.feedMesh) {
+          ch.matrixAutoUpdate = false;
+        }
+      }
+      this.staticRootFrozen = true;
+    }
+
     if (this.secondaryVehicle) {
-      this.stepSecondaryVehicle(dt, t, allEntities, popEase);
+      this.stepSecondaryVehicle(dt, t, buildingPeers, popEase);
     }
 
     if (this.feedMesh && this.feedMesh.visible) {
@@ -2192,7 +2458,7 @@ class CreationSimEntity {
     });
 
     if (this.isVegasSphere) {
-      this.updateVegasSphereEyes(dt, t, allEntities);
+      this.updateVegasSphereEyes(dt, t, vehiclePeers);
     }
   }
 
@@ -2323,19 +2589,39 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   const w0 = Math.max(320, window.innerWidth);
   const h0 = Math.max(240, window.innerHeight);
 
+  const probeCanvas = document.createElement("canvas");
+  const probeGl =
+    probeCanvas.getContext("webgl2", { powerPreference: "high-performance" }) ||
+    probeCanvas.getContext("webgl", { powerPreference: "high-performance" });
+  const probeDbg = probeGl?.getExtension?.("WEBGL_debug_renderer_info") || null;
+  const probeGpuName =
+    probeGl && probeDbg ? String(probeGl.getParameter(probeDbg.UNMASKED_RENDERER_WEBGL) || "") : "";
+  const isSoftwareProbe = /swiftshader|llvmpipe|software|basic render/i.test(probeGpuName);
+
   const renderer = new THREE.WebGLRenderer({
     canvas,
-    antialias: true,
+    antialias: !isSoftwareProbe,
     powerPreference: "high-performance",
     preserveDrawingBuffer: ogMode,
   });
   const gl = renderer.getContext();
   const dbg = gl.getExtension("WEBGL_debug_renderer_info");
-  const gpuName = dbg ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || "") : "";
-  const isSoftwareGpu = /swiftshader|llvmpipe|software|basic render/i.test(gpuName);
+  const gpuName = dbg ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || "") : probeGpuName;
+  const isSoftwareGpu =
+    isSoftwareProbe || /swiftshader|llvmpipe|software|basic render/i.test(gpuName);
+  const isTouchDevice =
+    !ogMode &&
+    (/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "") ||
+      Boolean(window.matchMedia?.("(pointer: coarse)")?.matches && Math.min(w0, h0) < 1024));
+  const isLowTierGpu =
+    !ogMode &&
+    (isSoftwareGpu ||
+      isTouchDevice ||
+      /Mali-G[357]|Adreno \(TM\) [2-6]|PowerVR|Intel\(R\) (HD|UHD) Graphics [456]/i.test(gpuName));
   const maxAniso = renderer.capabilities.getMaxAnisotropy?.() || 4;
 
-  renderer.setPixelRatio(isSoftwareGpu ? 1 : Math.min(window.devicePixelRatio || 1, 2));
+  let activeMaxDpr = isSoftwareGpu ? 1 : isLowTierGpu ? 1.5 : w0 > 2560 && !ogMode ? 1.65 : 2;
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, activeMaxDpr));
   renderer.setSize(w0, h0, false);
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFShadowMap;
@@ -2355,9 +2641,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   const fpCamera = new THREE.PerspectiveCamera(aspect0 < 0.8 ? 72 : 62, aspect0, 0.14, 820);
   fpCamera.rotation.order = "YXZ";
 
-  const composer = isSoftwareGpu ? null : new EffectComposer(renderer);
+  const composer = isSoftwareGpu || isLowTierGpu ? null : new EffectComposer(renderer);
+  let usePostProcessing = Boolean(composer);
   let renderPass = null;
   let gtaoPass = null;
+  let bloomPass = null;
   let smaaPass = null;
   if (composer) {
     renderPass = new RenderPass(scene, camera);
@@ -2370,12 +2658,12 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       distanceExponent: 1.4,
       thickness: 0.65,
       scale: 1.0,
-      samples: 14,
+      samples: 9,
       distanceFallOff: 1.0,
       screenSpaceRadius: true,
     });
     composer.addPass(gtaoPass);
-    const bloomPass = new UnrealBloomPass(new THREE.Vector2(w0, h0), 0.12, 0.25, 1.15);
+    bloomPass = new UnrealBloomPass(new THREE.Vector2(w0, h0), 0.12, 0.25, 1.15);
     composer.addPass(bloomPass);
     composer.addPass(new OutputPass());
     smaaPass = new SMAAPass(w0, h0);
@@ -2383,6 +2671,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   function syncComposerCamera(activeCam) {
+    if (!usePostProcessing) return;
     if (renderPass) {
       renderPass.camera = activeCam;
     }
@@ -2406,7 +2695,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   // Sunlit Golden-Hour Directional Key Light with Camera-Tracking Texel-Snapped Shadows
   const SUN_OFFSET = new THREE.Vector3(64, 118, 76);
   const SHADOW_HALF = 86;
-  const SHADOW_RES = isSoftwareGpu ? 1024 : 4096;
+  const SHADOW_RES = isSoftwareGpu ? 1024 : isLowTierGpu ? 2048 : 4096;
   const sun = new THREE.DirectionalLight(0xfff3db, 2.25);
   sun.position.copy(SUN_OFFSET);
   sun.castShadow = true;
@@ -2441,6 +2730,8 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   const groundGeo = buildIslandTerrainGeometry();
   const groundMesh = new THREE.Mesh(groundGeo, buildEndlessGrassMaterial(grassUniforms));
   groundMesh.receiveShadow = true;
+  groundMesh.matrixAutoUpdate = false;
+  groundMesh.updateMatrix();
   scene.add(groundMesh);
 
   const oceanGeo = new THREE.PlaneGeometry(4600, 4600, 1, 1);
@@ -2454,9 +2745,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   scene.add(skyDome);
 
   const citySignboard = createContributorSignboard(maxAniso);
+  citySignboard.group.updateMatrixWorld(true);
+  citySignboard.group.matrixAutoUpdate = false;
   scene.add(citySignboard.group);
 
-  // Scattered scenic perimeter Meadow Groves + Coastal Shoreline Boulders
+  // Scattered scenic perimeter Meadow Groves + Coastal Shoreline Boulders (batched into 1 static mesh)
   const perimeterTreesGroup = new THREE.Group();
   scene.add(perimeterTreesGroup);
   const treeProtos = [buildMeadowTreeMesh(0), buildMeadowTreeMesh(1), buildMeadowTreeMesh(2)];
@@ -2469,13 +2762,17 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     const tx = Math.cos(ang) * r;
     const tz = Math.sin(ang) * r;
     if (getIslandInlandMargin(tx, tz) >= 6.5) {
-      const tree = treeProtos[i % 3].clone();
-      tree.position.set(tx, 0, tz);
-      tree.rotation.y = (i * 1.7) % (Math.PI * 2);
-      const sc = 0.85 + (i % 4) * 0.14;
-      tree.scale.setScalar(sc);
-      perimeterTreesGroup.add(tree);
-      perimeterScenery.push({ mesh: tree, x: tx, z: tz, isTree: true });
+      perimeterScenery.push({
+        mesh: treeProtos[i % 3],
+        x: tx,
+        y: 0,
+        z: tz,
+        rotY: (i * 1.7) % (Math.PI * 2),
+        scale: 0.85 + (i % 4) * 0.14,
+        isTree: true,
+        isCoastalRock: false,
+        blocked: false,
+      });
     }
 
     if (i % 2 === 0) {
@@ -2483,11 +2780,17 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       const bx = tx + Math.cos(bAng * 7) * 2.4;
       const bz = tz + Math.sin(bAng * 5) * 2.4;
       if (getIslandInlandMargin(bx, bz) >= 6.0) {
-        const bush = bushProtos[i % 3].clone();
-        bush.position.set(bx, 0, bz);
-        bush.rotation.y = (i * 2.3) % (Math.PI * 2);
-        perimeterTreesGroup.add(bush);
-        perimeterScenery.push({ mesh: bush, x: bx, z: bz, isTree: false });
+        perimeterScenery.push({
+          mesh: bushProtos[i % 3],
+          x: bx,
+          y: 0,
+          z: bz,
+          rotY: (i * 2.3) % (Math.PI * 2),
+          scale: 1,
+          isTree: false,
+          isCoastalRock: false,
+          blocked: false,
+        });
       }
     }
   }
@@ -2496,13 +2799,24 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     const shoreMargin = -3.3 + (k % 4) * 0.85;
     const [rx, rz] = clampPointToIsland(Math.cos(ang) * 260, Math.sin(ang) * 260, shoreMargin);
     const ry = getIslandGroundHeight(rx, rz) - 0.12;
-    const rock = rockProtos[k % 3].clone();
-    rock.position.set(rx, ry, rz);
-    rock.rotation.y = (k * 2.17) % (Math.PI * 2);
-    rock.scale.setScalar(0.88 + (k % 4) * 0.18);
-    perimeterTreesGroup.add(rock);
-    perimeterScenery.push({ mesh: rock, x: rx, z: rz, isTree: false, isCoastalRock: true });
+    perimeterScenery.push({
+      mesh: rockProtos[k % 3],
+      x: rx,
+      y: ry,
+      z: rz,
+      rotY: (k * 2.17) % (Math.PI * 2),
+      scale: 0.88 + (k % 4) * 0.18,
+      isTree: false,
+      isCoastalRock: true,
+      blocked: false,
+    });
   }
+  const initialPerimeterMesh = mergeVoxelMeshInstances(perimeterScenery, {
+    depthLayer: 0,
+    castShadow: true,
+    receiveShadow: true,
+  });
+  if (initialPerimeterMesh) perimeterTreesGroup.add(initialPerimeterMesh);
 
   // Shared voxel prototypes for the 6 path styles
   const flagstoneProtos = [0, 1, 2].map((variant) => {
@@ -2804,14 +3118,59 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     }
   }
 
+  let sceneListsDirty = true;
+  let cachedAllEntities = [];
+  let cachedVehicles = [];
+  let cachedBuildings = [];
+  let cachedInteractiveEntities = [];
+  let cachedPonds = [];
+  let cachedVillagers = [];
+  let cachedVillagerObstacles = [{ ent: null, x: CITY_SIGN_POS[0], z: CITY_SIGN_POS[1], r: 2.9 }];
+
+  function markSceneListsDirty() {
+    sceneListsDirty = true;
+  }
+
+  function rebuildSceneListsIfNeeded() {
+    if (!sceneListsDirty) return;
+    sceneListsDirty = false;
+    cachedAllEntities = Array.from(creationEntities.values());
+    cachedVehicles = [];
+    cachedBuildings = [];
+    cachedInteractiveEntities = [];
+    cachedVillagerObstacles = [{ ent: null, x: CITY_SIGN_POS[0], z: CITY_SIGN_POS[1], r: 2.9 }];
+
+    for (const ent of cachedAllEntities) {
+      if (ent.interactive?.hitMeshes?.length) {
+        cachedInteractiveEntities.push(ent);
+      }
+      if (ent.data.behavior?.type === "vehicle_route") {
+        cachedVehicles.push(ent);
+      } else if (ent.data.category === "building" || ent.data.behavior?.type === "landmark") {
+        cachedBuildings.push(ent);
+        cachedVillagerObstacles.push({
+          ent,
+          x: ent.x,
+          z: ent.z,
+          r: (ent.footprintRadius || 3.8) + 0.8,
+        });
+      }
+    }
+
+    cachedPonds = (currentWorld?.props || []).filter((p) => p.kind === "pond");
+    cachedVillagers = Array.from(villagerAgents.values());
+  }
+
   const raycaster = new THREE.Raycaster();
   const interactiveRaycaster = new THREE.Raycaster();
   interactiveRaycaster.layers.set(INTERACTIVE_HIT_LAYER);
   let hoveredInteractiveEnt = null;
+  let pendingHover = null;
   const groundPlaneMath = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
   const tmpHit = new THREE.Vector3();
 
   function clearInteractiveHover() {
+    pendingHover = null;
     if (hoveredInteractiveEnt) {
       hoveredInteractiveEnt.interactive?.setHovered?.(null);
       hoveredInteractiveEnt = null;
@@ -2819,12 +3178,19 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   function pickInteractiveAt(clientX, clientY) {
+    rebuildSceneListsIfNeeded();
+    if (cachedInteractiveEntities.length === 0) return null;
+
     const hitTargets = [];
-    for (const ent of creationEntities.values()) {
-      if (ent.interactive?.hitMeshes?.length) {
-        for (const m of ent.interactive.hitMeshes) {
-          hitTargets.push(m);
-        }
+    for (const ent of cachedInteractiveEntities) {
+      if (fp.active) {
+        const maxD = 44 + (ent.footprintRadius || 4.0);
+        const dx = ent.x - fp.x;
+        const dz = ent.z - fp.z;
+        if (dx * dx + dz * dz > maxD * maxD) continue;
+      }
+      for (const m of ent.interactive.hitMeshes) {
+        hitTargets.push(m);
       }
     }
     if (hitTargets.length === 0) return null;
@@ -2905,15 +3271,46 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   function pickCreationAt(clientX, clientY) {
+    rebuildSceneListsIfNeeded();
     if (fp.active) {
       const rect = canvas.getBoundingClientRect();
       const locked = document.pointerLockElement === canvas;
       const ndcX = locked ? 0 : ((clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1;
       const ndcY = locked ? 0 : -((clientY - rect.top) / Math.max(1, rect.height)) * 2 + 1;
       raycaster.setFromCamera({ x: ndcX, y: ndcY }, fpCamera);
+
+      const candidates = [];
+      const sdx = CITY_SIGN_POS[0] - fp.x;
+      const sdz = CITY_SIGN_POS[1] - fp.z;
+      if (sdx * sdx + sdz * sdz <= 78 * 78) {
+        candidates.push(citySignboard.group);
+      }
+      const camFwdX = -Math.sin(fp.yaw);
+      const camFwdZ = -Math.cos(fp.yaw);
+      for (const ent of cachedAllEntities) {
+        const r = (ent.footprintRadius || 3.8) + 3.5;
+        const maxD = 75 + r;
+        const dx = ent.x - fp.x;
+        const dz = ent.z - fp.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 <= maxD * maxD && (d2 <= r * r || dx * camFwdX + dz * camFwdZ > -r)) {
+          candidates.push(ent.group);
+        }
+        if (ent.secondaryVehicle) {
+          const sv = ent.secondaryVehicle;
+          const svDx = sv.x - fp.x;
+          const svDz = sv.z - fp.z;
+          const svD2 = svDx * svDx + svDz * svDz;
+          if (svD2 <= 80 * 80 && (svD2 <= 25 || svDx * camFwdX + svDz * camFwdZ > -5)) {
+            candidates.push(sv.group);
+          }
+        }
+      }
+      if (candidates.length === 0) return null;
+
       const prevFar = raycaster.far;
       raycaster.far = 75;
-      const hits = raycaster.intersectObjects([citySignboard.group, ...creationsGroup.children], true);
+      const hits = raycaster.intersectObjects(candidates, true);
       raycaster.far = prevFar;
       for (const hit of hits) {
         let cur = hit.object;
@@ -2936,7 +3333,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
     let best = null;
     let bestScore = Infinity;
-    for (const ent of creationEntities.values()) {
+    for (const ent of cachedAllEntities) {
       const hitRadius = Math.max(4.4, (ent.footprintRadius || 3.5) + 1.2);
       const d = Math.hypot(ent.x - g[0], ent.z - g[1]);
       if (d < hitRadius && d < bestScore) {
@@ -2968,9 +3365,41 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     grassUniforms.uZoneCount.value = count;
   }
 
+  function disposeStaticBatchGroup(grp) {
+    while (grp.children.length) {
+      const ch = grp.children.pop();
+      ch.traverse((o) => {
+        if (o.userData?.sharedProto) return;
+        if (o.isInstancedMesh) o.dispose();
+        if (o.geometry && !o.userData?.sharedGeo) {
+          o.geometry.dispose();
+        }
+      });
+    }
+  }
+
+  let lastClearanceSig = "";
+  let lastPerimeterVisMask = "1".repeat(perimeterScenery.length);
+
   function updatePerimeterTreeClearance(world) {
     const creations = world?.creations || [];
-    const sampledPaths = (world?.paths || [])
+    const paths = world?.paths || [];
+    let sig = `${creations.length}:${paths.length}`;
+    for (let i = 0; i < creations.length; i++) {
+      const c = creations[i];
+      sig += `|${c.id}:${Math.round((c.x || 0) * 10)}:${Math.round((c.z || 0) * 10)}:${c.scaleClass || ""}`;
+    }
+    for (let i = 0; i < paths.length; i++) {
+      const p = paths[i];
+      const pts = p.points || [];
+      const p0 = pts[0];
+      const pN = pts[pts.length - 1];
+      sig += `;${p.id}:${p.kind}:${pts.length}:${p0 ? `${p0[0]},${p0[1]}` : ""}:${pN ? `${pN[0]},${pN[1]}` : ""}`;
+    }
+    if (sig === lastClearanceSig) return;
+    lastClearanceSig = sig;
+
+    const sampledPaths = paths
       .filter((p) => Array.isArray(p.points) && p.points.length >= 2)
       .map((p) => {
         const vecs = p.points.map(([x, z]) => new THREE.Vector3(x, 0, z));
@@ -2981,6 +3410,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           pts: curve.getSpacedPoints(Math.min(120, Math.max(12, Math.round(len * 0.6)))),
         };
       });
+
+    let visMask = "";
+    const visibleEntries = [];
     for (const item of perimeterScenery) {
       let blocked = false;
       for (const c of creations) {
@@ -3008,27 +3440,73 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           if (blocked) break;
         }
       }
-      item.mesh.visible = !blocked;
+      item.blocked = blocked;
+      visMask += blocked ? "0" : "1";
+      if (!blocked) visibleEntries.push(item);
+    }
+
+    if (visMask !== lastPerimeterVisMask) {
+      lastPerimeterVisMask = visMask;
+      disposeStaticBatchGroup(perimeterTreesGroup);
+      const merged = mergeVoxelMeshInstances(visibleEntries, {
+        depthLayer: 0,
+        castShadow: true,
+        receiveShadow: true,
+      });
+      if (merged) perimeterTreesGroup.add(merged);
     }
   }
 
-  function rebuildPathsAndProps(world) {
-    while (pathsGroup.children.length) {
-      const ch = pathsGroup.children.pop();
-      ch.traverse((o) => {
-        if (o.userData?.sharedProto) return;
-        if (o.geometry) o.geometry.dispose();
-        if (o.material) o.material.dispose();
-      });
-    }
-    while (propsGroup.children.length) {
-      const ch = propsGroup.children.pop();
-      ch.traverse((o) => {
-        if (o.geometry) o.geometry.dispose();
-      });
-    }
+  const sharedDashGeo = new THREE.BoxGeometry(0.2, 0.026, 1.3);
+  const sharedDashMat = new THREE.MeshBasicMaterial({
+    color: "#f6eed8",
+    polygonOffset: true,
+    polygonOffsetFactor: -3,
+    polygonOffsetUnits: -4,
+  });
+  const tmpDashMatrix = new THREE.Matrix4();
+  const tmpDashPos = new THREE.Vector3();
+  const tmpDashQuat = new THREE.Quaternion();
+  const tmpDashScale = new THREE.Vector3(1, 1, 1);
+  const dashAxisY = new THREE.Vector3(0, 1, 0);
+  let lastPathsPropsSig = "";
 
+  function rebuildPathsAndProps(world) {
     const allPaths = world.paths || [];
+    const allProps = world.props || [];
+    let sig = `${allPaths.length}:${allProps.length}`;
+    for (let i = 0; i < allPaths.length; i++) {
+      const p = allPaths[i];
+      sig += `|${p.id}:${p.kind}:${p.closed ? 1 : 0}:`;
+      const pts = p.points || [];
+      for (let j = 0; j < pts.length; j++) {
+        sig += `${pts[j][0]},${pts[j][1]};`;
+      }
+    }
+    for (let i = 0; i < allProps.length; i++) {
+      const pr = allProps[i];
+      sig += `|${pr.id || pr.kind}:${pr.x}:${pr.z}:${pr.yaw || 0}:${pr.radius || 0}:${pr.variant || 0}`;
+    }
+    if (sig === lastPathsPropsSig) return;
+    lastPathsPropsSig = sig;
+
+    disposeStaticBatchGroup(pathsGroup);
+    disposeStaticBatchGroup(propsGroup);
+
+    const ribbonBuckets = new Map();
+    const pushRibbon = (polyOffset, slice) => {
+      let arr = ribbonBuckets.get(polyOffset);
+      if (!arr) {
+        arr = [];
+        ribbonBuckets.set(polyOffset, arr);
+      }
+      arr.push(slice);
+    };
+    const dashTransforms = [];
+    const pathVoxLayer1NoShadow = [];
+    const pathVoxLayer2NoShadow = [];
+    const pathVoxLayer2PlankShadow = [];
+
     const roadSamples = allPaths
       .filter((rp) => rp.kind === "road" && rp.points && rp.points.length >= 2)
       .map((rp, rIdx) => {
@@ -3106,17 +3584,10 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         const isPrimaryRoad = p.id === "path-main-loop" || Boolean(p.closed);
         const asphaltY = isPrimaryRoad ? 0.091 : Math.max(0.084, 0.089 - Math.min(5, pIdx) * 0.001);
         const asphaltPoly = isPrimaryRoad ? -2.3 : -2.0;
-        pathsGroup.add(buildRibbonMesh(curve, samples, 2.52, 0.052, "#dfd7c5", true, -1, true));
-        pathsGroup.add(buildRibbonMesh(curve, samples, 2.1, asphaltY, "#4b505c", true, asphaltPoly, true));
+        pushRibbon(-1, buildRibbonSliceData(curve, samples, 2.52, 0.052, "#dfd7c5", true));
+        pushRibbon(asphaltPoly, buildRibbonSliceData(curve, samples, 2.1, asphaltY, "#4b505c", true));
 
         const dashCount = Math.floor(len / 3.4);
-        const dashGeo = new THREE.BoxGeometry(0.2, 0.026, 1.3);
-        const dashMat = new THREE.MeshBasicMaterial({
-          color: "#f6eed8",
-          polygonOffset: true,
-          polygonOffsetFactor: -3,
-          polygonOffsetUnits: -4,
-        });
         for (let i = 0; i < dashCount; i++) {
           const u = (i + 0.5) / dashCount;
           const distFromStart = u * len;
@@ -3127,17 +3598,14 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           const pt = curve.getPointAt(u);
           if (!isPrimaryRoad && nearOtherRoadCenter(pt.x, pt.z, p.id)) continue;
           const tan = curve.getTangentAt(u);
-          const dash = new THREE.Mesh(dashGeo, dashMat);
-          dash.position.set(pt.x, 0.106, pt.z);
-          dash.rotation.y = Math.atan2(tan.x, tan.z);
-          pathsGroup.add(dash);
+          dashTransforms.push(pt.x, 0.106, pt.z, Math.atan2(tan.x, tan.z));
         }
       } else if (p.kind === "cottage_road") {
         // Warm country honey-gravel cottage lane with twin wheel tracks, sandy-clover center crown & fieldstone border stones
         const zBias = Math.min(28, pIdx) * 0.00022;
-        pathsGroup.add(buildRibbonMesh(curve, samples, 1.24, 0.032 - zBias, "#c5b089", true, -1, true));
-        pathsGroup.add(buildRibbonMesh(curve, samples, 0.90, 0.048 - zBias, "#e6d8b9", true, -2, true));
-        pathsGroup.add(buildRibbonMesh(curve, samples, 0.24, 0.056 - zBias, "#bda67b", true, -2.5, true));
+        pushRibbon(-1, buildRibbonSliceData(curve, samples, 1.24, 0.032 - zBias, "#c5b089", true));
+        pushRibbon(-2, buildRibbonSliceData(curve, samples, 0.90, 0.048 - zBias, "#e6d8b9", true));
+        pushRibbon(-2.5, buildRibbonSliceData(curve, samples, 0.24, 0.056 - zBias, "#bda67b", true));
 
         const borderCount = Math.max(2, Math.floor(len / 2.2));
         for (let i = 1; i < borderCount; i++) {
@@ -3147,17 +3615,19 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           const side = i % 2 === 0 ? 1 : -1;
           const nx = -tan.z * side;
           const nz = tan.x * side;
-          const st = cottageBorderProtos[i % cottageBorderProtos.length].clone();
-          st.userData.sharedProto = true;
-          st.position.set(pt.x + nx * 1.14, -0.11, pt.z + nz * 1.14);
-          st.rotation.y = Math.atan2(tan.x, tan.z) + (((i * 3) % 5) - 2) * 0.12;
-          pathsGroup.add(st);
+          pathVoxLayer1NoShadow.push({
+            mesh: cottageBorderProtos[i % cottageBorderProtos.length],
+            x: pt.x + nx * 1.14,
+            y: -0.11,
+            z: pt.z + nz * 1.14,
+            rotY: Math.atan2(tan.x, tan.z) + (((i * 3) % 5) - 2) * 0.12,
+          });
         }
       } else if (p.kind === "dirt_trail") {
         // Gentle country dirt path with rounded ends, soft sandy-loam edge & subtle border stones
         const zBias = Math.min(28, pIdx) * 0.00022;
-        pathsGroup.add(buildRibbonMesh(curve, samples, 0.98, 0.03 - zBias, "#bfa074", true, -1, true));
-        pathsGroup.add(buildRibbonMesh(curve, samples, 0.68, 0.045 - zBias, "#9b7248", true, -2, true));
+        pushRibbon(-1, buildRibbonSliceData(curve, samples, 0.98, 0.03 - zBias, "#bfa074", true));
+        pushRibbon(-2, buildRibbonSliceData(curve, samples, 0.68, 0.045 - zBias, "#9b7248", true));
 
         const pebbleCount = Math.max(2, Math.floor(len / 2.8));
         for (let i = 1; i < pebbleCount; i++) {
@@ -3167,16 +3637,18 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           const side = i % 2 === 0 ? 1 : -1;
           const nx = -tan.z * side;
           const nz = tan.x * side;
-          const pebble = dirtPebbleProtos[i % dirtPebbleProtos.length].clone();
-          pebble.userData.sharedProto = true;
-          pebble.position.set(pt.x + nx * 0.88, -0.115, pt.z + nz * 0.88);
-          pebble.rotation.y = (i * 1.9) % (Math.PI * 2);
-          pathsGroup.add(pebble);
+          pathVoxLayer1NoShadow.push({
+            mesh: dirtPebbleProtos[i % dirtPebbleProtos.length],
+            x: pt.x + nx * 0.88,
+            y: -0.115,
+            z: pt.z + nz * 0.88,
+            rotY: (i * 1.9) % (Math.PI * 2),
+          });
         }
       } else if (p.kind === "cobblestone") {
         // Refined warm stone cobble walkway with rounded limestone bed & staggered low-profile pavers
         const zBias = Math.min(28, pIdx) * 0.00022;
-        pathsGroup.add(buildRibbonMesh(curve, samples, 0.88, 0.036 - zBias, "#c4baa6", true, -1, true));
+        pushRibbon(-1, buildRibbonSliceData(curve, samples, 0.88, 0.036 - zBias, "#c4baa6", true));
         const cobbleCount = Math.max(3, Math.floor(len / 0.95));
         for (let i = 0; i <= cobbleCount; i++) {
           const u = i / cobbleCount;
@@ -3185,41 +3657,47 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           const side = ((i % 3) - 1) * 0.16;
           const nx = -tan.z * side;
           const nz = tan.x * side;
-          const cob = cobbleProtos[i % cobbleProtos.length].clone();
-          cob.userData.sharedProto = true;
-          cob.position.set(pt.x + nx, -0.115, pt.z + nz);
-          cob.rotation.y = Math.atan2(tan.x, tan.z) + (((i * 5) % 7) - 3) * 0.14;
-          pathsGroup.add(cob);
+          pathVoxLayer2NoShadow.push({
+            mesh: cobbleProtos[i % cobbleProtos.length],
+            x: pt.x + nx,
+            y: -0.115,
+            z: pt.z + nz,
+            rotY: Math.atan2(tan.x, tan.z) + (((i * 5) % 7) - 3) * 0.14,
+          });
         }
       } else if (p.kind === "boardwalk") {
         // Cohesive timber plank boardwalk over continuous dark-oak stringer rails
         const zBias = Math.min(28, pIdx) * 0.00022;
-        pathsGroup.add(buildRibbonMesh(curve, samples, 0.62, 0.032 - zBias, "#6b4b30", true, -1, true));
+        pushRibbon(-1, buildRibbonSliceData(curve, samples, 0.62, 0.032 - zBias, "#6b4b30", true));
         const plankCount = Math.max(4, Math.floor(len / 0.78));
         for (let i = 0; i <= plankCount; i++) {
           const u = i / plankCount;
           const pt = curve.getPointAt(u);
           const tan = curve.getTangentAt(u);
-          const plank = boardwalkPlankProtos[i % boardwalkPlankProtos.length].clone();
-          plank.userData.sharedProto = true;
-          plank.position.set(pt.x, -0.145, pt.z);
-          plank.rotation.y = Math.atan2(tan.x, tan.z);
-          pathsGroup.add(plank);
+          pathVoxLayer2PlankShadow.push({
+            mesh: boardwalkPlankProtos[i % boardwalkPlankProtos.length],
+            x: pt.x,
+            y: -0.145,
+            z: pt.z,
+            rotY: Math.atan2(tan.x, tan.z),
+          });
         }
       } else if (p.kind === "volcanic_trail") {
         // Charred obsidian basalt path with staggered ember stones
         const zBias = Math.min(28, pIdx) * 0.00022;
-        pathsGroup.add(buildRibbonMesh(curve, samples, 0.92, 0.038 - zBias, "#2b2d36", true, -1, true));
+        pushRibbon(-1, buildRibbonSliceData(curve, samples, 0.92, 0.038 - zBias, "#2b2d36", true));
         const stepCount = Math.max(3, Math.floor(len / 1.35));
         for (let i = 0; i <= stepCount; i++) {
           const u = i / stepCount;
           const pt = curve.getPointAt(u);
           const tan = curve.getTangentAt(u);
-          const st = volcanicStepProtos[i % volcanicStepProtos.length].clone();
-          st.userData.sharedProto = true;
-          st.position.set(pt.x, -0.135, pt.z);
-          st.rotation.y = Math.atan2(tan.x, tan.z) + (((i % 3) - 1) * 0.15);
-          pathsGroup.add(st);
+          pathVoxLayer2NoShadow.push({
+            mesh: volcanicStepProtos[i % volcanicStepProtos.length],
+            x: pt.x,
+            y: -0.135,
+            z: pt.z,
+            rotY: Math.atan2(tan.x, tan.z) + (((i % 3) - 1) * 0.15),
+          });
         }
       } else {
         // Airy garden stepping flagstones with gentle left/right walking rhythm
@@ -3231,19 +3709,66 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           const sway = (i % 2 === 0 ? 1 : -1) * 0.1;
           const nx = -tan.z * sway;
           const nz = tan.x * sway;
-          const stone = flagstoneProtos[i % flagstoneProtos.length].clone();
-          stone.userData.sharedProto = true;
-          stone.position.set(pt.x + nx, -0.155, pt.z + nz);
-          stone.rotation.y = Math.atan2(tan.x, tan.z) + (((i % 3) - 1) * 0.08);
-          stone.scale.set(1.0 + (i % 2) * 0.1, 1, 0.92 + ((i + 1) % 2) * 0.1);
-          pathsGroup.add(stone);
+          pathVoxLayer1NoShadow.push({
+            mesh: flagstoneProtos[i % flagstoneProtos.length],
+            x: pt.x + nx,
+            y: -0.155,
+            z: pt.z + nz,
+            rotY: Math.atan2(tan.x, tan.z) + (((i % 3) - 1) * 0.08),
+            scaleX: 1.0 + (i % 2) * 0.1,
+            scaleY: 1,
+            scaleZ: 0.92 + ((i + 1) % 2) * 0.1,
+          });
         }
       }
     }
 
-    for (const pr of world.props || []) {
-      propsGroup.add(buildWorldPropMesh(pr));
+    for (const [polyOffset, slices] of ribbonBuckets.entries()) {
+      const mergedRibbon = buildMergedRibbonMesh(slices, polyOffset, true);
+      if (mergedRibbon) pathsGroup.add(mergedRibbon);
     }
+
+    const totalDashes = dashTransforms.length >> 2;
+    if (totalDashes > 0) {
+      const dashInstanced = new THREE.InstancedMesh(sharedDashGeo, sharedDashMat, totalDashes);
+      for (let i = 0; i < totalDashes; i++) {
+        const b4 = i * 4;
+        tmpDashPos.set(dashTransforms[b4], dashTransforms[b4 + 1], dashTransforms[b4 + 2]);
+        tmpDashQuat.setFromAxisAngle(dashAxisY, dashTransforms[b4 + 3]);
+        tmpDashMatrix.compose(tmpDashPos, tmpDashQuat, tmpDashScale);
+        dashInstanced.setMatrixAt(i, tmpDashMatrix);
+      }
+      dashInstanced.instanceMatrix.needsUpdate = true;
+      dashInstanced.frustumCulled = false;
+      dashInstanced.matrixAutoUpdate = false;
+      dashInstanced.updateMatrix();
+      dashInstanced.userData.sharedGeo = true;
+      dashInstanced.userData.sharedMaterial = true;
+      pathsGroup.add(dashInstanced);
+    }
+
+    const mergedPathL1 = mergeVoxelMeshInstances(pathVoxLayer1NoShadow, {
+      depthLayer: 1,
+      castShadow: false,
+      receiveShadow: true,
+    });
+    if (mergedPathL1) pathsGroup.add(mergedPathL1);
+
+    const mergedPathL2 = mergeVoxelMeshInstances(pathVoxLayer2NoShadow, {
+      depthLayer: 2,
+      castShadow: false,
+      receiveShadow: true,
+    });
+    if (mergedPathL2) pathsGroup.add(mergedPathL2);
+
+    const mergedPlanks = mergeVoxelMeshInstances(pathVoxLayer2PlankShadow, {
+      depthLayer: 2,
+      castShadow: true,
+      receiveShadow: true,
+    });
+    if (mergedPlanks) pathsGroup.add(mergedPlanks);
+
+    buildBatchedWorldProps(allProps, propsGroup);
   }
 
   function frameActiveWorldForOg() {
@@ -3280,7 +3805,73 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     }
   }
 
+  let worldSnapshotGen = 0;
+  let isStreamingCreations = false;
+  const pendingCreationSpecs = new Map();
+
+  function instantiateCreationSpec(spec) {
+    const { c, idx } = spec;
+    if (creationEntities.has(c.id)) return creationEntities.get(c.id);
+    const ent = new CreationSimEntity(
+      c,
+      idx,
+      callbacks.onInteractiveEvent || null,
+      creationsGroup,
+    );
+    if (ogMode) ent.spawnScale = 1.0;
+    ent.setLiveFeedReading(liveFeedsById[c.id] || null, maxAniso);
+    creationEntities.set(c.id, ent);
+    creationsGroup.add(ent.group);
+    markSceneListsDirty();
+    return ent;
+  }
+
+  function ensureCreationBuilt(id) {
+    if (!id || creationEntities.has(id)) return creationEntities.get(id) || null;
+    const spec = pendingCreationSpecs.get(id);
+    if (!spec) return null;
+    pendingCreationSpecs.delete(id);
+    const ent = instantiateCreationSpec(spec);
+    if (ent.data.behavior?.type === "vehicle_route") {
+      deBunchVehicleRoutes(creationEntities);
+    }
+    return ent;
+  }
+
+  const yieldToMain = () =>
+    typeof globalThis.scheduler?.yield === "function"
+      ? globalThis.scheduler.yield()
+      : new Promise((resolve) => setTimeout(resolve, 0));
+
+  async function streamRemainingCreations(gen) {
+    isStreamingCreations = true;
+    while (gen === worldSnapshotGen && pendingCreationSpecs.size > 0) {
+      await yieldToMain();
+      if (gen !== worldSnapshotGen || pendingCreationSpecs.size === 0) break;
+      const sliceStart = performance.now();
+      let builtVehicle = false;
+      for (const [id, spec] of pendingCreationSpecs) {
+        pendingCreationSpecs.delete(id);
+        const ent = instantiateCreationSpec(spec);
+        if (ent.data.behavior?.type === "vehicle_route") builtVehicle = true;
+        if (performance.now() - sliceStart >= 10) break;
+      }
+      if (builtVehicle) {
+        deBunchVehicleRoutes(creationEntities);
+      }
+    }
+    if (gen === worldSnapshotGen) {
+      isStreamingCreations = false;
+      deBunchVehicleRoutes(creationEntities);
+      markSceneListsDirty();
+    }
+  }
+
   function applyWorldSnapshot(world) {
+    const myGen = ++worldSnapshotGen;
+    pendingCreationSpecs.clear();
+    isStreamingCreations = false;
+
     currentWorld = world;
     const contribCount =
       typeof world.contributionCount === "number"
@@ -3292,6 +3883,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     rebuildPathsAndProps(world);
 
     const seenIds = new Set();
+    const newSpecs = [];
     world.creations.forEach((c, idx) => {
       seenIds.add(c.id);
       const existing = creationEntities.get(c.id);
@@ -3300,16 +3892,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         existing.rebuildBehavior(c, creationsGroup);
         existing.setLiveFeedReading(liveFeedsById[c.id] || null, maxAniso);
       } else {
-        const ent = new CreationSimEntity(
-          c,
-          idx,
-          callbacks.onInteractiveEvent || null,
-          creationsGroup,
-        );
-        if (ogMode) ent.spawnScale = 1.0;
-        ent.setLiveFeedReading(liveFeedsById[c.id] || null, maxAniso);
-        creationEntities.set(c.id, ent);
-        creationsGroup.add(ent.group);
+        newSpecs.push({ c, idx });
       }
     });
     for (const [id, ent] of creationEntities.entries()) {
@@ -3317,6 +3900,59 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         creationsGroup.remove(ent.group);
         ent.dispose(creationsGroup);
         creationEntities.delete(id);
+      }
+    }
+
+    if (ogMode || newSpecs.length <= 16) {
+      for (const spec of newSpecs) {
+        instantiateCreationSpec(spec);
+      }
+    } else {
+      const refX = fp.active ? fp.x : cam.tx;
+      const refZ = fp.active ? fp.z : cam.tz;
+      newSpecs.sort((a, b) => {
+        const pa =
+          a.c.isSeed ||
+          a.c.behavior?.type === "vehicle_route" ||
+          a.c.id === world.myCreationId ||
+          a.c.id === highlightedId
+            ? 0
+            : 1;
+        const pb =
+          b.c.isSeed ||
+          b.c.behavior?.type === "vehicle_route" ||
+          b.c.id === world.myCreationId ||
+          b.c.id === highlightedId
+            ? 0
+            : 1;
+        if (pa !== pb) return pa - pb;
+        const da = (a.c.x - refX) ** 2 + (a.c.z - refZ) ** 2;
+        const db = (b.c.x - refX) ** 2 + (b.c.z - refZ) ** 2;
+        return da - db;
+      });
+
+      const syncStart = performance.now();
+      let cursor = 0;
+      while (cursor < newSpecs.length) {
+        const spec = newSpecs[cursor];
+        const mustBuildNow =
+          cursor < 14 ||
+          spec.c.isSeed ||
+          spec.c.behavior?.type === "vehicle_route" ||
+          spec.c.id === world.myCreationId ||
+          spec.c.id === highlightedId;
+        if (!mustBuildNow && performance.now() - syncStart >= 14) {
+          break;
+        }
+        instantiateCreationSpec(spec);
+        cursor++;
+      }
+
+      if (cursor < newSpecs.length) {
+        for (let i = cursor; i < newSpecs.length; i++) {
+          pendingCreationSpecs.set(newSpecs[i].c.id, newSpecs[i]);
+        }
+        void streamRemainingCreations(myGen);
       }
     }
 
@@ -3341,6 +3977,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         villagerAgents.delete(id);
       }
     }
+    markSceneListsDirty();
 
     if (ogMode) {
       frameActiveWorldForOg();
@@ -3472,7 +4109,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         }
       }
       for (const sc of perimeterScenery) {
-        if ((sc.isTree || sc.isCoastalRock) && sc.mesh.visible) {
+        if ((sc.isTree || sc.isCoastalRock) && !sc.blocked) {
           pushOut(sc.x, sc.z, sc.isCoastalRock ? 1.15 : 0.72);
         }
       }
@@ -3874,24 +4511,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         return;
       }
       if (document.pointerLockElement !== canvas) {
-        const iHitFp = pickInteractiveAt(e.clientX, e.clientY);
-        if (iHitFp) {
-          if (hoveredInteractiveEnt && hoveredInteractiveEnt !== iHitFp.ent) {
-            hoveredInteractiveEnt.interactive?.setHovered?.(null);
-          }
-          hoveredInteractiveEnt = iHitFp.ent;
-          hoveredInteractiveEnt.interactive?.setHovered?.(iHitFp.action);
-          const readingFp = liveFeedsById[iHitFp.ent.id] || null;
-          callbacks.onHoverCreation?.(iHitFp.ent.data, e.clientX, e.clientY, readingFp);
-          canvas.style.cursor = "pointer";
-          return;
-        }
-        clearInteractiveHover();
-        const hoveredFp = pickCreationAt(e.clientX, e.clientY);
-        const readingFp =
-          hoveredFp && hoveredFp.id !== "__city_sign__" ? liveFeedsById[hoveredFp.id] || null : null;
-        callbacks.onHoverCreation?.(hoveredFp ? hoveredFp.data : null, e.clientX, e.clientY, readingFp);
-        canvas.style.cursor = hoveredFp ? "pointer" : idleCursor();
+        pendingHover = { x: e.clientX, y: e.clientY };
       }
       return;
     }
@@ -3915,6 +4535,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
     // 2-finger mobile map gesture: pinch-zoom + 2-finger twist (azimuth) + 2-finger vertical drag (tilt) + midpoint pan
     if (activePointers.size >= 2) {
+      pendingHover = null;
       const cur = computeTwoPointerSample();
       if (cur && multiPrev) {
         const dMidX = cur.midX - multiPrev.midX;
@@ -3965,23 +4586,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         canvas.style.cursor = "crosshair";
         return;
       }
-      const iHit = pickInteractiveAt(e.clientX, e.clientY);
-      if (iHit) {
-        if (hoveredInteractiveEnt && hoveredInteractiveEnt !== iHit.ent) {
-          hoveredInteractiveEnt.interactive?.setHovered?.(null);
-        }
-        hoveredInteractiveEnt = iHit.ent;
-        hoveredInteractiveEnt.interactive?.setHovered?.(iHit.action);
-        const reading = liveFeedsById[iHit.ent.id] || null;
-        callbacks.onHoverCreation?.(iHit.ent.data, e.clientX, e.clientY, reading);
-        canvas.style.cursor = "pointer";
-        return;
-      }
-      clearInteractiveHover();
-      const hovered = pickCreationAt(e.clientX, e.clientY);
-      const reading = hovered && hovered.id !== "__city_sign__" ? liveFeedsById[hovered.id] || null : null;
-      callbacks.onHoverCreation?.(hovered ? hovered.data : null, e.clientX, e.clientY, reading);
-      canvas.style.cursor = hovered ? "pointer" : idleCursor();
+      pendingHover = { x: e.clientX, y: e.clientY };
       return;
     }
 
@@ -4006,6 +4611,36 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       canvas.style.cursor = "grabbing";
     }
   });
+
+  function processPendingHover() {
+    if (!pendingHover) return;
+    const { x, y } = pendingHover;
+    pendingHover = null;
+    if (pointerGesture?.moved || activePointers.size >= 2) return;
+    if (fp.active && document.pointerLockElement === canvas) return;
+
+    const iHit = pickInteractiveAt(x, y);
+    if (iHit) {
+      if (hoveredInteractiveEnt && hoveredInteractiveEnt !== iHit.ent) {
+        hoveredInteractiveEnt.interactive?.setHovered?.(null);
+      }
+      hoveredInteractiveEnt = iHit.ent;
+      hoveredInteractiveEnt.interactive?.setHovered?.(iHit.action);
+      const reading = liveFeedsById[iHit.ent.id] || null;
+      callbacks.onHoverCreation?.(iHit.ent.data, x, y, reading);
+      canvas.style.cursor = "pointer";
+      return;
+    }
+
+    if (hoveredInteractiveEnt) {
+      hoveredInteractiveEnt.interactive?.setHovered?.(null);
+      hoveredInteractiveEnt = null;
+    }
+    const hovered = pickCreationAt(x, y);
+    const reading = hovered && hovered.id !== "__city_sign__" ? liveFeedsById[hovered.id] || null : null;
+    callbacks.onHoverCreation?.(hovered ? hovered.data : null, x, y, reading);
+    canvas.style.cursor = hovered ? "pointer" : idleCursor();
+  }
 
   const handleFirstPersonTap = (clientX, clientY) => {
     const iHit = pickInteractiveAt(clientX, clientY);
@@ -4236,7 +4871,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   function focusCreationById(id) {
-    const ent = creationEntities.get(id);
+    const ent = ensureCreationBuilt(id);
     if (!ent) return;
     highlightedId = id;
     ent.triggerEyeSpinFlourish?.();
@@ -4269,6 +4904,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   function handleResize() {
     const w = Math.max(320, window.innerWidth);
     const h = Math.max(240, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, activeMaxDpr));
     renderer.setSize(w, h, false);
     const aspect = w / h;
     camera.left = -BASE_FRUSTUM * aspect;
@@ -4281,9 +4917,10 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       fpCamera.fov = aspect < 0.8 ? 72 : 62;
     }
     fpCamera.updateProjectionMatrix();
-    if (composer) {
+    if (composer && usePostProcessing) {
       composer.setSize(w, h);
       gtaoPass?.setSize(w, h);
+      bloomPass?.setSize?.(w, h);
       smaaPass?.setSize(w, h);
       syncComposerCamera(fp.active || introSweep.usingFpCam ? fpCamera : camera);
     }
@@ -4297,21 +4934,24 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   const lightDir = SUN_OFFSET.clone().normalize();
   const lightRight = new THREE.Vector3().crossVectors(lightUp, lightDir).normalize();
   const lightOrthoUp = new THREE.Vector3().crossVectors(lightDir, lightRight).normalize();
+  const tmpSunFocus = new THREE.Vector3();
+  const tmpSunSnapped = new THREE.Vector3();
 
   function updateTexelSnappedSun(tx, tz) {
     const texelSize = (SHADOW_HALF * 2) / SHADOW_RES;
-    const focusVec = new THREE.Vector3(tx, 0, tz);
-    const projR = Math.round(focusVec.dot(lightRight) / texelSize) * texelSize;
-    const projU = Math.round(focusVec.dot(lightOrthoUp) / texelSize) * texelSize;
-    const projD = focusVec.dot(lightDir);
+    tmpSunFocus.set(tx, 0, tz);
+    const projR = Math.round(tmpSunFocus.dot(lightRight) / texelSize) * texelSize;
+    const projU = Math.round(tmpSunFocus.dot(lightOrthoUp) / texelSize) * texelSize;
+    const projD = tmpSunFocus.dot(lightDir);
 
-    const snappedTarget = new THREE.Vector3()
+    tmpSunSnapped
+      .set(0, 0, 0)
       .addScaledVector(lightRight, projR)
       .addScaledVector(lightOrthoUp, projU)
       .addScaledVector(lightDir, projD);
 
-    sun.target.position.copy(snappedTarget);
-    sun.position.copy(snappedTarget).add(SUN_OFFSET);
+    sun.target.position.copy(tmpSunSnapped);
+    sun.position.copy(tmpSunSnapped).add(SUN_OFFSET);
     sun.target.updateMatrixWorld();
   }
 
@@ -4319,12 +4959,46 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   let bootWaitElapsed = 0;
   let lastReportedAz = NaN;
   let lastReportedHome = null;
+  let frameTick = 0;
+  let govFrameCount = 0;
+  let govFrameMsAccum = 0;
+  const simCtx = {
+    vehicles: cachedVehicles,
+    buildings: cachedBuildings,
+    focusX: 0,
+    focusZ: 0,
+    frameTick: 0,
+  };
 
   function animate(now) {
     requestAnimationFrame(animate);
-    const dt = Math.min(0.05, Math.max(0.001, (now - lastNow) / 1000));
+    if (!ogMode && document.visibilityState === "hidden") {
+      lastNow = now;
+      return;
+    }
+
+    const rawDeltaMs = now - lastNow;
+    const dt = Math.min(0.05, Math.max(0.001, rawDeltaMs / 1000));
     lastNow = now;
     const t = now * 0.001;
+    frameTick = (frameTick + 1) | 0;
+
+    // Dynamic quality governor: step down heavy post-FX / high-DPI on struggling laptops
+    if (!ogMode && !isStreamingCreations && currentWorld && rawDeltaMs > 4 && rawDeltaMs < 240) {
+      govFrameCount++;
+      govFrameMsAccum += rawDeltaMs;
+      if (govFrameCount >= 75) {
+        const avgMs = govFrameMsAccum / govFrameCount;
+        govFrameCount = 0;
+        govFrameMsAccum = 0;
+        if (usePostProcessing && avgMs > 26.5) {
+          usePostProcessing = false;
+        } else if (!usePostProcessing && activeMaxDpr > 1.25 && avgMs > 29.0) {
+          activeMaxDpr = 1.25;
+          handleResize();
+        }
+      }
+    }
 
     grassUniforms.uTime.value = t;
 
@@ -4710,28 +5384,37 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       }
     }
 
-    const allEnts = Array.from(creationEntities.values());
-    const ponds = (currentWorld?.props || []).filter((p) => p.kind === "pond");
-    const activeVehicles = [];
-    const obstacles = [{ x: CITY_SIGN_POS[0], z: CITY_SIGN_POS[1], r: 2.9 }];
+    rebuildSceneListsIfNeeded();
+    simCtx.vehicles = cachedVehicles;
+    simCtx.buildings = cachedBuildings;
+    simCtx.focusX = focusWorldX;
+    simCtx.focusZ = focusWorldZ;
+    simCtx.frameTick = frameTick;
 
-    for (const ent of allEnts) {
-      ent.step(dt, t, allEnts, ponds, activeAz, viewerPos);
-      if (ent.data.behavior?.type === "vehicle_route") {
-        activeVehicles.push(ent);
-      } else if (ent.data.category === "building" || ent.data.behavior?.type === "landmark") {
-        obstacles.push({
-          x: ent.x,
-          z: ent.z,
-          r: (ent.footprintRadius || 3.8) + 0.8,
-        });
+    for (let i = 0; i < cachedAllEntities.length; i++) {
+      cachedAllEntities[i].step(dt, t, cachedAllEntities, cachedPonds, activeAz, viewerPos, simCtx);
+    }
+
+    for (let i = 1; i < cachedVillagerObstacles.length; i++) {
+      const obs = cachedVillagerObstacles[i];
+      if (obs.ent && !obs.ent.staticRootFrozen) {
+        obs.x = obs.ent.x;
+        obs.z = obs.ent.z;
       }
     }
 
-    const allVillagers = Array.from(villagerAgents.values());
-    for (const ag of allVillagers) {
-      ag.step(dt, t, activeVehicles, ponds, allVillagers, obstacles);
+    for (let i = 0; i < cachedVillagers.length; i++) {
+      cachedVillagers[i].step(
+        dt,
+        t,
+        cachedVehicles,
+        cachedPonds,
+        cachedVillagers,
+        cachedVillagerObstacles,
+      );
     }
+
+    processPendingHover();
 
     if (!ogMode && highlightedId && creationEntities.has(highlightedId)) {
       const myEnt = creationEntities.get(highlightedId);
@@ -4766,7 +5449,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       }
     }
 
-    if (composer) composer.render();
+    if (usePostProcessing && composer) composer.render();
     else renderer.render(scene, fp.active || introSweep.usingFpCam ? fpCamera : camera);
 
     if (ogMode && currentWorld) {
@@ -4819,6 +5502,48 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       Boolean(fpTouchLook) ||
       Math.hypot(fpJoystick.right, fpJoystick.fwd) > 0.01 ||
       activePointers.size > 0,
-    getCreationEntity: (id) => creationEntities.get(id) || null,
+    getCreationEntity: (id) => ensureCreationBuilt(id),
+    getPerfStats: () => {
+      const summarize = (root) => {
+        let meshes = 0;
+        let shadowCasters = 0;
+        let triangles = 0;
+        let frozenMeshes = 0;
+        root.traverse((o) => {
+          if (!o.isMesh) return;
+          meshes++;
+          if (o.castShadow) shadowCasters++;
+          if (o.matrixAutoUpdate === false) frozenMeshes++;
+          const g = o.geometry;
+          if (g) {
+            const tri = g.index
+              ? g.index.count / 3
+              : (g.attributes.position?.count || 0) / 3;
+            triangles += o.isInstancedMesh ? tri * (o.count || 1) : tri;
+          }
+        });
+        return { meshes, shadowCasters, triangles: Math.round(triangles), frozenMeshes };
+      };
+      return {
+        entityCount: creationEntities.size,
+        pendingCreations: pendingCreationSpecs.size,
+        isStreamingCreations,
+        usePostProcessing,
+        isLowTierGpu,
+        isTouchDevice,
+        activeMaxDpr,
+        pixelRatio: renderer.getPixelRatio(),
+        shadowRes: SHADOW_RES,
+        render: { ...renderer.info.render },
+        memory: { ...renderer.info.memory },
+        sceneTotal: summarize(scene),
+        ground: summarize(groundMesh),
+        perimeterTrees: summarize(perimeterTreesGroup),
+        paths: summarize(pathsGroup),
+        props: summarize(propsGroup),
+        creations: summarize(creationsGroup),
+        villagers: summarize(villagersGroup),
+      };
+    },
   };
 }

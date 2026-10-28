@@ -2,7 +2,7 @@
 // Boarding, Riding & Alighting) and Tactile World Props.
 
 import * as THREE from "../vendor/three-bundle.js";
-import { Vox, buildVoxelMesh } from "./vox.js";
+import { Vox, buildVoxelMesh, mergeVoxelMeshInstances } from "./vox.js";
 
 const SKIN_TONES = ["#f5cfa8", "#e6b48a", "#c98e63", "#8d5838", "#f7dcc0"];
 const PANTS_COLORS = ["#394a6d", "#4b4f59", "#6b4f3a", "#3d6b5e", "#54476e"];
@@ -73,13 +73,13 @@ export function buildVillagerRig(villager, index = 0) {
   headPivot.add(buildVoxelMesh(headVox, { scale: s, depthLayer: 1 }));
   root.add(headPivot);
 
-  // Left & Right Legs (clean hip gap + depthLayer 2)
+  // Left & Right Legs (clean hip gap + depthLayer 2; torso & head cast the villager's ground shadow)
   const makeLeg = (seedOff) => {
     const piv = new THREE.Group();
     const lv = new Vox(301 + index + seedOff);
     lv.box(-1, -4, -1, 1, 0, 1, pants);
     lv.box(-1, -4, 0, 1, -3, 2, "#24272e");
-    piv.add(buildVoxelMesh(lv, { scale: s, depthLayer: 2 }));
+    piv.add(buildVoxelMesh(lv, { scale: s, depthLayer: 2, castShadow: false }));
     return piv;
   };
   const leftLeg = makeLeg(1);
@@ -94,7 +94,7 @@ export function buildVillagerRig(villager, index = 0) {
     const av = new Vox(401 + index + seedOff);
     av.box(x0, -3, -1, x1, 0, 1, shirt);
     av.box(x0, -4, -1, x1, -3, 1, skin);
-    piv.add(buildVoxelMesh(av, { scale: s, depthLayer: 3 }));
+    piv.add(buildVoxelMesh(av, { scale: s, depthLayer: 3, castShadow: false }));
     return piv;
   };
   const leftArm = makeArm(1, 0, 1);
@@ -506,20 +506,35 @@ export class VillagerAgent {
   }
 }
 
-/**
- * Build charming micro-voxel WorldProps (bus stops, ponds, warm lamp posts, benches, flower patches, signposts).
- */
-export function buildWorldPropMesh(prop) {
-  const group = new THREE.Group();
-  const s = 0.2;
+const propProtoCache = new Map();
+let sharedPondWaterMat = null;
 
-  if (prop.kind === "pond") {
-    const r = prop.radius || 6.4;
-    const ps = 0.32;
-    const gr = Math.round(r / ps);
+function getSharedPondWaterMaterial() {
+  if (!sharedPondWaterMat) {
+    sharedPondWaterMat = new THREE.MeshStandardMaterial({
+      color: "#4daee0",
+      roughness: 0.18,
+      metalness: 0.08,
+      emissive: new THREE.Color("#1a5b7d"),
+      emissiveIntensity: 0.16,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+    });
+  }
+  return sharedPondWaterMat;
+}
+
+function getPondPropProtos(radius) {
+  const r = radius || 6.4;
+  const ps = 0.32;
+  const s = 0.2;
+  const gr = Math.round(r / ps);
+  const cacheKey = `pond:${gr}`;
+  let cached = propProtoCache.get(cacheKey);
+  if (!cached) {
     const pondVox = new Vox(77);
     const rimTones = ["limestone", "concrete", "concrete2", "grass2"];
-    // Stepped voxel stone & mossy bank rim sitting flush on the meadow
     for (let x = -gr - 3; x <= gr + 3; x++) {
       for (let z = -gr - 3; z <= gr + 3; z++) {
         const d = Math.hypot(x, z);
@@ -534,26 +549,7 @@ export function buildWorldPropMesh(prop) {
       }
     }
     const rimMesh = buildVoxelMesh(pondVox, { scale: ps });
-    group.add(rimMesh);
 
-    const waterR = Math.max(1.2, (gr - 0.85) * ps);
-    const waterGeo = new THREE.CylinderGeometry(waterR, waterR, 0.2, 32);
-    const waterMat = new THREE.MeshStandardMaterial({
-      color: "#4daee0",
-      roughness: 0.18,
-      metalness: 0.08,
-      emissive: new THREE.Color("#1a5b7d"),
-      emissiveIntensity: 0.16,
-      polygonOffset: true,
-      polygonOffsetFactor: -1,
-      polygonOffsetUnits: -1,
-    });
-    const water = new THREE.Mesh(waterGeo, waterMat);
-    water.position.y = 0.11;
-    water.receiveShadow = true;
-    group.add(water);
-
-    // Chunky voxel lilypads & lotus blossoms
     const padVox = new Vox(79);
     const pads = [
       [-r * 0.38, -r * 0.24, true],
@@ -571,46 +567,80 @@ export function buildWorldPropMesh(prop) {
       }
     }
     const padMesh = buildVoxelMesh(padVox, { scale: s, castShadow: false });
-    padMesh.position.y = 0.05;
-    group.add(padMesh);
-  } else if (prop.kind === "bus_stop") {
-    const v = new Vox(51);
-    v.box(-5, 0, -3, 5, 1, 3, "concrete");
-    v.box(-4, 1, -2, -3, 10, -1, "woodDark");
-    v.box(3, 1, -2, 4, 10, -1, "woodDark");
-    v.box(-3, 2, -2, 3, 9, -1, "glass");
-    v.box(-5, 10, -3, 5, 11, 2, "terracotta");
-    v.box(-3, 2, -1, 3, 3, 1, "wood");
-    v.box(5, 0, 1, 6, 11, 2, "steelDark");
-    v.box(4, 10, 1, 7, 13, 2, "busYellow", 0.55);
-    v.put(5, 11, 2, "charcoal");
-    group.add(buildVoxelMesh(v, { scale: s }));
-  } else if (prop.kind === "lamp_post") {
-    const v = new Vox(61);
-    v.box(-1, 0, -1, 2, 2, 2, "iron");
-    v.box(0, 2, 0, 1, 13, 1, "iron");
-    v.box(0, 12, 0, 3, 13, 1, "iron");
-    v.box(2, 10, -0.5, 4, 12, 1.5, "warmGlow", 1.5);
-    group.add(buildVoxelMesh(v, { scale: s }));
-  } else if (prop.kind === "bench") {
-    const v = new Vox(71);
-    v.box(-4, 0, -1, -3, 3, 2, "iron");
-    v.box(3, 0, -1, 4, 3, 2, "iron");
-    v.box(-4, 2, -1, 4, 3, 2, "wood");
-    v.box(-4, 3, -1, 4, 5, 0, "woodLight");
-    group.add(buildVoxelMesh(v, { scale: s }));
-  } else if (prop.kind === "signpost") {
-    const v = new Vox(81);
-    v.box(0, 0, 0, 1, 10, 1, "woodDark");
-    v.box(-3, 7, 0, 4, 9, 1, "cream");
-    v.box(-1, 5, 0, 5, 6, 1, "wood");
-    group.add(buildVoxelMesh(v, { scale: s }));
-  } else {
-    const seed = Math.abs(Math.round((prop.x || 1) * 13 + (prop.z || 1) * 29)) + 91;
-    const v = new Vox(seed);
+    const waterR = Math.max(1.2, (gr - 0.85) * ps);
+    cached = { rimMesh, padMesh, waterR };
+    propProtoCache.set(cacheKey, cached);
+  }
+  return cached;
+}
+
+function getStandardPropProtoMesh(prop) {
+  const s = 0.2;
+  if (prop.kind === "bus_stop") {
+    let m = propProtoCache.get("bus_stop");
+    if (!m) {
+      const v = new Vox(51);
+      v.box(-5, 0, -3, 5, 1, 3, "concrete");
+      v.box(-4, 1, -2, -3, 10, -1, "woodDark");
+      v.box(3, 1, -2, 4, 10, -1, "woodDark");
+      v.box(-3, 2, -2, 3, 9, -1, "glass");
+      v.box(-5, 10, -3, 5, 11, 2, "terracotta");
+      v.box(-3, 2, -1, 3, 3, 1, "wood");
+      v.box(5, 0, 1, 6, 11, 2, "steelDark");
+      v.box(4, 10, 1, 7, 13, 2, "busYellow", 0.55);
+      v.put(5, 11, 2, "charcoal");
+      m = buildVoxelMesh(v, { scale: s });
+      propProtoCache.set("bus_stop", m);
+    }
+    return m;
+  }
+  if (prop.kind === "lamp_post") {
+    let m = propProtoCache.get("lamp_post");
+    if (!m) {
+      const v = new Vox(61);
+      v.box(-1, 0, -1, 2, 2, 2, "iron");
+      v.box(0, 2, 0, 1, 13, 1, "iron");
+      v.box(0, 12, 0, 3, 13, 1, "iron");
+      v.box(2, 10, -0.5, 4, 12, 1.5, "warmGlow", 1.5);
+      m = buildVoxelMesh(v, { scale: s });
+      propProtoCache.set("lamp_post", m);
+    }
+    return m;
+  }
+  if (prop.kind === "bench") {
+    let m = propProtoCache.get("bench");
+    if (!m) {
+      const v = new Vox(71);
+      v.box(-4, 0, -1, -3, 3, 2, "iron");
+      v.box(3, 0, -1, 4, 3, 2, "iron");
+      v.box(-4, 2, -1, 4, 3, 2, "wood");
+      v.box(-4, 3, -1, 4, 5, 0, "woodLight");
+      m = buildVoxelMesh(v, { scale: s });
+      propProtoCache.set("bench", m);
+    }
+    return m;
+  }
+  if (prop.kind === "signpost") {
+    let m = propProtoCache.get("signpost");
+    if (!m) {
+      const v = new Vox(81);
+      v.box(0, 0, 0, 1, 10, 1, "woodDark");
+      v.box(-3, 7, 0, 4, 9, 1, "cream");
+      v.box(-1, 5, 0, 5, 6, 1, "wood");
+      m = buildVoxelMesh(v, { scale: s });
+      propProtoCache.set("signpost", m);
+    }
+    return m;
+  }
+  const rawSeed = Math.abs(Math.round((prop.x || 1) * 13 + (prop.z || 1) * 29)) + 91;
+  const variant = rawSeed % 8;
+  const key = `flower:${variant}`;
+  let m = propProtoCache.get(key);
+  if (!m) {
+    const v = new Vox(91 + variant * 17);
     const blossoms = ["#f6d55c", "#ec8db0", "#fcfaf5", "#ffb642"];
-    const b1 = blossoms[seed % blossoms.length];
-    const b2 = blossoms[(seed + 1) % blossoms.length];
+    const b1 = blossoms[variant % blossoms.length];
+    const b2 = blossoms[(variant + 1) % blossoms.length];
     v.sphere(0, 1.1, 0, 2.6, 1.4, 2.3, "leaf");
     v.sphere(2.1, 0.9, 1.1, 1.9, 1.2, 1.8, "leafLight");
     v.sphere(-1.8, 0.8, 0.9, 1.6, 1.1, 1.6, "leafDark");
@@ -619,7 +649,95 @@ export function buildWorldPropMesh(prop) {
     v.put(0, 2, 1, b1);
     v.put(2, 2, 1, b2);
     v.put(-2, 1, 1, b2);
-    group.add(buildVoxelMesh(v, { scale: 0.22 }));
+    m = buildVoxelMesh(v, { scale: 0.22 });
+    propProtoCache.set(key, m);
+  }
+  return m;
+}
+
+/**
+ * Batch all static WorldProps into minimal GPU draw calls (1 shadow-casting voxel mesh,
+ * 1 non-shadow lilypad mesh, and pond water surfaces) while preserving exact visuals.
+ */
+export function buildBatchedWorldProps(props, targetGroup) {
+  const shadowEntries = [];
+  const noShadowEntries = [];
+
+  for (const prop of props || []) {
+    const px = prop.x || 0;
+    const pz = prop.z || 0;
+    const rotY = prop.yaw || 0;
+    if (prop.kind === "pond") {
+      const { rimMesh, padMesh, waterR } = getPondPropProtos(prop.radius);
+      shadowEntries.push({ mesh: rimMesh, x: px, y: 0, z: pz, rotY });
+      noShadowEntries.push({ mesh: padMesh, x: px, y: 0.05, z: pz, rotY });
+
+      const waterGeo = new THREE.CylinderGeometry(waterR, waterR, 0.2, 32);
+      const water = new THREE.Mesh(waterGeo, getSharedPondWaterMaterial());
+      water.position.set(px, 0.11, pz);
+      water.rotation.y = rotY;
+      water.receiveShadow = true;
+      water.matrixAutoUpdate = false;
+      water.updateMatrix();
+      water.userData.sharedMaterial = true;
+      targetGroup.add(water);
+    } else {
+      const protoMesh = getStandardPropProtoMesh(prop);
+      // Tiny low flower tufts don't need 4K shadow-map draw calls; tall props keep crisp shadows
+      const casts =
+        prop.kind === "bus_stop" ||
+        prop.kind === "lamp_post" ||
+        prop.kind === "bench" ||
+        prop.kind === "signpost";
+      if (casts) {
+        shadowEntries.push({ mesh: protoMesh, x: px, y: 0, z: pz, rotY });
+      } else {
+        noShadowEntries.push({ mesh: protoMesh, x: px, y: 0, z: pz, rotY });
+      }
+    }
+  }
+
+  const mergedShadow = mergeVoxelMeshInstances(shadowEntries, {
+    depthLayer: 0,
+    castShadow: true,
+    receiveShadow: true,
+  });
+  if (mergedShadow) targetGroup.add(mergedShadow);
+
+  const mergedNoShadow = mergeVoxelMeshInstances(noShadowEntries, {
+    depthLayer: 0,
+    castShadow: false,
+    receiveShadow: true,
+  });
+  if (mergedNoShadow) targetGroup.add(mergedNoShadow);
+}
+
+/**
+ * Build charming micro-voxel WorldProps (single-prop helper kept for compatibility).
+ */
+export function buildWorldPropMesh(prop) {
+  const group = new THREE.Group();
+  if (prop.kind === "pond") {
+    const { rimMesh, padMesh, waterR } = getPondPropProtos(prop.radius);
+    const rim = rimMesh.clone();
+    rim.userData.sharedProto = true;
+    group.add(rim);
+
+    const waterGeo = new THREE.CylinderGeometry(waterR, waterR, 0.2, 32);
+    const water = new THREE.Mesh(waterGeo, getSharedPondWaterMaterial());
+    water.position.y = 0.11;
+    water.receiveShadow = true;
+    water.userData.sharedMaterial = true;
+    group.add(water);
+
+    const pad = padMesh.clone();
+    pad.position.y = 0.05;
+    pad.userData.sharedProto = true;
+    group.add(pad);
+  } else {
+    const proto = getStandardPropProtoMesh(prop).clone();
+    proto.userData.sharedProto = true;
+    group.add(proto);
   }
 
   group.position.set(prop.x, 0, prop.z);

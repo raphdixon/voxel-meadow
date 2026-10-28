@@ -110,10 +110,10 @@ function buildVoxelHoverBracket(spanMeters = 0.54, color = "#ffe57f") {
 }
 
 function inspectCenterDeckSurface(group, maxOpenHeightVox = 6) {
-  const baseVox = group.userData?.baseVox;
+  const hasCenterVox = group.userData?.hasCenterVox;
   const voxScale = group.userData?.voxScale || 0.23;
   const b = group.userData?.baseBounds || { minX: -6, maxX: 6, minY: 0, maxY: 8, minZ: -6, maxZ: 6 };
-  if (!baseVox || !baseVox.v || baseVox.v.size === 0) {
+  if (typeof hasCenterVox !== "function") {
     return { onCenterTop: false, yMeters: 0.01, frontZMeters: 1.8, maxYMeters: 2.0, voxScale, bounds: b };
   }
 
@@ -127,10 +127,10 @@ function inspectCenterDeckSurface(group, maxOpenHeightVox = 6) {
     for (let z = -3; z <= 3; z++) {
       let colTop = -1;
       for (let y = 0; y <= maxOpenHeightVox; y++) {
-        if (baseVox.v.has(`${x},${y},${z}`)) colTop = y + 1;
+        if (hasCenterVox(x, y, z)) colTop = y + 1;
       }
       for (let y = maxOpenHeightVox + 1; y <= Math.min(64, b.maxY + 1); y++) {
-        if (baseVox.v.has(`${x},${y},${z}`)) {
+        if (hasCenterVox(x, y, z)) {
           hasOverheadRoof = true;
           break;
         }

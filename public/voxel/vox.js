@@ -189,6 +189,14 @@ const QUAD_UVS = [
   [0, 1],
 ];
 
+for (const f of FACES) {
+  const c0 = f.corners[0];
+  const c1 = f.corners[1];
+  const c3 = f.corners[3];
+  f.stepU = [c1[0] - c0[0], c1[1] - c0[1], c1[2] - c0[2]];
+  f.stepV = [c3[0] - c0[0], c3[1] - c0[1], c3[2] - c0[2]];
+}
+
 const rgbCache = new Map();
 export function parseColorLinear(hexOrName) {
   const safeName = typeof hexOrName === "string" ? hexOrName : "";
@@ -223,7 +231,32 @@ export function hashCoords(x, y, z, seed = 1) {
   return ((n ^ (n >>> 16)) >>> 0) / 4294967295;
 }
 
-const keyOf = (x, y, z) => `${x | 0},${y | 0},${z | 0}`;
+const KEY_BIAS = 512;
+const KEY_MASK = 1023;
+export function packVoxKey(x, y, z) {
+  return (
+    (((x + KEY_BIAS) & KEY_MASK) << 20) |
+    (((y + KEY_BIAS) & KEY_MASK) << 10) |
+    ((z + KEY_BIAS) & KEY_MASK)
+  );
+}
+
+const styleKeyToId = new Map();
+const styleRgbs = [null];
+const styleEmits = [0];
+
+function internVoxStyle(colStr, emitVal) {
+  const numEmit = Number(emitVal) || 0;
+  const k = numEmit === 0 ? colStr : `${colStr}|${numEmit}`;
+  let id = styleKeyToId.get(k);
+  if (!id) {
+    id = styleRgbs.length;
+    styleKeyToId.set(k, id);
+    styleRgbs.push(parseColorLinear(colStr));
+    styleEmits.push(numEmit);
+  }
+  return id;
+}
 
 export class Vox {
   constructor(seed = 1) {
@@ -235,6 +268,10 @@ export class Vox {
     return this.v.size;
   }
 
+  hasCell(x, y, z) {
+    return this.v.has(packVoxKey(x | 0, y | 0, z | 0));
+  }
+
   resolveColor(color, x, y, z) {
     const raw = typeof color === "function" ? color(x, y, z) : color;
     if (!raw) return null;
@@ -242,20 +279,50 @@ export class Vox {
   }
 
   put(x, y, z, color, emit = 0) {
-    const xi = Math.round(x);
-    const yi = Math.round(y);
-    const zi = Math.round(z);
+    const xi = Math.round(x) | 0;
+    const yi = Math.round(y) | 0;
+    const zi = Math.round(z) | 0;
     const col = this.resolveColor(color, xi, yi, zi);
-    const k = keyOf(xi, yi, zi);
+    const k = packVoxKey(xi, yi, zi);
     if (!col) this.v.delete(k);
-    else this.v.set(k, { x: xi, y: yi, z: zi, color: col, emit: Number(emit) || 0 });
+    else this.v.set(k, internVoxStyle(col, emit));
     return this;
   }
 
   box(x0, y0, z0, x1, y1, z1, color, emit = 0) {
-    const ax0 = Math.round(Math.min(x0, x1)), ax1 = Math.round(Math.max(x0, x1));
-    const ay0 = Math.round(Math.min(y0, y1)), ay1 = Math.round(Math.max(y0, y1));
-    const az0 = Math.round(Math.min(z0, z1)), az1 = Math.round(Math.max(z0, z1));
+    const ax0 = Math.round(Math.min(x0, x1)) | 0;
+    const ax1 = Math.round(Math.max(x0, x1)) | 0;
+    const ay0 = Math.round(Math.min(y0, y1)) | 0;
+    const ay1 = Math.round(Math.max(y0, y1)) | 0;
+    const az0 = Math.round(Math.min(z0, z1)) | 0;
+    const az1 = Math.round(Math.max(z0, z1)) | 0;
+    if (typeof color !== "function") {
+      const constCol = color ? PALETTE[color] || color : null;
+      if (!constCol) {
+        if (this.v.size === 0) return this;
+        for (let x = ax0; x < ax1; x++) {
+          const kx = ((x + KEY_BIAS) & KEY_MASK) << 20;
+          for (let y = ay0; y < ay1; y++) {
+            const kxy = kx | (((y + KEY_BIAS) & KEY_MASK) << 10);
+            for (let z = az0; z < az1; z++) {
+              this.v.delete(kxy | ((z + KEY_BIAS) & KEY_MASK));
+            }
+          }
+        }
+      } else {
+        const styleId = internVoxStyle(constCol, emit);
+        for (let x = ax0; x < ax1; x++) {
+          const kx = ((x + KEY_BIAS) & KEY_MASK) << 20;
+          for (let y = ay0; y < ay1; y++) {
+            const kxy = kx | (((y + KEY_BIAS) & KEY_MASK) << 10);
+            for (let z = az0; z < az1; z++) {
+              this.v.set(kxy | ((z + KEY_BIAS) & KEY_MASK), styleId);
+            }
+          }
+        }
+      }
+      return this;
+    }
     for (let x = ax0; x < ax1; x++) {
       for (let y = ay0; y < ay1; y++) {
         for (let z = az0; z < az1; z++) {
@@ -487,13 +554,16 @@ export class Vox {
   bounds() {
     if (!this.v.size) return { minX: 0, maxX: 0, minY: 0, maxY: 0, minZ: 0, maxZ: 0, count: 0 };
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
-    for (const p of this.v.values()) {
-      if (p.x < minX) minX = p.x;
-      if (p.x + 1 > maxX) maxX = p.x + 1;
-      if (p.y < minY) minY = p.y;
-      if (p.y + 1 > maxY) maxY = p.y + 1;
-      if (p.z < minZ) minZ = p.z;
-      if (p.z + 1 > maxZ) maxZ = p.z + 1;
+    for (const k of this.v.keys()) {
+      const x = ((k >> 20) & KEY_MASK) - KEY_BIAS;
+      const y = ((k >> 10) & KEY_MASK) - KEY_BIAS;
+      const z = (k & KEY_MASK) - KEY_BIAS;
+      if (x < minX) minX = x;
+      if (x + 1 > maxX) maxX = x + 1;
+      if (y < minY) minY = y;
+      if (y + 1 > maxY) maxY = y + 1;
+      if (z < minZ) minZ = z;
+      if (z + 1 > maxZ) maxZ = z + 1;
     }
     return { minX, maxX, minY, maxY, minZ, maxZ, count: this.v.size };
   }
@@ -634,13 +704,16 @@ function createVoxelStandardMaterial(layerIndex = 0) {
         "#include <common>",
         `#include <common>
         attribute float aEmit;
+        attribute float aJitterSeed;
         varying float vEmit;
+        varying float vJitterSeed;
         varying vec2 vVoxUv;`,
       )
       .replace(
         "#include <begin_vertex>",
         `#include <begin_vertex>
         vEmit = aEmit;
+        vJitterSeed = aJitterSeed;
         vVoxUv = uv;`,
       );
     shader.fragmentShader = shader.fragmentShader
@@ -648,6 +721,7 @@ function createVoxelStandardMaterial(layerIndex = 0) {
         "#include <common>",
         `#include <common>
         varying float vEmit;
+        varying float vJitterSeed;
         varying vec2 vVoxUv;`,
       )
       .replace(
@@ -655,9 +729,17 @@ function createVoxelStandardMaterial(layerIndex = 0) {
         `#include <color_fragment>
         float voxPx = max(fwidth(vVoxUv.x), fwidth(vVoxUv.y));
         float voxDetail = 1.0 - smoothstep(0.04, 0.14, voxPx);
-        float edgeDist = min(min(vVoxUv.x, 1.0 - vVoxUv.x), min(vVoxUv.y, 1.0 - vVoxUv.y));
+        vec2 cellUv = fract(vVoxUv);
+        if (vJitterSeed >= 0.0 && voxDetail > 0.005) {
+          vec2 cellId = floor(vVoxUv);
+          vec2 jq = fract(cellId * vec2(123.34, 456.21) + vJitterSeed);
+          jq += dot(jq, jq + 45.32);
+          float cellJ = fract(jq.x * jq.y) - 0.5;
+          diffuseColor.rgb *= 1.0 + cellJ * 0.072 * voxDetail;
+        }
+        float edgeDist = min(min(cellUv.x, 1.0 - cellUv.x), min(cellUv.y, 1.0 - cellUv.y));
         float seam = smoothstep(0.0, max(0.085, voxPx * 1.45), edgeDist);
-        float hi = smoothstep(0.14, 0.02, edgeDist) * (vVoxUv.y * 0.6 + 0.4);
+        float hi = smoothstep(0.14, 0.02, edgeDist) * (cellUv.y * 0.6 + 0.4);
         diffuseColor.rgb *= mix(1.0 - 0.22 * voxDetail, 1.0, seam);
         diffuseColor.rgb += hi * 0.05 * voxDetail;
         if (vEmit > 0.05) {
@@ -671,9 +753,10 @@ function createVoxelStandardMaterial(layerIndex = 0) {
         vec3 dPosY = dFdy(vViewPosition);
         vec2 dUvX = dFdx(vVoxUv);
         vec2 dUvY = dFdy(vVoxUv);
+        vec2 bevUv = fract(vVoxUv);
         float bevW = 0.115;
-        float bx = smoothstep(bevW, 0.0, vVoxUv.x) - smoothstep(1.0 - bevW, 1.0, vVoxUv.x);
-        float by = smoothstep(bevW, 0.0, vVoxUv.y) - smoothstep(1.0 - bevW, 1.0, vVoxUv.y);
+        float bx = smoothstep(bevW, 0.0, bevUv.x) - smoothstep(1.0 - bevW, 1.0, bevUv.x);
+        float by = smoothstep(bevW, 0.0, bevUv.y) - smoothstep(1.0 - bevW, 1.0, bevUv.y);
         vec3 surfT = normalize(dPosX * dUvY.y - dPosY * dUvX.y + 1e-6);
         vec3 surfB = normalize(-dPosX * dUvY.x + dPosY * dUvX.x + 1e-6);
         normal = normalize(normal - (surfT * bx + surfB * by) * 0.26 * (1.0 - smoothstep(0.04, 0.14, max(fwidth(vVoxUv.x), fwidth(vVoxUv.y)))));`,
@@ -684,7 +767,7 @@ function createVoxelStandardMaterial(layerIndex = 0) {
         totalEmissiveRadiance += diffuseColor.rgb * min(vEmit * 0.9, 1.35);`,
       );
   };
-  mat.customProgramCacheKey = () => "meadow-voxel-bevel-ao-v1";
+  mat.customProgramCacheKey = () => "meadow-voxel-bevel-ao-v2";
   return mat;
 }
 
@@ -716,6 +799,8 @@ function getGhostVoxelMaterial() {
   return ghostMat;
 }
 
+let greedyMaskScratch = new Int32Array(4096);
+
 export function buildVoxelMesh(vox, options = {}) {
   const {
     jitter = 0.036,
@@ -732,50 +817,341 @@ export function buildVoxelMesh(vox, options = {}) {
   const colors = [];
   const uvs = [];
   const emits = [];
+  const jSeeds = [];
   const indices = [];
 
   const map = vox.v;
+  const seedBase = (vox.seed & 1023) * 0.73;
   let vertCount = 0;
 
-  for (const cell of map.values()) {
-    const { x, y, z, color, emit } = cell;
-    const [br, bg, bb] = parseColorLinear(color);
-    const j = 1.0 + (hashCoords(x, y, z, vox.seed) - 0.5) * 2 * jitter;
+  const emitQuad = (
+    x0,
+    y0,
+    z0,
+    w,
+    h,
+    face,
+    fi,
+    sliceW,
+    u0,
+    v0,
+    br,
+    bg,
+    bb,
+    ao0,
+    ao1,
+    ao2,
+    ao3,
+    emit,
+    dirShade,
+  ) => {
+    const [nx, ny, nz] = face.n;
+    const c0 = face.corners[0];
+    const su = face.stepU;
+    const sv = face.stepV;
+    const bx = x0 + c0[0];
+    const by = y0 + c0[1];
+    const bz = z0 + c0[2];
+    const wx = w * su[0];
+    const wy = w * su[1];
+    const wz = w * su[2];
+    const hx = h * sv[0];
+    const hy = h * sv[1];
+    const hz = h * sv[2];
+
+    positions.push(
+      bx * scale,
+      by * scale,
+      bz * scale,
+      (bx + wx) * scale,
+      (by + wy) * scale,
+      (bz + wz) * scale,
+      (bx + wx + hx) * scale,
+      (by + wy + hy) * scale,
+      (bz + wz + hz) * scale,
+      (bx + hx) * scale,
+      (by + hy) * scale,
+      (bz + hz) * scale,
+    );
+    normals.push(nx, ny, nz, nx, ny, nz, nx, ny, nz, nx, ny, nz);
+
+    const s0 = ao0 * dirShade;
+    const s1 = ao1 * dirShade;
+    const s2 = ao2 * dirShade;
+    const s3 = ao3 * dirShade;
+    colors.push(
+      Math.min(1, br * s0),
+      Math.min(1, bg * s0),
+      Math.min(1, bb * s0),
+      Math.min(1, br * s1),
+      Math.min(1, bg * s1),
+      Math.min(1, bb * s1),
+      Math.min(1, br * s2),
+      Math.min(1, bg * s2),
+      Math.min(1, bb * s2),
+      Math.min(1, br * s3),
+      Math.min(1, bg * s3),
+      Math.min(1, bb * s3),
+    );
+
+    const uBase = u0 + 512;
+    const vBase = v0 + 512;
+    uvs.push(uBase, vBase, uBase + w, vBase, uBase + w, vBase + h, uBase, vBase + h);
+    emits.push(emit, emit, emit, emit);
+
+    const jSeed = jitter > 0 && !ghost ? seedBase + fi * 13.1 + (sliceW + 512) * 2.3 : -1.0;
+    jSeeds.push(jSeed, jSeed, jSeed, jSeed);
+
+    if (ao0 + ao2 < ao1 + ao3) {
+      indices.push(
+        vertCount + 1,
+        vertCount + 2,
+        vertCount + 3,
+        vertCount + 1,
+        vertCount + 3,
+        vertCount + 0,
+      );
+    } else {
+      indices.push(
+        vertCount + 0,
+        vertCount + 1,
+        vertCount + 2,
+        vertCount + 0,
+        vertCount + 2,
+        vertCount + 3,
+      );
+    }
+    vertCount += 4;
+  };
+
+  // Slices grouped by face direction (0..5) -> sliceW -> flat [u, v, faceToken, ...]
+  // faceToken = (styleId << 8) | (ai0 << 6) | (ai1 << 4) | (ai2 << 2) | ai3
+  const faceSlices = [new Map(), new Map(), new Map(), new Map(), new Map(), new Map()];
+
+  for (const [k, styleId] of map.entries()) {
+    const x = ((k >> 20) & KEY_MASK) - KEY_BIAS;
+    const y = ((k >> 10) & KEY_MASK) - KEY_BIAS;
+    const z = (k & KEY_MASK) - KEY_BIAS;
+    const emit = styleEmits[styleId];
+    const parsedRgb = styleRgbs[styleId];
 
     for (let fi = 0; fi < 6; fi++) {
       const face = FACES[fi];
       const [nx, ny, nz] = face.n;
-      if (map.has(keyOf(x + nx, y + ny, z + nz))) continue;
+      if (map.has(packVoxKey(x + nx, y + ny, z + nz))) continue;
 
-      const cornerAO = [1, 1, 1, 1];
+      let ai0 = 3;
+      let ai1 = 3;
+      let ai2 = 3;
+      let ai3 = 3;
       if (ao && emit < 0.5) {
-        for (let ci = 0; ci < 4; ci++) {
-          const [d1, d2, dc] = face.aoDirs[ci];
-          const s1 = map.has(keyOf(x + d1[0], y + d1[1], z + d1[2]));
-          const s2 = map.has(keyOf(x + d2[0], y + d2[1], z + d2[2]));
-          const sc = map.has(keyOf(x + dc[0], y + dc[1], z + dc[2]));
-          const lvl = s1 && s2 ? 0 : 3 - ((s1 ? 1 : 0) + (s2 ? 1 : 0) + (sc ? 1 : 0));
-          cornerAO[ci] = AO_LEVELS[lvl];
+        const dirs = face.aoDirs;
+        {
+          const [d1, d2, dc] = dirs[0];
+          const s1 = map.has(packVoxKey(x + d1[0], y + d1[1], z + d1[2]));
+          const s2 = map.has(packVoxKey(x + d2[0], y + d2[1], z + d2[2]));
+          const sc = map.has(packVoxKey(x + dc[0], y + dc[1], z + dc[2]));
+          ai0 = s1 && s2 ? 0 : 3 - ((s1 ? 1 : 0) + (s2 ? 1 : 0) + (sc ? 1 : 0));
+        }
+        {
+          const [d1, d2, dc] = dirs[1];
+          const s1 = map.has(packVoxKey(x + d1[0], y + d1[1], z + d1[2]));
+          const s2 = map.has(packVoxKey(x + d2[0], y + d2[1], z + d2[2]));
+          const sc = map.has(packVoxKey(x + dc[0], y + dc[1], z + dc[2]));
+          ai1 = s1 && s2 ? 0 : 3 - ((s1 ? 1 : 0) + (s2 ? 1 : 0) + (sc ? 1 : 0));
+        }
+        {
+          const [d1, d2, dc] = dirs[2];
+          const s1 = map.has(packVoxKey(x + d1[0], y + d1[1], z + d1[2]));
+          const s2 = map.has(packVoxKey(x + d2[0], y + d2[1], z + d2[2]));
+          const sc = map.has(packVoxKey(x + dc[0], y + dc[1], z + dc[2]));
+          ai2 = s1 && s2 ? 0 : 3 - ((s1 ? 1 : 0) + (s2 ? 1 : 0) + (sc ? 1 : 0));
+        }
+        {
+          const [d1, d2, dc] = dirs[3];
+          const s1 = map.has(packVoxKey(x + d1[0], y + d1[1], z + d1[2]));
+          const s2 = map.has(packVoxKey(x + d2[0], y + d2[1], z + d2[2]));
+          const sc = map.has(packVoxKey(x + dc[0], y + dc[1], z + dc[2]));
+          ai3 = s1 && s2 ? 0 : 3 - ((s1 ? 1 : 0) + (s2 ? 1 : 0) + (sc ? 1 : 0));
         }
       }
 
-      const dirShade = ny > 0 ? 1.04 : ny < 0 ? 0.64 : nz > 0 ? 0.96 : nx > 0 ? 0.89 : nx < 0 ? 0.83 : 0.79;
-      for (let ci = 0; ci < 4; ci++) {
-        const c = face.corners[ci];
-        positions.push((x + c[0]) * scale, (y + c[1]) * scale, (z + c[2]) * scale);
-        normals.push(nx, ny, nz);
-        const shade = cornerAO[ci] * j * dirShade;
-        colors.push(Math.min(1, br * shade), Math.min(1, bg * shade), Math.min(1, bb * shade));
-        uvs.push(QUAD_UVS[ci][0], QUAD_UVS[ci][1]);
-        emits.push(emit);
+      const su = face.stepU;
+      const sv = face.stepV;
+      const sliceW = x * nx + y * ny + z * nz;
+      const u = x * su[0] + y * su[1] + z * su[2];
+      const v = x * sv[0] + y * sv[1] + z * sv[2];
+
+      // Uniform AO (2D merge) OR 1D-constant AO creases (exact linear interpolation along U or V!)
+      const canMergeU = ai0 === ai1 && ai2 === ai3;
+      const canMergeV = ai0 === ai3 && ai1 === ai2;
+      if (canMergeU || canMergeV) {
+        let bucket = faceSlices[fi].get(sliceW);
+        if (!bucket) {
+          bucket = { minU: u, maxU: u, minV: v, maxV: v, items: [] };
+          faceSlices[fi].set(sliceW, bucket);
+        } else {
+          if (u < bucket.minU) bucket.minU = u;
+          if (u > bucket.maxU) bucket.maxU = u;
+          if (v < bucket.minV) bucket.minV = v;
+          if (v > bucket.maxV) bucket.maxV = v;
+        }
+        const token = (styleId << 8) | (ai0 << 6) | (ai1 << 4) | (ai2 << 2) | ai3;
+        bucket.items.push(u, v, token);
+      } else {
+        const dirShade =
+          ny > 0 ? 1.04 : ny < 0 ? 0.64 : nz > 0 ? 0.96 : nx > 0 ? 0.89 : nx < 0 ? 0.83 : 0.79;
+        emitQuad(
+          x,
+          y,
+          z,
+          1,
+          1,
+          face,
+          fi,
+          sliceW,
+          u,
+          v,
+          parsedRgb[0],
+          parsedRgb[1],
+          parsedRgb[2],
+          AO_LEVELS[ai0],
+          AO_LEVELS[ai1],
+          AO_LEVELS[ai2],
+          AO_LEVELS[ai3],
+          emit,
+          dirShade,
+        );
+      }
+    }
+  }
+
+  // Greedy merge across every coplanar slice (2D for uniform AO, 1D strips for straight wall/sill creases)
+  for (let fi = 0; fi < 6; fi++) {
+    const face = FACES[fi];
+    const [nx, ny, nz] = face.n;
+    const su = face.stepU;
+    const sv = face.stepV;
+    const dirShade =
+      ny > 0 ? 1.04 : ny < 0 ? 0.64 : nz > 0 ? 0.96 : nx > 0 ? 0.89 : nx < 0 ? 0.83 : 0.79;
+
+    for (const [sliceW, bucket] of faceSlices[fi].entries()) {
+      const items = bucket.items;
+      if (items.length === 3) {
+        const u0 = items[0];
+        const v0 = items[1];
+        const token = items[2];
+        const styleId = token >>> 8;
+        const rgb = styleRgbs[styleId];
+        const x0 = sliceW * nx + u0 * su[0] + v0 * sv[0];
+        const y0 = sliceW * ny + u0 * su[1] + v0 * sv[1];
+        const z0 = sliceW * nz + u0 * su[2] + v0 * sv[2];
+        emitQuad(
+          x0,
+          y0,
+          z0,
+          1,
+          1,
+          face,
+          fi,
+          sliceW,
+          u0,
+          v0,
+          rgb[0],
+          rgb[1],
+          rgb[2],
+          AO_LEVELS[(token >>> 6) & 3],
+          AO_LEVELS[(token >>> 4) & 3],
+          AO_LEVELS[(token >>> 2) & 3],
+          AO_LEVELS[token & 3],
+          styleEmits[styleId],
+          dirShade,
+        );
+        continue;
       }
 
-      if (cornerAO[0] + cornerAO[2] < cornerAO[1] + cornerAO[3]) {
-        indices.push(vertCount + 1, vertCount + 2, vertCount + 3, vertCount + 1, vertCount + 3, vertCount + 0);
-      } else {
-        indices.push(vertCount + 0, vertCount + 1, vertCount + 2, vertCount + 0, vertCount + 2, vertCount + 3);
+      const { minU, minV } = bucket;
+      const spanU = bucket.maxU - minU + 1;
+      const spanV = bucket.maxV - minV + 1;
+      const area = spanU * spanV;
+      if (area > greedyMaskScratch.length) {
+        greedyMaskScratch = new Int32Array(Math.max(area, greedyMaskScratch.length * 2));
       }
-      vertCount += 4;
+      const mask = greedyMaskScratch;
+      mask.fill(0, 0, area);
+
+      for (let idx = 0; idx < items.length; idx += 3) {
+        mask[(items[idx + 1] - minV) * spanU + (items[idx] - minU)] = items[idx + 2];
+      }
+
+      for (let dv = 0; dv < spanV; dv++) {
+        const rowOff = dv * spanU;
+        for (let du = 0; du < spanU; du++) {
+          const token = mask[rowOff + du];
+          if (token === 0) continue;
+
+          const ai0 = (token >>> 6) & 3;
+          const ai1 = (token >>> 4) & 3;
+          const ai2 = (token >>> 2) & 3;
+          const ai3 = token & 3;
+          const allowU = ai0 === ai1 && ai2 === ai3;
+          const allowV = ai0 === ai3 && ai1 === ai2;
+
+          let w = 1;
+          if (allowU) {
+            while (du + w < spanU && mask[rowOff + du + w] === token) {
+              w++;
+            }
+          }
+
+          let h = 1;
+          if (allowV) {
+            outerH: while (dv + h < spanV) {
+              const nextRow = (dv + h) * spanU + du;
+              for (let k = 0; k < w; k++) {
+                if (mask[nextRow + k] !== token) break outerH;
+              }
+              h++;
+            }
+          }
+
+          for (let r = 0; r < h; r++) {
+            const clrRow = (dv + r) * spanU + du;
+            for (let k = 0; k < w; k++) {
+              mask[clrRow + k] = 0;
+            }
+          }
+
+          const u0 = minU + du;
+          const v0 = minV + dv;
+          const x0 = sliceW * nx + u0 * su[0] + v0 * sv[0];
+          const y0 = sliceW * ny + u0 * su[1] + v0 * sv[1];
+          const z0 = sliceW * nz + u0 * su[2] + v0 * sv[2];
+          const styleId = token >>> 8;
+          const rgb = styleRgbs[styleId];
+          emitQuad(
+            x0,
+            y0,
+            z0,
+            w,
+            h,
+            face,
+            fi,
+            sliceW,
+            u0,
+            v0,
+            rgb[0],
+            rgb[1],
+            rgb[2],
+            AO_LEVELS[ai0],
+            AO_LEVELS[ai1],
+            AO_LEVELS[ai2],
+            AO_LEVELS[ai3],
+            styleEmits[styleId],
+            dirShade,
+          );
+        }
+      }
     }
   }
 
@@ -785,7 +1161,12 @@ export function buildVoxelMesh(vox, options = {}) {
   geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
   geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
   geo.setAttribute("aEmit", new THREE.Float32BufferAttribute(emits, 1));
-  geo.setIndex(indices);
+  geo.setAttribute("aJitterSeed", new THREE.Float32BufferAttribute(jSeeds, 1));
+  geo.setIndex(
+    vertCount <= 65535
+      ? new THREE.Uint16BufferAttribute(indices, 1)
+      : new THREE.Uint32BufferAttribute(indices, 1),
+  );
   geo.computeBoundingSphere();
 
   const mesh = new THREE.Mesh(
@@ -795,6 +1176,118 @@ export function buildVoxelMesh(vox, options = {}) {
   mesh.castShadow = castShadow && !ghost;
   mesh.receiveShadow = receiveShadow && !ghost;
   return mesh;
+}
+
+/**
+ * Merges an array of static voxel mesh instances `{ mesh, x, y, z, rotY, scaleX, scaleY, scaleZ }`
+ * into a single static `THREE.Mesh` draw call while preserving per-vertex AO, color, emit, UV bevels, and jitter.
+ */
+export function mergeVoxelMeshInstances(entries, options = {}) {
+  const { depthLayer = 0, castShadow = true, receiveShadow = true } = options;
+  if (!entries || entries.length === 0) return null;
+
+  let totalVerts = 0;
+  let totalIndices = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const geo = entries[i].mesh?.geometry;
+    if (!geo) continue;
+    const p = geo.attributes.position;
+    const idx = geo.index;
+    if (!p || !idx) continue;
+    totalVerts += p.count;
+    totalIndices += idx.count;
+  }
+  if (totalVerts === 0 || totalIndices === 0) return null;
+
+  const posOut = new Float32Array(totalVerts * 3);
+  const normOut = new Float32Array(totalVerts * 3);
+  const colOut = new Float32Array(totalVerts * 3);
+  const uvOut = new Float32Array(totalVerts * 2);
+  const emitOut = new Float32Array(totalVerts);
+  const jSeedOut = new Float32Array(totalVerts);
+  const idxOut =
+    totalVerts <= 65535 ? new Uint16Array(totalIndices) : new Uint32Array(totalIndices);
+
+  let vCursor = 0;
+  let iCursor = 0;
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const geo = entry.mesh?.geometry;
+    if (!geo) continue;
+    const pArr = geo.attributes.position.array;
+    const nArr = geo.attributes.normal.array;
+    const cArr = geo.attributes.color.array;
+    const uArr = geo.attributes.uv.array;
+    const eArr = geo.attributes.aEmit?.array;
+    const jArr = geo.attributes.aJitterSeed?.array;
+    const idxArr = geo.index.array;
+    const vCount = geo.attributes.position.count;
+
+    const tx = entry.x || 0;
+    const ty = entry.y || 0;
+    const tz = entry.z || 0;
+    const rotY = entry.rotY || 0;
+    const cosY = Math.cos(rotY);
+    const sinY = Math.sin(rotY);
+    const sx = entry.scaleX ?? entry.scale ?? 1;
+    const sy = entry.scaleY ?? entry.scale ?? 1;
+    const sz = entry.scaleZ ?? entry.scale ?? 1;
+
+    for (let v = 0; v < vCount; v++) {
+      const i3 = v * 3;
+      const o3 = (vCursor + v) * 3;
+      const lx = pArr[i3] * sx;
+      const ly = pArr[i3 + 1] * sy;
+      const lz = pArr[i3 + 2] * sz;
+      posOut[o3] = lx * cosY + lz * sinY + tx;
+      posOut[o3 + 1] = ly + ty;
+      posOut[o3 + 2] = -lx * sinY + lz * cosY + tz;
+
+      const nx = nArr[i3];
+      const ny = nArr[i3 + 1];
+      const nz = nArr[i3 + 2];
+      normOut[o3] = nx * cosY + nz * sinY;
+      normOut[o3 + 1] = ny;
+      normOut[o3 + 2] = -nx * sinY + nz * cosY;
+
+      colOut[o3] = cArr[i3];
+      colOut[o3 + 1] = cArr[i3 + 1];
+      colOut[o3 + 2] = cArr[i3 + 2];
+
+      const i2 = v * 2;
+      const o2 = (vCursor + v) * 2;
+      uvOut[o2] = uArr[i2];
+      uvOut[o2 + 1] = uArr[i2 + 1];
+
+      emitOut[vCursor + v] = eArr ? eArr[v] : 0;
+      jSeedOut[vCursor + v] = jArr ? jArr[v] : -1;
+    }
+
+    for (let k = 0; k < idxArr.length; k++) {
+      idxOut[iCursor + k] = idxArr[k] + vCursor;
+    }
+
+    vCursor += vCount;
+    iCursor += idxArr.length;
+  }
+
+  const mergedGeo = new THREE.BufferGeometry();
+  mergedGeo.setAttribute("position", new THREE.BufferAttribute(posOut, 3));
+  mergedGeo.setAttribute("normal", new THREE.BufferAttribute(normOut, 3));
+  mergedGeo.setAttribute("color", new THREE.BufferAttribute(colOut, 3));
+  mergedGeo.setAttribute("uv", new THREE.BufferAttribute(uvOut, 2));
+  mergedGeo.setAttribute("aEmit", new THREE.BufferAttribute(emitOut, 1));
+  mergedGeo.setAttribute("aJitterSeed", new THREE.BufferAttribute(jSeedOut, 1));
+  mergedGeo.setIndex(new THREE.BufferAttribute(idxOut, 1));
+  mergedGeo.computeBoundingSphere();
+
+  const mergedMesh = new THREE.Mesh(mergedGeo, getVoxelMaterialForLayer(depthLayer));
+  mergedMesh.castShadow = castShadow;
+  mergedMesh.receiveShadow = receiveShadow;
+  mergedMesh.matrixAutoUpdate = false;
+  mergedMesh.updateMatrix();
+  return mergedMesh;
 }
 
 /**
@@ -812,12 +1305,27 @@ export function buildCreationGroup(blueprint, options = {}) {
 
   const baseVox = new Vox(seed);
   applyOps(baseVox, blueprint?.ops || [], pal);
+  const baseBounds = baseVox.bounds();
   if (baseVox.size > 0) {
     const baseMesh = buildVoxelMesh(baseVox, { scale: voxScale, ghost });
     group.add(baseMesh);
   }
 
-  let maxTopY = baseVox.bounds().maxY * voxScale;
+  // Record compact [-3..3] x [-3..3] column occupancy so `baseVox` (hundreds of MB across 115+ builds) can be freed immediately!
+  const centerColKeys = new Set();
+  if (baseVox.size > 0) {
+    const maxCheckY = Math.min(64, baseBounds.maxY + 1);
+    for (let x = -3; x <= 3; x++) {
+      for (let z = -3; z <= 3; z++) {
+        for (let y = 0; y <= maxCheckY; y++) {
+          const k = packVoxKey(x, y, z);
+          if (baseVox.v.has(k)) centerColKeys.add(k);
+        }
+      }
+    }
+  }
+
+  let maxTopY = baseBounds.maxY * voxScale;
 
   for (let i = 0; i < (blueprint?.parts || []).length; i++) {
     const part = blueprint.parts[i];
@@ -833,6 +1341,7 @@ export function buildCreationGroup(blueprint, options = {}) {
     const pMesh = buildVoxelMesh(pv, {
       scale: voxScale,
       ghost,
+      castShadow: pv.size > 14,
       depthLayer: (i % 6) + 1,
     });
     // Microscopic scale inset + per-part polygonOffset prevents coplanar depth shimmer on grazing joints
@@ -886,12 +1395,19 @@ export function buildCreationGroup(blueprint, options = {}) {
 
   group.userData.topY = Math.max(1.0, maxTopY);
   group.userData.voxScale = voxScale;
-  group.userData.baseVox = baseVox;
-  group.userData.baseBounds = baseVox.bounds();
+  group.userData.hasCenterVox =
+    centerColKeys.size > 0
+      ? (x, y, z) => centerColKeys.has(packVoxKey(x | 0, y | 0, z | 0))
+      : null;
+  group.userData.baseBounds = baseBounds;
   group.userData.partPivots = partPivots;
-  group.userData.animate = (t, motion = null) => {
-    for (const fn of animators) fn(t, motion);
-  };
+  group.userData.animatorCount = animators.length;
+  group.userData.animate =
+    animators.length > 0
+      ? (t, motion = null) => {
+          for (const fn of animators) fn(t, motion);
+        }
+      : null;
   group.userData.dispose = () => {
     group.traverse((obj) => {
       if (obj.isMesh && obj.geometry) obj.geometry.dispose();
@@ -917,12 +1433,13 @@ export function buildSplitDualVehicleGroups(blueprint, options = {}) {
     const sideVox = new Vox(seed + seedOffset);
     let minX = Infinity;
     let maxX = -Infinity;
-    for (const [k, cell] of fullVox.v.entries()) {
-      const belongs = isRightSide ? cell.x >= splitX : cell.x < splitX;
+    for (const [k, styleId] of fullVox.v.entries()) {
+      const cx = ((k >> 20) & KEY_MASK) - KEY_BIAS;
+      const belongs = isRightSide ? cx >= splitX : cx < splitX;
       if (!belongs) continue;
-      sideVox.v.set(k, { ...cell });
-      if (cell.x < minX) minX = cell.x;
-      if (cell.x + 1 > maxX) maxX = cell.x + 1;
+      sideVox.v.set(k, styleId);
+      if (cx < minX) minX = cx;
+      if (cx + 1 > maxX) maxX = cx + 1;
     }
     if (!sideVox.size) return null;
 
@@ -956,6 +1473,7 @@ export function buildSplitDualVehicleGroups(blueprint, options = {}) {
       const pMesh = buildVoxelMesh(pv, {
         scale: voxScale,
         ghost,
+        castShadow: pv.size > 14,
         depthLayer: (i % 6) + 1,
       });
       pMesh.scale.setScalar(0.9985);
@@ -976,9 +1494,13 @@ export function buildSplitDualVehicleGroups(blueprint, options = {}) {
 
     outer.userData.topY = Math.max(1.0, maxTopY);
     outer.userData.voxScale = voxScale;
-    outer.userData.animate = (t, motion = null) => {
-      for (const fn of animators) fn(t, motion);
-    };
+    outer.userData.animatorCount = animators.length;
+    outer.userData.animate =
+      animators.length > 0
+        ? (t, motion = null) => {
+            for (const fn of animators) fn(t, motion);
+          }
+        : null;
     outer.userData.dispose = () => {
       outer.traverse((obj) => {
         if (obj.isMesh && obj.geometry) obj.geometry.dispose();

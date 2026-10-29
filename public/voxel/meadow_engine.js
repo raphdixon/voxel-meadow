@@ -4109,6 +4109,53 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   const pressedKeys = new Set();
   const fpJoystick = { right: 0, fwd: 0 };
   let fpTouchLook = null;
+  let suppressPointerUnlockExit = false;
+  let lastUnlockedFpMouse = null;
+
+  function requestWalkPointerLock() {
+    if (!fp.active || ogMode) return;
+    if (typeof document !== "undefined" && document.querySelector("dialog[open]")) return;
+    if (typeof window !== "undefined" && window.matchMedia?.("(pointer: coarse)")?.matches) return;
+    if (document.pointerLockElement === canvas) return;
+    try {
+      const maybePromise = canvas.requestPointerLock?.({ unadjustedMovement: true });
+      if (maybePromise && typeof maybePromise.catch === "function") {
+        maybePromise.catch(() => {
+          try {
+            const fallback = canvas.requestPointerLock?.();
+            if (fallback && typeof fallback.catch === "function") {
+              fallback.catch(() => {});
+            }
+          } catch {
+            // Unclicked free-mouse look handles non-gesture entry seamlessly
+          }
+        });
+      }
+    } catch {
+      try {
+        const fallback = canvas.requestPointerLock?.();
+        if (fallback && typeof fallback.catch === "function") {
+          fallback.catch(() => {});
+        }
+      } catch {
+        // Ignore unsupported environments
+      }
+    }
+  }
+
+  function releaseWalkPointerLock() {
+    if (document.pointerLockElement === canvas) {
+      suppressPointerUnlockExit = true;
+      try {
+        document.exitPointerLock();
+      } catch {
+        suppressPointerUnlockExit = false;
+      }
+      setTimeout(() => {
+        suppressPointerUnlockExit = false;
+      }, 120);
+    }
+  }
 
   function setJoystickInput(right, fwd) {
     const rx = Number.isFinite(right) ? right : 0;
@@ -4124,7 +4171,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   function idleCursor() {
-    if (fp.active) return "grab";
+    if (fp.active) return "crosshair";
     if (spotState.mode === "picking" || spotState.mode === "staked") return "crosshair";
     return "grab";
   }
@@ -4498,13 +4545,14 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     fpCamera.updateMatrixWorld();
     syncComposerCamera(fpCamera);
     canvas.style.cursor = idleCursor();
-
+    lastUnlockedFpMouse = null;
     callbacks.onDragModeChange?.("walk");
     callbacks.onInteriorChange?.({
       roomId: res.roomId,
       name: res.creation?.name || "",
     });
     refreshInteractionTarget();
+    requestWalkPointerLock();
     return true;
   }
 
@@ -4589,9 +4637,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     fpCamera.updateMatrixWorld();
     syncComposerCamera(fpCamera);
     canvas.style.cursor = idleCursor();
+    lastUnlockedFpMouse = null;
 
     callbacks.onDragModeChange?.("walk");
     refreshInteractionTarget();
+    requestWalkPointerLock();
     return true;
   }
 
@@ -4821,7 +4871,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     fpCamera.updateMatrixWorld();
     syncComposerCamera(fpCamera);
     canvas.style.cursor = idleCursor();
+    lastUnlockedFpMouse = null;
+    clearInteractiveHover();
+    callbacks.onHoverCreation?.(null, 0, 0, null);
     refreshInteractionTarget();
+    requestWalkPointerLock();
   }
 
   function exitFirstPerson(toHome = false) {
@@ -4849,16 +4903,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     fpJoystick.right = 0;
     fpJoystick.fwd = 0;
     fpTouchLook = null;
+    lastUnlockedFpMouse = null;
     pointerGesture = null;
     activePointers.clear();
     pressedKeys.clear();
-    if (document.pointerLockElement === canvas) {
-      try {
-        document.exitPointerLock();
-      } catch {
-        // ignore pointer-lock exit errors
-      }
-    }
+    releaseWalkPointerLock();
     localAvatarRig.setFirstPersonMode(false);
     sun.intensity = 2.25;
     hemi.intensity = 1.12;
@@ -5045,21 +5094,34 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     { passive: false },
   );
 
-  canvas.addEventListener("dblclick", () => {
-    if (!fp.active) return;
+  document.addEventListener("pointerlockchange", () => {
     if (document.pointerLockElement === canvas) {
-      try {
-        document.exitPointerLock();
-      } catch {
-        // ignore
-      }
-    } else {
-      try {
-        canvas.requestPointerLock?.();
-      } catch {
-        // ignore unsupported environments
-      }
+      lastUnlockedFpMouse = null;
+      clearInteractiveHover();
+      callbacks.onHoverCreation?.(null, 0, 0, null);
+      return;
     }
+    lastUnlockedFpMouse = null;
+    if (suppressPointerUnlockExit) {
+      suppressPointerUnlockExit = false;
+      return;
+    }
+    if (
+      fp.active &&
+      !document.querySelector("dialog[open]") &&
+      document.visibilityState === "visible" &&
+      document.hasFocus()
+    ) {
+      setDragMode("pan");
+    }
+  });
+
+  canvas.addEventListener("pointerenter", () => {
+    lastUnlockedFpMouse = null;
+  });
+
+  canvas.addEventListener("pointerleave", () => {
+    lastUnlockedFpMouse = null;
   });
 
   document.addEventListener("mousemove", (e) => {
@@ -5114,6 +5176,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         return;
       }
 
+      if (e.button === 0 && document.pointerLockElement !== canvas) {
+        requestWalkPointerLock();
+      }
       pointerGesture = {
         id: e.pointerId,
         kind: "fp_look",
@@ -5171,27 +5236,39 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         }
         return;
       }
-      if (pointerGesture && pointerGesture.kind === "fp_look" && pointerGesture.id === e.pointerId) {
-        const dx = e.clientX - pointerGesture.lastX;
-        const dy = e.clientY - pointerGesture.lastY;
-        pointerGesture.lastX = e.clientX;
-        pointerGesture.lastY = e.clientY;
-        if (Math.hypot(e.clientX - pointerGesture.startX, e.clientY - pointerGesture.startY) > 4) {
-          pointerGesture.moved = true;
-        }
-        if (pointerGesture.moved) {
-          callbacks.onHoverCreation?.(null, e.clientX, e.clientY, null);
-          fp.goalYaw -= dx * 0.0052;
-          fp.goalPitch = Math.max(
-            FP_MIN_PITCH,
-            Math.min(FP_MAX_PITCH, fp.goalPitch - dy * 0.0044),
-          );
-          canvas.style.cursor = "grabbing";
+
+      // FPS mouse-look: when pointer-locked, document mousemove handles raw movementX/Y;
+      // when unlocked (e.g., right after intro sweep before a click), free mouse motion looks around directly!
+      if (document.pointerLockElement === canvas) {
+        if (pointerGesture && pointerGesture.kind === "fp_look" && pointerGesture.id === e.pointerId) {
+          if (Math.hypot(e.movementX || 0, e.movementY || 0) > 4) {
+            pointerGesture.moved = true;
+          }
         }
         return;
       }
-      if (document.pointerLockElement !== canvas) {
-        pendingHover = { x: e.clientX, y: e.clientY };
+
+      if (e.pointerType !== "touch" && !document.querySelector("dialog[open]")) {
+        const now = performance.now();
+        if (lastUnlockedFpMouse && now - lastUnlockedFpMouse.t < 240) {
+          const dx = Math.max(-90, Math.min(90, e.clientX - lastUnlockedFpMouse.x));
+          const dy = Math.max(-90, Math.min(90, e.clientY - lastUnlockedFpMouse.y));
+          if (dx !== 0 || dy !== 0) {
+            if (pointerGesture && pointerGesture.kind === "fp_look" && pointerGesture.id === e.pointerId) {
+              if (Math.hypot(e.clientX - pointerGesture.startX, e.clientY - pointerGesture.startY) > 4) {
+                pointerGesture.moved = true;
+              }
+            }
+            callbacks.onHoverCreation?.(null, e.clientX, e.clientY, null);
+            fp.goalYaw -= dx * 0.0034;
+            fp.goalPitch = Math.max(
+              FP_MIN_PITCH,
+              Math.min(FP_MAX_PITCH, fp.goalPitch - dy * 0.0028),
+            );
+          }
+        }
+        lastUnlockedFpMouse = { x: e.clientX, y: e.clientY, t: now };
+        canvas.style.cursor = idleCursor();
       }
       return;
     }
@@ -5357,7 +5434,12 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         const wasClickFp = !pointerGesture.moved && pointerGesture.button === 0 && e.type === "pointerup";
         pointerGesture = null;
         canvas.style.cursor = idleCursor();
-        if (wasClickFp) handleFirstPersonTap(e.clientX, e.clientY);
+        if (wasClickFp) {
+          const locked = document.pointerLockElement === canvas;
+          const tapX = locked ? (canvas.clientWidth || window.innerWidth) * 0.5 : e.clientX;
+          const tapY = locked ? (canvas.clientHeight || window.innerHeight) * 0.5 : e.clientY;
+          handleFirstPersonTap(tapX, tapY);
+        }
       }
       return;
     }
@@ -6600,6 +6682,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     enterFirstPerson: () => setDragMode("walk"),
     exitFirstPerson: () => setDragMode("pan"),
     isFirstPerson: () => fp.active,
+    releaseWalkPointerLock,
     setLocalAppearance,
     getLocalAppearance,
     triggerLocalWave,

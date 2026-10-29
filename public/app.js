@@ -53,6 +53,7 @@ const onlineCountEl = document.getElementById("online-count");
 const interactPromptBtn = document.getElementById("interact-prompt");
 const interactKeyEl = document.getElementById("interact-key");
 const interactLabelEl = document.getElementById("interact-label");
+const walkEscHintBtn = document.getElementById("walk-esc-hint");
 const avatarDialog = document.getElementById("avatar-dialog");
 
 const walkJoystick = document.getElementById("walk-joystick");
@@ -227,6 +228,9 @@ function syncCameraModeUI(mode) {
     camWalkBtn.setAttribute("aria-pressed", isWalk ? "true" : "false");
   }
   syncWalkJoystickVisibility();
+  if (walkEscHintBtn) {
+    walkEscHintBtn.hidden = isOgCapture || !isWalk || isMobileWalkViewport();
+  }
 }
 
 const demoClickTimers = new WeakMap();
@@ -392,7 +396,14 @@ avatarBtn?.addEventListener("click", () => {
   avatarBtn?.blur();
   hoverCard.hidden = true;
   resetWalkJoystick();
+  engine?.releaseWalkPointerLock?.();
   characterBuilder?.open(engine?.getLocalAppearance?.());
+});
+
+walkEscHintBtn?.addEventListener("click", () => {
+  hoverCard.hidden = true;
+  engine?.setDragMode("pan");
+  walkEscHintBtn.blur();
 });
 
 window.__geminIslandCharacterBuilder = characterBuilder;
@@ -439,6 +450,9 @@ window.addEventListener(
 
 window.addEventListener("resize", () => {
   syncWalkJoystickVisibility();
+  if (walkEscHintBtn) {
+    walkEscHintBtn.hidden = isOgCapture || currentCamMode !== "walk" || isMobileWalkViewport();
+  }
 });
 
 window.addEventListener("blur", () => {
@@ -723,7 +737,8 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (
       characterBuilder?.isOpen?.() ||
-      (avatarDialog && (avatarDialog.open || avatarDialog.contains(e.target))) ||
+      (avatarDialog &&
+        (avatarDialog.open || (e.target instanceof Node && avatarDialog.contains(e.target)))) ||
       performance.now() - lastAvatarDialogCloseMs < 80
     ) {
       return;

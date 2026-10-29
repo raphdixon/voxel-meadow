@@ -551,7 +551,9 @@ function sculptTorsoVox(a) {
 function sculptHeadVox(a) {
   const v = new Vox(419);
   const skin = a.skin;
-  const skinWarm = mixHex(skin, "#e67e6e", 0.18);
+  const [sr, sg, sb] = hexToRgb(skin);
+  const skinLum = (0.2126 * sr + 0.7152 * sg + 0.0722 * sb) / 255;
+  const skinWarm = mixHex(skin, "#e86e62", skinLum < 0.36 ? 0.28 : 0.22);
   const hair = a.hairColor;
   const hairLight = shadeHex(hair, 1.14);
   const hairDark = shadeHex(hair, 0.82);
@@ -559,194 +561,129 @@ function sculptHeadVox(a) {
   const hatDark = shadeHex(hat, 0.8);
   const hatLight = shadeHex(hat, 1.16);
 
-  // Neck post inside headPivot (y = -1..0) so hiding headPivot in FP hides neck cleanly with zero stump!
+  // 1. Neck post inside headPivot (y = -1..0) so hiding headPivot in FP hides neck cleanly with zero stump
   v.box(-2, -1, -2, 2, 0, 1, shadeHex(skin, 0.92));
 
-  // Base head skull: x[-4..4], y[0..8], z[-4..4] (faces +Z)
+  // Base 8x8x8 head skull: x[-4..4), y[0..8), z[-4..4) (faces +Z)
   v.box(-4, 0, -4, 4, 8, 4, skin);
   // Subtle voxel ears
   v.box(-5, 2, -1, -4, 5, 1, skinWarm);
   v.box(4, 2, -1, 5, 5, 1, skinWarm);
-  // Cute subtle cheek warmth / nose touch
-  v.put(-3, 2, 3, skinWarm);
-  v.put(2, 2, 3, skinWarm);
 
-  // Eyes & facial eyewear on +Z face (z = 3 flush, z = 4..5 eyewear)
-  const darkEye = "#181a20";
-  const whiteEye = "#fcfaf5";
-  if (a.eyeStyle === "classic") {
-    v.box(-3, 3, 3, -2, 5, 4, darkEye);
-    v.put(-3, 4, 3, whiteEye);
-    v.box(2, 3, 3, 3, 5, 4, darkEye);
-    v.put(2, 4, 3, whiteEye);
-    // Subtle smile
-    v.box(-1, 1, 3, 1, 2, 4, shadeHex(skin, 0.78));
-  } else if (a.eyeStyle === "happy") {
-    // Cheerful curved ^ ^ arcs
-    v.put(-3, 3, 3, darkEye);
-    v.put(-2, 4, 3, darkEye);
-    v.put(-1, 3, 3, darkEye);
-    v.put(1, 3, 3, darkEye);
-    v.put(2, 4, 3, darkEye);
-    v.put(3, 3, 3, darkEye);
-    v.box(-1, 1, 3, 1, 2, 4, "#d96b62");
-  } else if (a.eyeStyle === "wink") {
-    // Open left eye (+X) + winking right eye (-X)
-    v.box(1, 3, 3, 3, 5, 4, darkEye);
-    v.put(2, 4, 3, whiteEye);
-    v.box(-3, 3, 3, -1, 4, 4, darkEye);
-    v.put(-3, 4, 3, darkEye);
-    v.box(-1, 1, 3, 2, 2, 4, "#d96b62");
-  } else if (a.eyeStyle === "shades") {
-    // Cool 3D wrap-around sunglasses
-    v.box(-4, 4, 4, 4, 5, 5, "#181a20");
-    v.box(-4, 2, 4, -1, 5, 5, "#232730");
-    v.box(1, 2, 4, 4, 5, 5, "#232730");
-    v.put(-3, 4, 4, "#6fb7f0");
-    v.put(2, 4, 4, "#6fb7f0");
-    v.box(-5, 4, 0, -4, 5, 5, "#181a20");
-    v.box(4, 4, 0, 5, 5, 5, "#181a20");
-  } else if (a.eyeStyle === "glasses") {
-    // Framed spectacles with bright lenses
-    v.box(-3, 3, 3, -2, 4, 4, darkEye);
-    v.box(2, 3, 3, 3, 4, 4, darkEye);
-    const frameCol = "#2e323b";
-    v.box(-4, 2, 4, -1, 5, 5, "#b8e4f2");
-    v.box(1, 2, 4, 4, 5, 5, "#b8e4f2");
-    v.box(-3, 3, 4, -2, 4, 5, null);
-    v.box(2, 3, 4, 3, 4, 5, null);
-    v.box(-4, 5, 4, -1, 6, 5, frameCol);
-    v.box(1, 5, 4, 4, 6, 5, frameCol);
-    v.box(-1, 4, 4, 1, 5, 5, frameCol);
-    v.box(-5, 4, 0, -4, 5, 5, frameCol);
-    v.box(4, 4, 0, 5, 5, 5, frameCol);
-  } else if (a.eyeStyle === "visor") {
-    // Glowing cyber visor
-    v.box(-5, 3, 2, 5, 5, 5, "#232730");
-    v.box(-4, 3, 4, 4, 5, 5, "#5ce6db", 1.15);
-    v.box(-3, 4, 4, 2, 5, 5, "#fcfaf5", 1.25);
-  } else if (a.eyeStyle === "starry") {
-    v.box(-3, 2, 3, -1, 5, 4, "#242736");
-    v.box(1, 2, 3, 3, 5, 4, "#242736");
-    v.put(-2, 4, 3, "#f6d55c", 0.9);
-    v.put(-3, 3, 3, "#fcfaf5", 0.8);
-    v.put(2, 4, 3, "#f6d55c", 0.9);
-    v.put(1, 3, 3, "#fcfaf5", 0.8);
-    v.box(-1, 1, 3, 1, 2, 4, "#d96b62");
-  }
-
-  // Hair sculpting (adapts cleanly to full-coverage hats so zero voxels clip!)
+  // 2. Hair sculpting (runs BEFORE facial features and keeps front face x[-3..3), y[0..7) completely open!)
   const fullCover = FULL_COVER_HATS.has(a.hatStyle);
   const topCrownHat = TOP_CROWN_HATS.has(a.hatStyle);
   const hasHeadphones = a.hatStyle === "headphones";
 
   if (a.hairStyle !== "none") {
     const capTopY = fullCover ? 7 : 9;
-    // Base hairline shell around back & sides
-    v.box(-4, 6, -5, 4, capTopY, 4, hair);
-    v.box(-5, 4, -4, -4, capTopY - 1, 2, hair);
-    v.box(4, 4, -4, 5, capTopY - 1, 2, hair);
-    v.box(-4, 2, -5, 4, 6, -4, hairDark);
 
-    if (a.hairStyle === "short") {
-      if (!fullCover) {
-        v.box(-4, 8, -4, 4, 9, 4, hairLight);
-      }
-      v.box(-3, 6, 3, 3, 7, 5, hair);
-    } else if (a.hairStyle === "spiky") {
-      v.box(-4, 6, 3, 4, 7, 5, hair);
-      v.put(-3, 5, 4, hair);
-      v.put(1, 5, 4, hair);
-      if (!fullCover && !topCrownHat) {
-        v.box(-3, 8, -3, 3, 10, 3, hair);
-        v.box(-3, 10, 1, -1, 11, 3, hairLight);
-        v.box(1, 10, -1, 3, 11, 2, hairLight);
-        v.box(-1, 10, -3, 1, 11, -1, hairLight);
-      }
-    } else if (a.hairStyle === "parted") {
-      v.box(-4, 6, 3, 1, 8, 5, hairLight);
-      v.box(2, 6, 3, 4, 7, 5, hair);
-      if (!fullCover) {
-        v.box(-4, 8, -4, 2, 10, 4, hairLight);
-        v.box(2, 8, -4, 4, 9, 4, hair);
-      }
-    } else if (a.hairStyle === "long") {
-      // Flowing back & shoulder-framing locks (visible even beneath wizard/sunhat/cap!)
-      v.box(-4, -3, -5, 4, 6, -4, hair);
-      v.box(-5, -2, -4, -4, 5, 1, hair);
-      v.box(4, -2, -4, 5, 5, 1, hair);
-      v.box(-4, 0, 3, -3, 6, 5, hairLight);
-      v.box(3, 0, 3, 4, 6, 5, hairLight);
-      if (!fullCover) {
-        v.box(-4, 8, -4, 4, 10, 4, hairLight);
-      }
-    } else if (a.hairStyle === "ponytail") {
-      v.box(-3, 6, 3, 3, 7, 5, hair);
-      if (fullCover) {
-        // Low ponytail emerging cleanly under the back of the hat
-        v.box(-1, 3, -6, 1, 5, -4, hat);
-        v.box(-2, -1, -7, 2, 4, -5, hair);
-        v.box(-1, -2, -7, 1, 0, -5, hairLight);
-      } else {
-        v.box(-4, 8, -4, 4, 9, 4, hairLight);
-        v.box(-1, 6, -6, 1, 8, -4, hat);
-        v.box(-2, 1, -7, 2, 8, -5, hair);
-        v.box(-1, 0, -7, 1, 2, -5, hairLight);
-      }
-    } else if (a.hairStyle === "buns") {
-      v.box(-3, 6, 3, 3, 7, 5, hair);
-      if (fullCover || hasHeadphones) {
-        // Low space-buns tucked neatly at nape/sides
-        v.box(-6, 1, -4, -4, 4, -1, hairLight);
-        v.box(4, 1, -4, 6, 4, -1, hairLight);
-      } else {
-        v.box(-4, 8, -4, 4, 9, 4, hair);
-        v.box(-6, 7, -2, -3, 11, 1, hairLight);
-        v.box(3, 7, -2, 6, 11, 1, hairLight);
-      }
-    } else if (a.hairStyle === "curly") {
-      v.box(-5, 3, -5, 5, 7, -3, hair);
-      v.box(-5, 4, -3, -4, 7, 3, hairLight);
-      v.box(4, 4, -3, 5, 7, 3, hairLight);
-      v.box(-4, 6, 3, 4, 7, 5, hair);
-      if (!fullCover) {
-        v.box(-5, 7, -5, 5, 10, 4, hair);
-        v.box(-4, 10, -4, 4, 11, 3, hairLight);
-      }
-    } else if (a.hairStyle === "mohawk") {
-      // Shaved sides, bold central crest when uncovered
-      v.clear(-5, 4, -5, -2, 9, 5);
-      v.clear(2, 4, -5, 5, 9, 5);
-      v.box(-4, 0, -4, 4, 8, 4, skin);
-      // Restore ears after clear
-      v.box(-5, 2, -1, -4, 5, 1, skinWarm);
-      v.box(4, 2, -1, 5, 5, 1, skinWarm);
-      v.box(-1, 6, 3, 1, 8, 5, hairLight);
+    if (a.hairStyle === "mohawk") {
+      // Shaved sides, bold central crest — never touches facial plane!
       v.box(-1, 3, -5, 1, 8, -4, hair);
+      v.box(-1, 7, -4, 1, capTopY, 4, hair);
+      if (!fullCover) {
+        v.box(-1, 7, 3, 1, 9, 5, hairLight);
+      }
       if (!fullCover && !topCrownHat && !hasHeadphones) {
         v.box(-1, 8, -4, 1, 12, 4, hair);
         v.box(-1, 11, -3, 1, 13, 3, hairLight);
       }
-    } else if (a.hairStyle === "bob") {
-      v.box(-5, 1, -4, -4, 7, 3, hair);
-      v.box(4, 1, -4, 5, 7, 3, hair);
-      v.box(-4, 1, -5, 4, 7, -4, hairDark);
-      v.box(-4, 6, 3, 4, 7, 5, hairLight);
-      if (!fullCover) {
-        v.box(-4, 8, -4, 4, 10, 4, hairLight);
+    } else {
+      // Base hairline shell around back, crown & sides (front hairline sits at y >= 7)
+      v.box(-4, 6, -5, 4, capTopY, 2, hair);
+      v.box(-4, 7, 2, 4, capTopY, 4, hair);
+      v.box(-5, 4, -4, -4, capTopY - 1, 2, hair);
+      v.box(4, 4, -4, 5, capTopY - 1, 2, hair);
+      v.box(-4, 2, -5, 4, 6, -4, hairDark);
+
+      if (a.hairStyle === "short") {
+        if (!fullCover) {
+          v.box(-4, 8, -4, 4, 9, 4, hairLight);
+          v.box(-3, 7, 3, 3, 8, 5, hair);
+        }
+      } else if (a.hairStyle === "spiky") {
+        if (!fullCover) {
+          v.box(-4, 7, 3, 4, 8, 5, hair);
+          v.put(-3, 7, 5, hairLight);
+          v.put(1, 7, 5, hairLight);
+        }
+        if (!fullCover && !topCrownHat) {
+          v.box(-3, 8, -3, 3, 10, 3, hair);
+          v.box(-3, 10, 1, -1, 11, 3, hairLight);
+          v.box(1, 10, -1, 3, 11, 2, hairLight);
+          v.box(-1, 10, -3, 1, 11, -1, hairLight);
+        }
+      } else if (a.hairStyle === "parted") {
+        if (!fullCover) {
+          v.box(-4, 7, 3, 1, 9, 5, hairLight);
+          v.box(2, 7, 3, 4, 8, 5, hair);
+          v.box(-4, 8, -4, 2, 10, 4, hairLight);
+          v.box(2, 8, -4, 4, 9, 4, hair);
+        }
+      } else if (a.hairStyle === "long") {
+        // Flowing back & side-framing locks (kept outside x[-3..3) so eyes & mouth stay 100% unobstructed)
+        v.box(-4, -3, -5, 4, 6, -4, hair);
+        v.box(-5, -2, -4, -4, 6, 3, hair);
+        v.box(4, -2, -4, 5, 6, 3, hair);
+        v.box(-5, -1, 1, -4, 6, 3, hairLight);
+        v.box(4, -1, 1, 5, 6, 3, hairLight);
+        if (!fullCover) {
+          v.box(-4, 7, 3, 4, 8, 5, hair);
+          v.box(-4, 8, -4, 4, 10, 4, hairLight);
+        }
+      } else if (a.hairStyle === "ponytail") {
+        if (fullCover) {
+          v.box(-1, 3, -6, 1, 5, -4, hat);
+          v.box(-2, -1, -7, 2, 4, -5, hair);
+          v.box(-1, -2, -7, 1, 0, -5, hairLight);
+        } else {
+          v.box(-3, 7, 3, 3, 8, 5, hair);
+          v.box(-4, 8, -4, 4, 9, 4, hairLight);
+          v.box(-1, 6, -6, 1, 8, -4, hat);
+          v.box(-2, 1, -7, 2, 8, -5, hair);
+          v.box(-1, 0, -7, 1, 2, -5, hairLight);
+        }
+      } else if (a.hairStyle === "buns") {
+        if (fullCover || hasHeadphones) {
+          v.box(-6, 1, -4, -4, 4, -1, hairLight);
+          v.box(4, 1, -4, 6, 4, -1, hairLight);
+        } else {
+          v.box(-3, 7, 3, 3, 8, 5, hair);
+          v.box(-4, 8, -4, 4, 9, 4, hair);
+          v.box(-6, 7, -2, -3, 11, 1, hairLight);
+          v.box(3, 7, -2, 6, 11, 1, hairLight);
+        }
+      } else if (a.hairStyle === "curly") {
+        v.box(-5, 3, -5, 5, 7, -3, hair);
+        v.box(-5, 4, -3, -4, 7, 3, hairLight);
+        v.box(4, 4, -3, 5, 7, 3, hairLight);
+        if (!fullCover) {
+          v.box(-4, 7, 3, 4, 8, 5, hair);
+          v.box(-5, 7, -5, 5, 10, 4, hair);
+          v.box(-4, 10, -4, 4, 11, 3, hairLight);
+        }
+      } else if (a.hairStyle === "bob") {
+        v.box(-5, 1, -4, -4, 7, 3, hair);
+        v.box(4, 1, -4, 5, 7, 3, hair);
+        v.box(-4, 1, -5, 4, 7, -4, hairDark);
+        if (!fullCover) {
+          v.box(-4, 7, 3, 4, 8, 5, hairLight);
+          v.box(-4, 8, -4, 4, 10, 4, hairLight);
+        }
       }
     }
   }
 
-  // Hats & Headgear
+  // 3. Hats & Headgear (all sit cleanly at y >= 7 on the front so y[0..6] face stays clear)
   if (a.hatStyle === "cap") {
     v.box(-4, 7, -4, 4, 10, 4, hat);
     v.box(-3, 10, -3, 3, 11, 3, hatLight);
     v.box(-4, 7, 4, 4, 8, 7, hatDark);
     v.box(-1, 8, 4, 1, 9, 5, "#fcfaf5");
   } else if (a.hatStyle === "beanie") {
-    v.box(-5, 6, -5, 5, 8, 5, hatDark);
-    v.box(-4, 8, -4, 4, 11, 4, hat);
+    v.box(-5, 7, -5, 5, 9, 5, hatDark);
+    v.box(-4, 9, -4, 4, 11, 4, hat);
     v.box(-1, 11, -1, 1, 13, 1, "#fcfaf5");
   } else if (a.hatStyle === "sunhat") {
     v.cylinderAxis("y", 0, 0, 7, 8, 7.2, "#ead39c");
@@ -812,6 +749,132 @@ function sculptHeadVox(a) {
     v.box(-5, 8, -4, 4, 10, 4, hat);
     v.box(-4, 10, -3, 2, 11, 3, hatLight);
     v.put(-1, 11, 0, hatDark);
+  }
+
+  // 4. Crisp, High-Contrast Facial Features (ALWAYS sculpted last so nothing can overwrite eyes or mouth!)
+  const darkEye = "#12141c";
+  const whiteEye = "#ffffff";
+  const mouthCol = skinLum < 0.34 ? "#100a0e" : "#26141a";
+  const tongueCol = "#e25d5d";
+  const browBase = a.hairStyle === "none" ? shadeHex(skin, 0.52) : shadeHex(hair, 0.76);
+  const [br, bg, bb] = hexToRgb(browBase);
+  const browLum = (0.2126 * br + 0.7152 * bg + 0.0722 * bb) / 255;
+  const browCol =
+    Math.abs(browLum - skinLum) < 0.14
+      ? skinLum < 0.35
+        ? "#14161e"
+        : shadeHex(browBase, 0.62)
+      : browBase;
+
+  // Outer rosy cheek warmth (leaves mid-face row y = 3 crisp between eyes and mouth)
+  v.put(-4, 3, 3, skinWarm);
+  v.put(3, 3, 3, skinWarm);
+
+  if (a.eyeStyle === "classic") {
+    // Expressive eyebrows (y = 6)
+    v.box(-3, 6, 3, -1, 7, 4, browCol);
+    v.box(1, 6, 3, 3, 7, 4, browCol);
+    // Bold 2x2 eyes with crisp white sclera + deep pupil (x[-3..-1] and x[1..3], y[4..6])
+    v.box(-3, 4, 3, -2, 6, 4, whiteEye);
+    v.box(-2, 4, 3, -1, 6, 4, darkEye);
+    v.box(1, 4, 3, 2, 6, 4, darkEye);
+    v.box(2, 4, 3, 3, 6, 4, whiteEye);
+    // Clean, friendly curved smile with soft upturned dimple corners (y = 1..3)
+    const cornerCol = skinLum < 0.34 ? "#181015" : mixHex(skin, mouthCol, 0.72);
+    v.box(-2, 1, 3, 2, 2, 4, mouthCol);
+    v.put(-3, 2, 3, cornerCol);
+    v.put(2, 2, 3, cornerCol);
+    if (skinLum < 0.34) {
+      v.box(-1, 1, 3, 1, 2, 4, tongueCol);
+    }
+  } else if (a.eyeStyle === "happy") {
+    // Symmetric joyful ^ ^ arches (clear on both fair and deep espresso skin tones)
+    const happyEyeCol = skinLum < 0.34 ? "#0b0d13" : darkEye;
+    if (skinLum < 0.36) {
+      const lidHighlight = shadeHex(skin, 1.36);
+      v.box(-3, 6, 3, -1, 7, 4, lidHighlight);
+      v.box(1, 6, 3, 3, 7, 4, lidHighlight);
+    }
+    v.box(-3, 5, 3, -1, 6, 4, happyEyeCol);
+    v.put(-4, 4, 3, happyEyeCol);
+    v.put(-1, 4, 3, mixHex(skin, happyEyeCol, 0.55));
+    v.box(1, 5, 3, 3, 6, 4, happyEyeCol);
+    v.put(0, 4, 3, mixHex(skin, happyEyeCol, 0.55));
+    v.put(3, 4, 3, happyEyeCol);
+    // Big cheerful open toothy grin (y = 1..3)
+    v.box(-2, 2, 3, 2, 3, 4, whiteEye);
+    v.box(-2, 1, 3, 2, 2, 4, mouthCol);
+    v.box(-1, 1, 3, 1, 2, 4, tongueCol);
+  } else if (a.eyeStyle === "wink") {
+    // Winking left eye (-X) + raised brow, open 2x2 right eye (+X)
+    v.box(-3, 6, 3, -1, 7, 4, browCol);
+    v.box(-3, 4, 3, -1, 5, 4, darkEye);
+    v.put(-3, 5, 3, darkEye);
+    v.box(1, 6, 3, 3, 7, 4, browCol);
+    v.box(1, 4, 3, 2, 6, 4, darkEye);
+    v.box(2, 4, 3, 3, 6, 4, whiteEye);
+    // Cheeky asymmetric smirk with tooth gleam
+    v.box(-2, 1, 3, 2, 2, 4, mouthCol);
+    v.put(1, 2, 3, whiteEye);
+    v.put(2, 2, 3, mouthCol);
+  } else if (a.eyeStyle === "shades") {
+    // Cool 3D wrap-around sunglasses (y = 4..6, z = 4..5)
+    v.box(-4, 5, 4, 4, 6, 5, "#15171d");
+    v.box(-4, 4, 4, -1, 6, 5, "#232730");
+    v.box(1, 4, 4, 4, 6, 5, "#232730");
+    v.put(-3, 5, 4, "#6fb7f0");
+    v.put(2, 5, 4, "#6fb7f0");
+    v.box(-5, 5, 0, -4, 6, 5, "#15171d");
+    v.box(4, 5, 0, 5, 6, 5, "#15171d");
+    // Confident cool smirk with tooth glint
+    v.box(-2, 1, 3, 2, 2, 4, mouthCol);
+    v.put(1, 2, 3, whiteEye);
+    v.put(2, 2, 3, mouthCol);
+  } else if (a.eyeStyle === "glasses") {
+    // Unobstructed 2x2 eyes on face + sleek 3D glasses frames around them
+    v.box(-3, 4, 3, -2, 6, 4, whiteEye);
+    v.box(-2, 4, 3, -1, 6, 4, darkEye);
+    v.box(1, 4, 3, 2, 6, 4, darkEye);
+    v.box(2, 4, 3, 3, 6, 4, whiteEye);
+    const frameCol = "#2c313b";
+    v.box(-4, 6, 4, -1, 7, 5, frameCol);
+    v.box(1, 6, 4, 4, 7, 5, frameCol);
+    v.box(-1, 5, 4, 1, 6, 5, frameCol);
+    v.box(-4, 4, 4, -3, 6, 5, frameCol);
+    v.box(3, 4, 4, 4, 6, 5, frameCol);
+    v.box(-5, 5, 0, -4, 6, 5, frameCol);
+    v.box(4, 5, 0, 5, 6, 5, frameCol);
+    // Warm friendly smile
+    const cornerCol = skinLum < 0.34 ? "#181015" : mixHex(skin, mouthCol, 0.72);
+    v.box(-2, 1, 3, 2, 2, 4, mouthCol);
+    v.put(-3, 2, 3, cornerCol);
+    v.put(2, 2, 3, cornerCol);
+    if (skinLum < 0.34) {
+      v.box(-1, 1, 3, 1, 2, 4, tongueCol);
+    }
+  } else if (a.eyeStyle === "visor") {
+    // Glowing cyber visor (y = 4..6, z = 4..5)
+    v.box(-5, 4, 2, 5, 6, 5, "#232730");
+    v.box(-4, 4, 4, 4, 6, 5, "#5ce6db", 1.15);
+    v.box(-3, 5, 4, 2, 6, 5, "#ffffff", 1.25);
+    // Crisp cyber grin
+    v.box(-2, 1, 3, 2, 2, 4, mouthCol);
+    v.box(-1, 2, 3, 1, 3, 4, whiteEye);
+    v.put(-2, 2, 3, mouthCol);
+    v.put(1, 2, 3, mouthCol);
+  } else if (a.eyeStyle === "starry") {
+    // Big sparkly anime-voxel eyes + brows + excited smile
+    v.box(-3, 6, 3, -1, 7, 4, browCol);
+    v.box(1, 6, 3, 3, 7, 4, browCol);
+    v.box(-3, 4, 3, -1, 6, 4, "#1b1f33");
+    v.box(1, 4, 3, 3, 6, 4, "#1b1f33");
+    v.put(-2, 5, 3, "#f6d55c", 0.9);
+    v.put(-3, 4, 3, whiteEye, 0.85);
+    v.put(1, 5, 3, "#f6d55c", 0.9);
+    v.put(2, 4, 3, whiteEye, 0.85);
+    v.box(-2, 2, 3, 2, 3, 4, whiteEye);
+    v.box(-2, 1, 3, 2, 2, 4, mouthCol);
+    v.box(-1, 1, 3, 1, 2, 4, tongueCol);
   }
 
   return v;

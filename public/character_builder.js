@@ -69,6 +69,8 @@ export function createCharacterBuilderController({
         <div class="cb-top-row">
           <input
             type="text"
+            id="cb-name-input"
+            name="characterName"
             class="cb-name-input"
             placeholder="Name"
             maxlength="16"
@@ -145,8 +147,8 @@ export function createCharacterBuilderController({
   let rafId = 0;
   let lastFrameMs = 0;
   let elapsedSec = 0;
-  let previewYaw = -0.32;
-  let goalPreviewYaw = -0.32;
+  let previewYaw = -0.2;
+  let goalPreviewYaw = -0.2;
   let yawVelocity = 0;
   let isDragging = false;
   let dragPointerId = null;
@@ -260,6 +262,14 @@ export function createCharacterBuilderController({
   }
 
   function updateCategoryFraming() {
+    if (activeCategory === "face") {
+      goalCamY = 1.36;
+      goalLookY = 1.31;
+      goalCamDist = 3.68;
+      goalPreviewYaw = -0.14;
+      return;
+    }
+
     // Full head-to-toe + tall wizard/party hats + wings + pedestal framed cleanly
     goalCamY = 1.22;
     goalLookY = 1.16;
@@ -268,7 +278,7 @@ export function createCharacterBuilderController({
     if (activeCategory === "gear" && BACK_MOUNTED_GEAR.has(draft.accessory)) {
       goalPreviewYaw = 2.45;
     } else if (Math.abs(goalPreviewYaw) > 1.6 && activeCategory !== "gear") {
-      goalPreviewYaw = -0.32;
+      goalPreviewYaw = -0.2;
     }
   }
 
@@ -577,7 +587,7 @@ export function createCharacterBuilderController({
           if (BACK_MOUNTED_GEAR.has(accessory)) {
             goalPreviewYaw = 2.45;
           } else {
-            goalPreviewYaw = -0.32;
+            goalPreviewYaw = -0.2;
           }
           applyDraftUpdate({ accessory }, "hop");
         }),

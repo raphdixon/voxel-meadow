@@ -121,6 +121,7 @@
         type="button"
         id="recenter-btn"
         class="cam-recenter-btn"
+        aria-label="Recentre camera"
         title="Recentre camera"
       >
         <svg class="cam-icon cam-compass-svg" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -132,6 +133,26 @@
         </svg>
         <span>Recentre</span>
       </button>
+
+      <button
+        type="button"
+        id="avatar-btn"
+        class="cam-recenter-btn cam-avatar-btn"
+        aria-label="Customize character"
+        title="Customize character"
+      >
+        <svg class="cam-icon cam-avatar-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="7.5" y="3.5" width="9" height="8" rx="2" />
+          <path d="M5.5 20.5v-2.2a3.8 3.8 0 0 1 3.8-3.8h5.4a3.8 3.8 0 0 1 3.8 3.8v2.2" />
+        </svg>
+        <span class="avatar-swatch-dot" id="avatar-swatch-dot" aria-hidden="true"></span>
+        <span>Character</span>
+      </button>
+
+      <div id="online-pill" class="online-pill" title="Players online" hidden>
+        <span class="live-dot" aria-hidden="true"></span>
+        <span id="online-count">1</span>
+      </div>
     </div>
 
     <!-- Hover nameplate + optional live API readout -->
@@ -159,6 +180,11 @@
         </g>
       </svg>
     </div>
+
+    <!-- Contextual First-Person Interaction Prompt -->
+    <button type="button" id="interact-prompt" class="interact-prompt" hidden>
+      <kbd id="interact-key" class="interact-key">F</kbd><span id="interact-label">Enter</span>
+    </button>
 
     <!-- Bottom-Anchored Explore & Build Dock (never blocks the 3D meadow) -->
     <div class="bottom-dock">
@@ -235,6 +261,8 @@
         <span id="locate-mine-label">Locate yours</span>
       </button>
     </div>
+
+    <dialog id="avatar-dialog" class="avatar-dialog" closedby="any" aria-label="Character customizer"></dialog>
 
     <script type="module" src="/app.js"></script>
   </body>

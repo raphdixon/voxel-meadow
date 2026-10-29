@@ -1,4 +1,6 @@
 import { createMeadowWorldEngine } from "./voxel/meadow_engine.js";
+import { createCharacterBuilderController } from "./character_builder.js";
+import { createMultiplayerClient } from "./multiplayer_client.js";
 
 const urlParams = new URLSearchParams(location.search);
 const isOgCapture = urlParams.get("og") === "1";
@@ -44,6 +46,14 @@ const camOrbitBtn = document.getElementById("cam-orbit-btn");
 const camWalkBtn = document.getElementById("cam-walk-btn");
 const recenterBtn = document.getElementById("recenter-btn");
 const recenterCompass = document.getElementById("recenter-compass");
+const avatarBtn = document.getElementById("avatar-btn");
+const avatarSwatchDot = document.getElementById("avatar-swatch-dot");
+const onlinePill = document.getElementById("online-pill");
+const onlineCountEl = document.getElementById("online-count");
+const interactPromptBtn = document.getElementById("interact-prompt");
+const interactKeyEl = document.getElementById("interact-key");
+const interactLabelEl = document.getElementById("interact-label");
+const avatarDialog = document.getElementById("avatar-dialog");
 
 const walkJoystick = document.getElementById("walk-joystick");
 const walkJoystickKnob = document.getElementById("walk-joystick-knob");
@@ -139,9 +149,35 @@ function stopJobTracking() {
 }
 
 let engine = null;
+let characterBuilder = null;
+let mpClient = null;
+let activeInteractionPrompt = null;
+let lastAvatarDialogCloseMs = -1000;
 let currentCamMode = "pan";
 let sawTouchInput = false;
 let joyPointerId = null;
+
+function syncAvatarSwatchDot(app) {
+  if (!avatarSwatchDot || !app || typeof app !== "object") return;
+  const swatchColor =
+    (typeof app.topColor === "string" && app.topColor) ||
+    (typeof app.hatColor === "string" && app.hatColor) ||
+    "#4c82d4";
+  avatarSwatchDot.style.backgroundColor = swatchColor;
+}
+
+function updateOnlinePill(count) {
+  if (!onlinePill) return;
+  if (isOgCapture || typeof count !== "number" || !Number.isFinite(count) || count < 1) {
+    onlinePill.hidden = true;
+    return;
+  }
+  const clean = Math.max(1, Math.trunc(count));
+  if (onlineCountEl) {
+    onlineCountEl.textContent = String(clean);
+  }
+  onlinePill.hidden = false;
+}
 
 function isMobileWalkViewport() {
   if (sawTouchInput) return true;
@@ -216,7 +252,12 @@ engine = createMeadowWorldEngine(
   worldCanvas,
   {
     onHoverCreation(creation, clientX, clientY, reading) {
-      if (!creation || uiState === "picking" || isOgCapture) {
+      if (
+        !creation ||
+        uiState === "picking" ||
+        isOgCapture ||
+        (activeInteractionPrompt && engine?.isFirstPerson?.())
+      ) {
         hoverCard.hidden = true;
         return;
       }
@@ -271,12 +312,90 @@ engine = createMeadowWorldEngine(
         recenterCompass.setAttribute("transform", `rotate(${deg} 12 12)`);
       }
     },
+    onInteractionPromptChange(promptInfo) {
+      activeInteractionPrompt = promptInfo || null;
+      if (!interactPromptBtn) return;
+      if (!promptInfo || isOgCapture) {
+        interactPromptBtn.hidden = true;
+        return;
+      }
+      if (interactKeyEl) {
+        interactKeyEl.textContent = promptInfo.keyHint || "F";
+      }
+      if (interactLabelEl) {
+        interactLabelEl.textContent = promptInfo.label || "Interact";
+      }
+      interactPromptBtn.hidden = false;
+      if (engine?.isFirstPerson?.()) {
+        hoverCard.hidden = true;
+      }
+    },
+    onLocalEmote(kind) {
+      mpClient?.sendEmote(kind);
+    },
+    onInteriorChange(roomInfo) {
+      if (roomInfo) {
+        document.body.dataset.inInterior = "1";
+        if (uiState === "picking" || uiState === "composing") {
+          hideError();
+          chosenSpot = null;
+          uiState = "idle";
+          syncDockUI();
+        }
+      } else {
+        delete document.body.dataset.inInterior;
+      }
+      hoverCard.hidden = true;
+      mpClient?.forcePoseSync();
+    },
   },
   { ogMode: isOgCapture },
 );
 
 window.__geminIslandCam = () => engine.getCameraState();
 window.__geminIslandEngine = engine;
+
+interactPromptBtn?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  engine?.triggerActiveInteraction?.();
+  interactPromptBtn.blur();
+});
+
+characterBuilder = createCharacterBuilderController({
+  dialogEl: avatarDialog,
+  onChange(app) {
+    engine?.setLocalAppearance?.(app);
+    syncAvatarSwatchDot(app);
+  },
+  onSave(app) {
+    engine?.setLocalAppearance?.(app);
+    syncAvatarSwatchDot(app);
+    mpClient?.sendProfile(app);
+  },
+});
+
+avatarDialog?.addEventListener("close", () => {
+  lastAvatarDialogCloseMs = performance.now();
+  avatarBtn?.blur();
+  queueMicrotask(() => avatarBtn?.blur());
+});
+
+avatarDialog?.querySelector('[data-cb-action="wave"]')?.addEventListener("click", () => {
+  engine?.triggerLocalWave?.();
+  mpClient?.sendEmote("wave");
+});
+
+syncAvatarSwatchDot(engine?.getLocalAppearance?.() || characterBuilder?.getAppearance?.());
+
+avatarBtn?.addEventListener("click", () => {
+  if (isOgCapture) return;
+  avatarBtn?.blur();
+  hoverCard.hidden = true;
+  resetWalkJoystick();
+  characterBuilder?.open(engine?.getLocalAppearance?.());
+});
+
+window.__geminIslandCharacterBuilder = characterBuilder;
 
 camPanBtn?.addEventListener("click", () => {
   engine.setDragMode("pan");
@@ -602,6 +721,13 @@ closeBuilderBtn.addEventListener("click", () => {
 
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
+    if (
+      characterBuilder?.isOpen?.() ||
+      (avatarDialog && (avatarDialog.open || avatarDialog.contains(e.target))) ||
+      performance.now() - lastAvatarDialogCloseMs < 80
+    ) {
+      return;
+    }
     if (uiState === "picking" || uiState === "composing") {
       e.preventDefault();
       hideError();
@@ -865,12 +991,105 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
+function handleWorldMessage(msg) {
+  if (!msg || typeof msg !== "object") return;
+  if (msg.type === "queue_tick" && activeJob && uiState === "building") {
+    const qIdx = Array.isArray(msg.queuedIds) ? msg.queuedIds.indexOf(activeJob.jobId) : -1;
+    const activeEntry = Array.isArray(msg.sculpting)
+      ? msg.sculpting.find((s) => s.jobId === activeJob.jobId)
+      : null;
+    if (qIdx >= 0) {
+      activeJob.status = "queued";
+      activeJob.phase = "queued";
+      activeJob.position = qIdx + 1;
+      renderActiveJobLabel();
+    } else if (activeEntry) {
+      activeJob.status = "sculpting";
+      if (activeEntry.phase === "refining") {
+        activeJob.phase = "refining";
+      } else if (activeJob.phase === "queued") {
+        activeJob.phase = "sculpting";
+      }
+      activeJob.position = 0;
+      renderActiveJobLabel();
+    }
+    pollActiveJob();
+    return;
+  }
+
+  if ((msg.type === "creation_placed" || msg.type === "world_updated") && msg.world) {
+    worldData = {
+      ...msg.world,
+      myCreationId,
+    };
+    engine.applyWorldSnapshot(worldData);
+    if (uiState === "building" && activeJob) {
+      pollActiveJob();
+    } else if (uiState === "placed" || uiState === "ready") {
+      syncDockUI();
+    }
+    refreshLiveFeeds();
+
+    if (msg.type === "world_updated" && msg.note) {
+      showToast(msg.note, 4600);
+    } else if (
+      msg.type === "creation_placed" &&
+      msg.creation &&
+      msg.creation.id !== myCreationId &&
+      uiState !== "building"
+    ) {
+      showToast(`Someone added "${msg.creation.name}" to GeminIsland!`, 4200);
+    }
+  }
+}
+
+if (!isOgCapture) {
+  mpClient = createMultiplayerClient({
+    multiplayerEnabled: !isOgCapture,
+    getLocalPose: () => engine?.getLocalMultiplayerPose?.(),
+    getLocalProfile: () => engine?.getLocalAppearance?.(),
+    onWorldMessage: handleWorldMessage,
+    onWelcome(msg) {
+      engine?.syncMultiplayerWelcome?.(msg?.players || []);
+      if (typeof msg?.onlineCount === "number") {
+        updateOnlinePill(msg.onlineCount);
+      }
+    },
+    onPeerJoin(player, msg) {
+      engine?.upsertRemotePlayer?.(player);
+      if (typeof msg?.onlineCount === "number") {
+        updateOnlinePill(msg.onlineCount);
+      }
+    },
+    onPeerPose(poseMsg) {
+      engine?.updateRemotePlayerPose?.(poseMsg);
+    },
+    onPeerProfile(profileMsg) {
+      engine?.updateRemotePlayerProfile?.(profileMsg);
+    },
+    onPeerEmote(emoteMsg) {
+      engine?.triggerRemotePlayerEmote?.(emoteMsg);
+    },
+    onPeerLeave(id, msg) {
+      engine?.removeRemotePlayer?.(id);
+      if (typeof msg?.onlineCount === "number") {
+        updateOnlinePill(msg.onlineCount);
+      }
+    },
+    onOnlineCountChange(count) {
+      updateOnlinePill(count);
+    },
+  });
+}
+
+window.__geminIslandMp = mpClient;
+
 async function initWorld() {
   try {
     const res = await fetch("/api/world");
     if (res.ok) {
       worldData = await res.json();
-      myCreationId = worldData.myCreationId || null;
+      myCreationId = worldData.myCreationId || myCreationId || null;
       engine.applyWorldSnapshot(worldData);
       if (!isOgCapture) {
         if (myCreationId) {
@@ -892,73 +1111,7 @@ async function initWorld() {
   if (!isOgCapture) {
     setInterval(refreshLiveFeeds, 90_000);
     setInterval(refreshDailyEligibility, 10 * 60_000);
-    connectLiveWebSocket();
   }
-}
-
-function connectLiveWebSocket() {
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${proto}//${location.host}/ws`);
-
-  ws.addEventListener("message", (ev) => {
-    try {
-      const msg = JSON.parse(String(ev.data));
-      if (msg.type === "queue_tick" && activeJob && uiState === "building") {
-        const qIdx = Array.isArray(msg.queuedIds) ? msg.queuedIds.indexOf(activeJob.jobId) : -1;
-        const activeEntry = Array.isArray(msg.sculpting)
-          ? msg.sculpting.find((s) => s.jobId === activeJob.jobId)
-          : null;
-        if (qIdx >= 0) {
-          activeJob.status = "queued";
-          activeJob.phase = "queued";
-          activeJob.position = qIdx + 1;
-          renderActiveJobLabel();
-        } else if (activeEntry) {
-          activeJob.status = "sculpting";
-          if (activeEntry.phase === "refining") {
-            activeJob.phase = "refining";
-          } else if (activeJob.phase === "queued") {
-            activeJob.phase = "sculpting";
-          }
-          activeJob.position = 0;
-          renderActiveJobLabel();
-        }
-        pollActiveJob();
-        return;
-      }
-
-      if ((msg.type === "creation_placed" || msg.type === "world_updated") && msg.world) {
-        worldData = {
-          ...msg.world,
-          myCreationId,
-        };
-        engine.applyWorldSnapshot(worldData);
-        if (uiState === "building" && activeJob) {
-          pollActiveJob();
-        } else if (uiState === "placed" || uiState === "ready") {
-          syncDockUI();
-        }
-        refreshLiveFeeds();
-
-        if (msg.type === "world_updated" && msg.note) {
-          showToast(msg.note, 4600);
-        } else if (
-          msg.type === "creation_placed" &&
-          msg.creation &&
-          msg.creation.id !== myCreationId &&
-          uiState !== "building"
-        ) {
-          showToast(`Someone added "${msg.creation.name}" to GeminIsland!`, 4200);
-        }
-      }
-    } catch {
-      // ignore malformed messages
-    }
-  });
-
-  ws.addEventListener("close", () => {
-    setTimeout(connectLiveWebSocket, 3500);
-  });
 }
 
 initWorld();

@@ -30,6 +30,14 @@ import {
 } from "./security";
 import type {
   BuildQueueJobInfo,
+  MultiplayerAnim,
+  MultiplayerAppearance,
+  MultiplayerEmoteKind,
+  MultiplayerMode,
+  MultiplayerPlayerState,
+  MultiplayerPose,
+  MultiplayerServerMessage,
+  MultiplayerSocketAttachment,
   WorldCreation,
   WorldPath,
   WorldProp,
@@ -205,8 +213,221 @@ function distToSegment(px: number, pz: number, ax: number, az: number, bx: numbe
   return Math.hypot(px - (ax + t * vx), pz - (az + t * vz));
 }
 
+const MP_MAX_WS_BYTES = 2048;
+const MP_STALE_TIMEOUT_MS = 120_000;
+const MP_POSE_WINDOW_MS = 1_000;
+const MP_MAX_POSES_PER_WINDOW = 22;
+const MP_MIN_PROFILE_INTERVAL_MS = 200;
+const MP_MIN_EMOTE_INTERVAL_MS = 250;
+
+const MP_VALID_ANIMS = new Set<MultiplayerAnim>([
+  "idle",
+  "walk",
+  "run",
+  "jump",
+  "ride",
+  "sit",
+  "wave",
+]);
+const MP_VALID_EMOTES = new Set<MultiplayerEmoteKind>(["wave", "jump", "cheer"]);
+const MP_RIDE_ID_RE = /^[a-zA-Z0-9_#-]+$/;
+const MP_ROOM_ID_RE = /^[a-zA-Z0-9_-]+$/;
+const MP_STYLE_TOKEN_RE = /^[a-zA-Z0-9_-]{1,24}$/;
+const MP_COLOR_TOKEN_RE = /^(?:#[0-9a-fA-F]{3,8}|[a-zA-Z0-9_-]{1,24})$/;
+const MP_CONTROL_CHARS_RE = /[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2066-\u2069]/g;
+
+const DEFAULT_MP_APPEARANCE: Readonly<MultiplayerAppearance> = {
+  skin: "#f2c29b",
+  hairStyle: "short",
+  hairColor: "#3b281e",
+  hatStyle: "none",
+  hatColor: "#d9534f",
+  eyeStyle: "classic",
+  accessory: "none",
+  accessoryColor: "#4a90d9",
+  topStyle: "tee",
+  topColor: "#3b82f6",
+  bottomStyle: "jeans",
+  bottomColor: "#1e3a5f",
+  shoeColor: "#e5e7eb",
+};
+
+const DEFAULT_MP_POSE: Readonly<MultiplayerPose> = {
+  mode: "walk",
+  x: 0,
+  y: 0,
+  z: 0,
+  yaw: 0,
+  pitch: 0,
+  vx: 0,
+  vz: 0,
+  anim: "idle",
+  ride: null,
+  seat: 0,
+  room: null,
+};
+
+function isPlainRecord(val: unknown): val is Record<string, unknown> {
+  return typeof val === "object" && val !== null && !Array.isArray(val);
+}
+
+function stripMpControlChars(raw: string): string {
+  return raw.replace(MP_CONTROL_CHARS_RE, "");
+}
+
+function sanitizeMpName(raw: unknown, fallback = ""): string {
+  if (typeof raw !== "string") return fallback;
+  return stripMpControlChars(raw).replace(/\s+/g, " ").trim().slice(0, 16);
+}
+
+function sanitizeMpToken(raw: unknown, re: RegExp, fallback: string): string {
+  if (typeof raw !== "string") return fallback;
+  const cleaned = stripMpControlChars(raw).trim().slice(0, 24);
+  return re.test(cleaned) ? cleaned : fallback;
+}
+
+function sanitizeMpAppearance(
+  raw: unknown,
+  fallback: Readonly<MultiplayerAppearance> = DEFAULT_MP_APPEARANCE,
+): MultiplayerAppearance {
+  const obj = isPlainRecord(raw) ? raw : {};
+  return {
+    skin: sanitizeMpToken(obj.skin, MP_COLOR_TOKEN_RE, fallback.skin),
+    hairStyle: sanitizeMpToken(obj.hairStyle, MP_STYLE_TOKEN_RE, fallback.hairStyle),
+    hairColor: sanitizeMpToken(obj.hairColor, MP_COLOR_TOKEN_RE, fallback.hairColor),
+    hatStyle: sanitizeMpToken(obj.hatStyle, MP_STYLE_TOKEN_RE, fallback.hatStyle),
+    hatColor: sanitizeMpToken(obj.hatColor, MP_COLOR_TOKEN_RE, fallback.hatColor),
+    eyeStyle: sanitizeMpToken(obj.eyeStyle, MP_STYLE_TOKEN_RE, fallback.eyeStyle),
+    accessory: sanitizeMpToken(obj.accessory, MP_STYLE_TOKEN_RE, fallback.accessory),
+    accessoryColor: sanitizeMpToken(obj.accessoryColor, MP_COLOR_TOKEN_RE, fallback.accessoryColor),
+    topStyle: sanitizeMpToken(obj.topStyle, MP_STYLE_TOKEN_RE, fallback.topStyle),
+    topColor: sanitizeMpToken(obj.topColor, MP_COLOR_TOKEN_RE, fallback.topColor),
+    bottomStyle: sanitizeMpToken(obj.bottomStyle, MP_STYLE_TOKEN_RE, fallback.bottomStyle),
+    bottomColor: sanitizeMpToken(obj.bottomColor, MP_COLOR_TOKEN_RE, fallback.bottomColor),
+    shoeColor: sanitizeMpToken(obj.shoeColor, MP_COLOR_TOKEN_RE, fallback.shoeColor),
+  };
+}
+
+function clampMpRound(
+  raw: unknown,
+  min: number,
+  max: number,
+  scale: number,
+  fallback: number,
+): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return fallback;
+  const clamped = Math.max(min, Math.min(max, raw));
+  const rounded = Math.round(clamped * scale) / scale;
+  return rounded === 0 ? 0 : rounded;
+}
+
+function sanitizeMpYaw(raw: unknown, fallback: number): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return fallback;
+  const twoPi = Math.PI * 2;
+  let v = raw;
+  if (v < -twoPi || v > twoPi) {
+    v = ((((v + Math.PI) % twoPi) + twoPi) % twoPi) - Math.PI;
+  }
+  const clamped = Math.max(-twoPi, Math.min(twoPi, v));
+  const rounded = Math.round(clamped * 1000) / 1000;
+  return rounded === 0 ? 0 : rounded;
+}
+
+function sanitizeMpOptionalId(
+  raw: unknown,
+  re: RegExp,
+  fallback: string | null,
+): string | null {
+  if (raw === null || raw === "") return null;
+  if (typeof raw === "string") {
+    const cleaned = stripMpControlChars(raw).trim().slice(0, 48);
+    return cleaned && re.test(cleaned) ? cleaned : null;
+  }
+  return fallback;
+}
+
+function sanitizeMpPose(
+  raw: Record<string, unknown>,
+  fallback: Readonly<MultiplayerPose> = DEFAULT_MP_POSE,
+): MultiplayerPose {
+  const mode: MultiplayerMode =
+    raw.mode === "aerial" ? "aerial" : raw.mode === "walk" ? "walk" : fallback.mode;
+  const anim: MultiplayerAnim =
+    typeof raw.anim === "string" && MP_VALID_ANIMS.has(raw.anim as MultiplayerAnim)
+      ? (raw.anim as MultiplayerAnim)
+      : fallback.anim;
+  const seat =
+    typeof raw.seat === "number" && Number.isFinite(raw.seat)
+      ? Math.max(0, Math.min(3, Math.trunc(raw.seat)))
+      : fallback.seat;
+
+  return {
+    mode,
+    x: clampMpRound(raw.x, -240, 240, 1000, fallback.x),
+    y: clampMpRound(raw.y, -20, 600, 1000, fallback.y),
+    z: clampMpRound(raw.z, -240, 240, 1000, fallback.z),
+    yaw: sanitizeMpYaw(raw.yaw, fallback.yaw),
+    pitch: clampMpRound(raw.pitch, -1.6, 1.6, 1000, fallback.pitch),
+    vx: clampMpRound(raw.vx, -25, 25, 100, fallback.vx),
+    vz: clampMpRound(raw.vz, -25, 25, 100, fallback.vz),
+    anim,
+    ride: sanitizeMpOptionalId(raw.ride, MP_RIDE_ID_RE, fallback.ride),
+    seat,
+    room: sanitizeMpOptionalId(raw.room, MP_ROOM_ID_RE, fallback.room),
+  };
+}
+
+function createInitialMpAttachment(nowMs: number): MultiplayerSocketAttachment {
+  return {
+    id: `p-${crypto.randomUUID().slice(0, 8)}`,
+    joined: false,
+    connectedAt: nowMs,
+    lastSeenAt: nowMs,
+    name: "",
+    appearance: { ...DEFAULT_MP_APPEARANCE },
+    ...DEFAULT_MP_POSE,
+  };
+}
+
+function toPublicPlayerState(state: MultiplayerSocketAttachment): MultiplayerPlayerState {
+  return {
+    id: state.id,
+    name: state.name,
+    appearance: state.appearance,
+    mode: state.mode,
+    x: state.x,
+    y: state.y,
+    z: state.z,
+    yaw: state.yaw,
+    pitch: state.pitch,
+    vx: state.vx,
+    vz: state.vz,
+    anim: state.anim,
+    ride: state.ride,
+    seat: state.seat,
+    room: state.room,
+  };
+}
+
+function measureWsMessageBytes(message: string | ArrayBuffer): number {
+  if (typeof message !== "string") {
+    return message.byteLength;
+  }
+  if (message.length <= 682) {
+    return message.length;
+  }
+  if (message.length > MP_MAX_WS_BYTES) {
+    return message.length;
+  }
+  return new TextEncoder().encode(message).byteLength;
+}
+
 export class WorldDO extends DurableObject<Env> {
   private activeJobPromises = new Map<string, Promise<void>>();
+  private wsRateLimits = new Map<
+    WebSocket,
+    { windowStartMs: number; count: number; lastProfileMs: number; lastEmoteMs?: number }
+  >();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -3709,6 +3930,124 @@ export class WorldDO extends DurableObject<Env> {
     }
   }
 
+  private broadcastExcept(excludeWs: WebSocket, payload: MultiplayerServerMessage): void {
+    const text = JSON.stringify(payload);
+    for (const peer of this.ctx.getWebSockets()) {
+      if (peer === excludeWs || peer.readyState !== 1) continue;
+      try {
+        peer.send(text);
+      } catch {
+        // Closed socket will be cleaned up on close/error
+      }
+    }
+  }
+
+  private readSocketAttachment(ws: WebSocket): MultiplayerSocketAttachment | null {
+    try {
+      const raw = ws.deserializeAttachment();
+      if (!isPlainRecord(raw) || typeof raw.id !== "string" || !raw.id.startsWith("p-")) {
+        return null;
+      }
+      return raw as unknown as MultiplayerSocketAttachment;
+    } catch {
+      return null;
+    }
+  }
+
+  private getOrInitSocketAttachment(ws: WebSocket, nowMs: number): MultiplayerSocketAttachment {
+    const existing = this.readSocketAttachment(ws);
+    if (existing) return existing;
+    const fresh = createInitialMpAttachment(nowMs);
+    try {
+      ws.serializeAttachment(fresh);
+    } catch {
+      // Ignore if socket cannot accept attachment
+    }
+    return fresh;
+  }
+
+  private getSocketRateLimit(ws: WebSocket, nowMs: number) {
+    if (this.wsRateLimits.size > 250) {
+      for (const sock of this.wsRateLimits.keys()) {
+        if (sock.readyState !== 1) {
+          this.wsRateLimits.delete(sock);
+        }
+      }
+    }
+    let entry = this.wsRateLimits.get(ws);
+    if (!entry) {
+      entry = { windowStartMs: nowMs, count: 0, lastProfileMs: 0, lastEmoteMs: 0 };
+      this.wsRateLimits.set(ws, entry);
+    } else if (nowMs - entry.windowStartMs >= MP_POSE_WINDOW_MS) {
+      entry.windowStartMs = nowMs;
+      entry.count = 0;
+    }
+    return entry;
+  }
+
+  private collectActiveJoinedPeers(
+    nowMs: number,
+    excludeWs?: WebSocket,
+    excludeId?: string,
+  ): MultiplayerPlayerState[] {
+    const peers: MultiplayerPlayerState[] = [];
+    const seenIds = new Set<string>();
+    for (const sock of this.ctx.getWebSockets()) {
+      if (sock === excludeWs) continue;
+      if (sock.readyState !== 1) {
+        this.wsRateLimits.delete(sock);
+        continue;
+      }
+      const att = this.readSocketAttachment(sock);
+      if (!att || !att.joined || !att.id) continue;
+      if (excludeId && att.id === excludeId) continue;
+      if (nowMs - att.lastSeenAt > MP_STALE_TIMEOUT_MS) continue;
+      if (seenIds.has(att.id)) continue;
+      seenIds.add(att.id);
+      peers.push(toPublicPlayerState(att));
+    }
+    return peers;
+  }
+
+  private handleSocketDisconnect(ws: WebSocket, code = 1000, reason = ""): void {
+    const state = this.readSocketAttachment(ws);
+    this.wsRateLimits.delete(ws);
+
+    if (state?.joined) {
+      try {
+        ws.serializeAttachment({ ...state, joined: false });
+      } catch {
+        // Ignore if attachment can no longer be mutated
+      }
+    }
+
+    const isValidCode =
+      (code >= 1000 && code <= 1014 && code !== 1004 && code !== 1005 && code !== 1006) ||
+      (code >= 3000 && code <= 4999);
+    const safeCode = isValidCode ? code : 1000;
+    const safeReason = typeof reason === "string" ? stripMpControlChars(reason).slice(0, 120) : "";
+
+    try {
+      ws.close(safeCode, safeReason);
+    } catch {
+      try {
+        ws.close(1000, safeReason);
+      } catch {
+        // Already closed
+      }
+    }
+
+    if (state?.joined && state.id) {
+      const now = Date.now();
+      const remainingPeers = this.collectActiveJoinedPeers(now, ws, state.id);
+      this.broadcastExcept(ws, {
+        type: "mp_leave",
+        id: state.id,
+        onlineCount: remainingPeers.length,
+      });
+    }
+  }
+
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/ws") {
@@ -3721,36 +4060,231 @@ export class WorldDO extends DurableObject<Env> {
       }
       const existingSockets = this.ctx.getWebSockets();
       if (existingSockets.length >= 200) {
-        try {
-          existingSockets[0].close(1000, "Connection limit rotation");
-        } catch {
-          // ignore
+        const candidate =
+          existingSockets.find((s) => !this.readSocketAttachment(s)?.joined) ?? existingSockets[0];
+        if (candidate) {
+          this.handleSocketDisconnect(candidate, 1000, "Connection limit rotation");
         }
       }
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       this.ctx.acceptWebSocket(server);
+      try {
+        server.serializeAttachment(createInitialMpAttachment(Date.now()));
+      } catch {
+        // Fallback lazy initialization in webSocketMessage
+      }
       return new Response(null, { status: 101, webSocket: client });
     }
     return new Response("Not Found", { status: 404 });
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    const byteLen = typeof message === "string" ? message.length : message.byteLength;
-    if (byteLen > 128) {
+    const byteLen = measureWsMessageBytes(message);
+    if (byteLen > MP_MAX_WS_BYTES) {
+      this.handleSocketDisconnect(ws, 1009, "Message too large");
+      return;
+    }
+
+    let rawText: string;
+    if (typeof message === "string") {
+      rawText = message;
+    } else {
       try {
-        ws.close(1009, "Message too large");
+        rawText = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(message);
       } catch {
-        // ignore
+        return;
       }
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch {
+      return;
+    }
+    if (!isPlainRecord(parsed) || typeof parsed.t !== "string") {
+      return;
+    }
+
+    const now = Date.now();
+    const t = parsed.t;
+
+    if (t === "hello") {
+      const prev = this.getOrInitSocketAttachment(ws, now);
+      const rl = this.getSocketRateLimit(ws, now);
+      rl.count += 1;
+      if (rl.count > MP_MAX_POSES_PER_WINDOW) return;
+      if (prev.joined && now - rl.lastProfileMs < MP_MIN_PROFILE_INTERVAL_MS) return;
+      rl.lastProfileMs = now;
+
+      const rawAppObj = isPlainRecord(parsed.appearance)
+        ? parsed.appearance
+        : typeof parsed.skin === "string"
+          ? parsed
+          : undefined;
+      const rawAppName = rawAppObj ? rawAppObj.name : undefined;
+      const nameSource = parsed.name !== undefined ? parsed.name : rawAppName;
+      const nextPose = sanitizeMpPose(parsed, prev);
+      const nextState: MultiplayerSocketAttachment = {
+        id: prev.id,
+        joined: true,
+        connectedAt: prev.connectedAt || now,
+        lastSeenAt: now,
+        name: sanitizeMpName(nameSource, prev.name),
+        appearance: sanitizeMpAppearance(rawAppObj, prev.appearance),
+        ...nextPose,
+      };
+      try {
+        ws.serializeAttachment(nextState);
+      } catch {
+        return;
+      }
+
+      const peersList = this.collectActiveJoinedPeers(now, ws, nextState.id);
+      const onlineCount = peersList.length + 1;
+      const publicSelf = toPublicPlayerState(nextState);
+
+      const welcomeMsg: MultiplayerServerMessage = {
+        type: "mp_welcome",
+        selfId: nextState.id,
+        onlineCount,
+        players: peersList,
+      };
+      try {
+        ws.send(JSON.stringify(welcomeMsg));
+      } catch {
+        return;
+      }
+
+      this.broadcastExcept(ws, {
+        type: "mp_join",
+        onlineCount,
+        player: publicSelf,
+      });
+      return;
+    }
+
+    if (t === "pose") {
+      const prev = this.getOrInitSocketAttachment(ws, now);
+      if (!prev.joined) return;
+
+      const rl = this.getSocketRateLimit(ws, now);
+      rl.count += 1;
+      if (rl.count > MP_MAX_POSES_PER_WINDOW) return;
+
+      const wasStale = now - prev.lastSeenAt > MP_STALE_TIMEOUT_MS;
+      const nextPose = sanitizeMpPose(parsed, prev);
+      const nextState: MultiplayerSocketAttachment = {
+        ...prev,
+        ...nextPose,
+        lastSeenAt: now,
+      };
+      try {
+        ws.serializeAttachment(nextState);
+      } catch {
+        return;
+      }
+
+      if (wasStale) {
+        const peersList = this.collectActiveJoinedPeers(now, ws, nextState.id);
+        this.broadcastExcept(ws, {
+          type: "mp_join",
+          onlineCount: peersList.length + 1,
+          player: toPublicPlayerState(nextState),
+        });
+      } else {
+        this.broadcastExcept(ws, {
+          type: "mp_pose",
+          id: nextState.id,
+          ...nextPose,
+        });
+      }
+      return;
+    }
+
+    if (t === "profile") {
+      const prev = this.getOrInitSocketAttachment(ws, now);
+      if (!prev.joined) return;
+
+      const rl = this.getSocketRateLimit(ws, now);
+      if (now - rl.lastProfileMs < MP_MIN_PROFILE_INTERVAL_MS) return;
+      rl.lastProfileMs = now;
+
+      const rawAppObj = isPlainRecord(parsed.appearance)
+        ? parsed.appearance
+        : typeof parsed.skin === "string"
+          ? parsed
+          : undefined;
+      const rawAppName = rawAppObj ? rawAppObj.name : undefined;
+      const nameSource = parsed.name !== undefined ? parsed.name : rawAppName;
+      const nextName =
+        nameSource !== undefined ? sanitizeMpName(nameSource, prev.name) : prev.name;
+      const nextAppearance =
+        rawAppObj !== undefined
+          ? sanitizeMpAppearance(rawAppObj, prev.appearance)
+          : prev.appearance;
+
+      const nextState: MultiplayerSocketAttachment = {
+        ...prev,
+        name: nextName,
+        appearance: nextAppearance,
+        lastSeenAt: now,
+      };
+      try {
+        ws.serializeAttachment(nextState);
+      } catch {
+        return;
+      }
+
+      this.broadcastExcept(ws, {
+        type: "mp_profile",
+        id: nextState.id,
+        name: nextState.name,
+        appearance: nextState.appearance,
+      });
+      return;
+    }
+
+    if (t === "emote") {
+      const prev = this.getOrInitSocketAttachment(ws, now);
+      if (!prev.joined) return;
+      if (typeof parsed.kind !== "string" || !MP_VALID_EMOTES.has(parsed.kind as MultiplayerEmoteKind)) {
+        return;
+      }
+
+      const rl = this.getSocketRateLimit(ws, now);
+      if (now - (rl.lastEmoteMs ?? 0) < MP_MIN_EMOTE_INTERVAL_MS) return;
+      rl.lastEmoteMs = now;
+
+      const nextState: MultiplayerSocketAttachment = {
+        ...prev,
+        lastSeenAt: now,
+      };
+      try {
+        ws.serializeAttachment(nextState);
+      } catch {
+        return;
+      }
+
+      this.broadcastExcept(ws, {
+        type: "mp_emote",
+        id: nextState.id,
+        kind: parsed.kind as MultiplayerEmoteKind,
+      });
     }
   }
 
-  override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
-    try {
-      ws.close(code, reason);
-    } catch {
-      // ignore
-    }
+  override async webSocketClose(
+    ws: WebSocket,
+    code: number,
+    reason: string,
+    _wasClean?: boolean,
+  ): Promise<void> {
+    this.handleSocketDisconnect(ws, code, reason);
+  }
+
+  override async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
+    this.handleSocketDisconnect(ws, 1011, "Socket error");
   }
 }

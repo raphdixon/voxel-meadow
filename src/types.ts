@@ -306,3 +306,104 @@ export interface WorldStateSnapshot {
   myActiveJob?: BuildQueueJobInfo | null;
   lastWeaveNote: string;
 }
+
+export type MultiplayerMode = "walk" | "aerial";
+
+export type MultiplayerAnim = "idle" | "walk" | "run" | "jump" | "ride" | "sit" | "wave";
+
+export type MultiplayerEmoteKind = "wave" | "jump" | "cheer";
+
+export interface MultiplayerAppearance {
+  skin: string;
+  hairStyle: string;
+  hairColor: string;
+  hatStyle: string;
+  hatColor: string;
+  eyeStyle: string;
+  accessory: string;
+  accessoryColor: string;
+  topStyle: string;
+  topColor: string;
+  bottomStyle: string;
+  bottomColor: string;
+  shoeColor: string;
+}
+
+export interface MultiplayerPose {
+  mode: MultiplayerMode;
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  pitch: number;
+  vx: number;
+  vz: number;
+  anim: MultiplayerAnim;
+  ride: string | null;
+  seat: number;
+  room: string | null;
+}
+
+export interface MultiplayerPlayerState extends MultiplayerPose {
+  id: string;
+  name: string;
+  appearance: MultiplayerAppearance;
+}
+
+export interface MultiplayerSocketAttachment extends MultiplayerPlayerState {
+  joined: boolean;
+  connectedAt: number;
+  lastSeenAt: number;
+}
+
+export type MultiplayerClientMessage =
+  | ({
+      t: "hello";
+      name?: string;
+      appearance?: Partial<MultiplayerAppearance>;
+    } & Partial<MultiplayerPose>)
+  | ({
+      t: "pose";
+    } & Partial<MultiplayerPose>)
+  | {
+      t: "profile";
+      name?: string;
+      appearance?: Partial<MultiplayerAppearance>;
+    }
+  | {
+      t: "emote";
+      kind: MultiplayerEmoteKind;
+    };
+
+export type MultiplayerServerMessage =
+  | {
+      type: "mp_welcome";
+      selfId: string;
+      onlineCount: number;
+      players: MultiplayerPlayerState[];
+    }
+  | {
+      type: "mp_join";
+      onlineCount: number;
+      player: MultiplayerPlayerState;
+    }
+  | ({
+      type: "mp_pose";
+      id: string;
+    } & MultiplayerPose)
+  | {
+      type: "mp_profile";
+      id: string;
+      name: string;
+      appearance: MultiplayerAppearance;
+    }
+  | {
+      type: "mp_emote";
+      id: string;
+      kind: MultiplayerEmoteKind;
+    }
+  | {
+      type: "mp_leave";
+      id: string;
+      onlineCount: number;
+    };

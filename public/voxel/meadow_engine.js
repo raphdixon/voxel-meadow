@@ -16,6 +16,17 @@ import {
   UnrealBloomPass,
 } from "../vendor/three-bundle.js";
 import { VillagerAgent, buildBatchedWorldProps, buildWorldPropMesh } from "./villagers.js";
+import {
+  RemotePlayerManager,
+  buildCharacterAvatarRig,
+  loadSavedAppearance,
+  sanitizeAppearance,
+} from "./character_system.js";
+import {
+  INTERIOR_ORIGIN,
+  canEnterCreation,
+  createInteriorAndTransitSystem,
+} from "./interiors_and_transit.js";
 import { INTERACTIVE_HIT_LAYER, createInteractiveController } from "./interactive_games.js";
 import {
   Vox,
@@ -2881,6 +2892,25 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   const villagersGroup = new THREE.Group();
   scene.add(pathsGroup, propsGroup, creationsGroup, villagersGroup);
 
+  let localAppearance = loadSavedAppearance();
+  const localAvatarRig = buildCharacterAvatarRig(localAppearance, {
+    isLocalPlayer: true,
+    castShadow: true,
+  });
+  localAvatarRig.root.visible = !ogMode;
+  scene.add(localAvatarRig.root);
+  let waveTimer = 0;
+
+  const remotePlayers = new RemotePlayerManager();
+  remotePlayers.group.visible = !ogMode;
+  scene.add(remotePlayers.group);
+
+  let interiorSystem = null;
+  let activeInteractionTarget = null;
+  let lastInteractionPromptKey = "";
+  let hasWalkedOnce = false;
+  let lastExitCamTarget = null;
+
   // Unit-radius Highlight Halo (scaled dynamically to match tiny vs colossal creation footprints!)
   const haloGeo = new THREE.RingGeometry(0.92, 1.06, 64);
   haloGeo.rotateX(-Math.PI / 2);
@@ -2952,6 +2982,15 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   const runIntroOnBoot = !ogMode && !prefersReducedMotion;
   const initialHomeZoom = getHomeZoom();
 
+  const sessionSpawnAng = Math.random() * Math.PI * 2;
+  const sessionSpawnRad = 1.4 + Math.random() * 2.4;
+  const [initialSpawnX, initialSpawnZ] = clampPointToIsland(
+    10.6 + Math.cos(sessionSpawnAng) * sessionSpawnRad,
+    -0.6 + Math.sin(sessionSpawnAng) * sessionSpawnRad,
+    4.0,
+  );
+  const initialSpawnYaw = Math.atan2(-(2.4 - initialSpawnX), -(-18.5 - initialSpawnZ));
+
   const introSweep = {
     active: runIntroOnBoot,
     elapsed: 0,
@@ -2969,9 +3008,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     firedOrbit: false,
     firedWalk: false,
     usingFpCam: false,
-    walkX: 10.6,
-    walkZ: -0.6,
-    walkYaw: 0.43,
+    walkX: initialSpawnX,
+    walkZ: initialSpawnZ,
+    walkYaw: initialSpawnYaw,
     walkPitch: 0.045,
   };
 
@@ -3014,7 +3053,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         const [rx, rz] = resolveWalkPosition(introSweep.walkX, introSweep.walkZ);
         fp.x = rx;
         fp.z = rz;
-        fp.y = getIslandGroundHeight(rx, rz) + FP_EYE_HEIGHT;
+        const gY = getIslandGroundHeight(rx, rz);
+        fp.feetY = gY;
+        fp.y = gY + FP_EYE_HEIGHT;
         fp.yaw = fp.goalYaw = introSweep.walkYaw;
         fp.pitch = fp.goalPitch = introSweep.walkPitch;
         fp.vx = 0;
@@ -3023,7 +3064,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         fp.jumpVy = 0;
         fp.settleT = 1;
         fp.active = true;
+        hasWalkedOnce = true;
         dragMode = "walk";
+        localAvatarRig.setFirstPersonMode(true);
         skyDome.visible = true;
         skyDome.position.set(fp.x, 0, fp.z);
         fpCamera.position.set(fp.x, fp.y, fp.z);
@@ -3178,6 +3221,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   function pickInteractiveAt(clientX, clientY) {
+    if (fp.active && interiorSystem?.isInside?.()) return null;
     rebuildSceneListsIfNeeded();
     if (cachedInteractiveEntities.length === 0) return null;
 
@@ -3215,16 +3259,23 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   const FP_EYE_HEIGHT = 1.65;
-  const FP_MIN_PITCH = -1.12;
+  const FP_MIN_PITCH = -1.32;
   const FP_MAX_PITCH = 1.18;
   const FP_MAX_RADIUS = 148;
+  const initialSpawnFeetY = getIslandGroundHeight(initialSpawnX, initialSpawnZ);
   const fp = {
     active: false,
-    x: 0,
-    y: FP_EYE_HEIGHT,
-    z: 8,
-    yaw: HOME_AZ,
-    goalYaw: HOME_AZ,
+    x: initialSpawnX,
+    y: initialSpawnFeetY + FP_EYE_HEIGHT,
+    z: initialSpawnZ,
+    localX: 0,
+    localY: 0,
+    localZ: 3.85,
+    feetY: initialSpawnFeetY,
+    horizSpeed: 0,
+    sprinting: false,
+    yaw: initialSpawnYaw,
+    goalYaw: initialSpawnYaw,
     pitch: -0.02,
     goalPitch: -0.02,
     vx: 0,
@@ -3236,6 +3287,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   };
 
   function screenToGround(clientX, clientY) {
+    if (fp.active && interiorSystem?.isInside?.()) return null;
     const rect = canvas.getBoundingClientRect();
     const ndcX = ((clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1;
     const ndcY = -((clientY - rect.top) / Math.max(1, rect.height)) * 2 + 1;
@@ -3271,6 +3323,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   function pickCreationAt(clientX, clientY) {
+    if (fp.active && interiorSystem?.isInside?.()) return null;
     rebuildSceneListsIfNeeded();
     if (fp.active) {
       const rect = canvas.getBoundingClientRect();
@@ -3979,6 +4032,32 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     }
     markSceneListsDirty();
 
+    if (interiorSystem?.isInside?.()) {
+      const curRoomId = interiorSystem.getCurrentRoomId();
+      if (curRoomId && !seenIds.has(curRoomId)) {
+        exitCurrentBuilding();
+      }
+    }
+    if (interiorSystem?.isRiding?.()) {
+      const rState = interiorSystem.getRidingState();
+      const baseRideId = rState?.rideId ? String(rState.rideId).replace(/#(?:sec|tram)$/, "") : "";
+      if (baseRideId && !seenIds.has(baseRideId)) {
+        hopOffCurrentVehicle();
+      }
+    }
+    if (!ogMode && !hasWalkedOnce && !fp.active) {
+      const [rx, rz] = resolveWalkPosition(fp.x, fp.z);
+      fp.x = rx;
+      fp.z = rz;
+      fp.feetY = getIslandGroundHeight(rx, rz);
+      fp.y = fp.feetY + FP_EYE_HEIGHT;
+      introSweep.walkX = rx;
+      introSweep.walkZ = rz;
+      const nextYaw = Math.atan2(-(2.4 - rx), -(-18.5 - rz));
+      introSweep.walkYaw = nextYaw;
+      fp.yaw = fp.goalYaw = nextYaw;
+    }
+
     if (ogMode) {
       frameActiveWorldForOg();
       ogSettledFrames = 0;
@@ -4118,6 +4197,519 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     return [x, z];
   }
 
+  {
+    const [bootX, bootZ] = resolveWalkPosition(fp.x, fp.z);
+    fp.x = bootX;
+    fp.z = bootZ;
+    fp.feetY = getIslandGroundHeight(bootX, bootZ);
+    fp.y = fp.feetY + FP_EYE_HEIGHT;
+    introSweep.walkX = bootX;
+    introSweep.walkZ = bootZ;
+    const bootYaw = Math.atan2(-(2.4 - bootX), -(-18.5 - bootZ));
+    introSweep.walkYaw = bootYaw;
+    fp.yaw = fp.goalYaw = bootYaw;
+  }
+
+  interiorSystem = createInteriorAndTransitSystem({
+    scene,
+    getCreationEntities: () => creationEntities,
+    getWorld: () => currentWorld,
+    resolveExteriorWalkPosition: resolveWalkPosition,
+  });
+
+  function setLocalAppearance(nextAppearance) {
+    localAppearance = sanitizeAppearance(nextAppearance);
+    localAvatarRig.setAppearance(localAppearance);
+    return { ...localAppearance };
+  }
+
+  function getLocalAppearance() {
+    return { ...localAppearance };
+  }
+
+  function triggerLocalWave() {
+    waveTimer = 1.45;
+    callbacks.onLocalEmote?.("wave");
+    return true;
+  }
+
+  function getLocalMultiplayerPose() {
+    const room = interiorSystem.getCurrentRoomId();
+    const rideState = interiorSystem.getRidingState();
+    const seatPose = interiorSystem.isSitting() ? interiorSystem.getSeatPose() : null;
+    const mode = fp.active ? "walk" : "aerial";
+
+    if (room) {
+      const lx = seatPose ? seatPose.x : fp.localX;
+      const ly = seatPose ? seatPose.y : fp.localY;
+      const lz = seatPose ? seatPose.z : fp.localZ;
+      const anim = seatPose
+        ? "sit"
+        : fp.jumpY > 0.03
+          ? "jump"
+          : fp.horizSpeed > 5.8
+            ? "run"
+            : fp.horizSpeed > 0.35
+              ? "walk"
+              : waveTimer > 0
+                ? "wave"
+                : "idle";
+      return {
+        mode: "walk",
+        x: lx,
+        y: ly,
+        z: lz,
+        yaw: fp.yaw,
+        pitch: fp.pitch,
+        vx: seatPose ? 0 : fp.vx,
+        vz: seatPose ? 0 : fp.vz,
+        anim,
+        ride: null,
+        seat: 0,
+        room,
+      };
+    }
+
+    if (fp.active && rideState) {
+      return {
+        mode: "walk",
+        x: fp.x,
+        y: fp.feetY,
+        z: fp.z,
+        yaw: fp.yaw,
+        pitch: fp.pitch,
+        vx: 0,
+        vz: 0,
+        anim: "ride",
+        ride: rideState.rideId,
+        seat: rideState.seat,
+        room: null,
+      };
+    }
+
+    if (fp.active && seatPose) {
+      const groundY = getIslandGroundHeight(seatPose.x, seatPose.z);
+      return {
+        mode: "walk",
+        x: seatPose.x,
+        y: groundY + seatPose.y,
+        z: seatPose.z,
+        yaw: fp.yaw,
+        pitch: fp.pitch,
+        vx: 0,
+        vz: 0,
+        anim: "sit",
+        ride: null,
+        seat: 0,
+        room: null,
+      };
+    }
+
+    if (fp.active) {
+      const groundY = getIslandGroundHeight(fp.x, fp.z);
+      const anim =
+        fp.jumpY > 0.03
+          ? "jump"
+          : fp.horizSpeed > 6.4
+            ? "run"
+            : fp.horizSpeed > 0.35
+              ? "walk"
+              : waveTimer > 0
+                ? "wave"
+                : "idle";
+      return {
+        mode: "walk",
+        x: fp.x,
+        y: groundY + fp.jumpY,
+        z: fp.z,
+        yaw: fp.yaw,
+        pitch: fp.pitch,
+        vx: fp.vx,
+        vz: fp.vz,
+        anim,
+        ride: null,
+        seat: 0,
+        room: null,
+      };
+    }
+
+    return {
+      mode,
+      x: fp.x,
+      y: getIslandGroundHeight(fp.x, fp.z),
+      z: fp.z,
+      yaw: fp.yaw,
+      pitch: 0,
+      vx: 0,
+      vz: 0,
+      anim: waveTimer > 0 ? "wave" : "idle",
+      ride: null,
+      seat: 0,
+      room: null,
+    };
+  }
+
+  function syncMultiplayerWelcome(playersOrMsg) {
+    const list = Array.isArray(playersOrMsg)
+      ? playersOrMsg
+      : Array.isArray(playersOrMsg?.players)
+        ? playersOrMsg.players
+        : [];
+    remotePlayers.clear();
+    for (const p of list) {
+      remotePlayers.upsertPeer(p);
+    }
+  }
+
+  function upsertRemotePlayer(player) {
+    return remotePlayers.upsertPeer(player);
+  }
+
+  function updateRemotePlayerPose(poseMsg) {
+    remotePlayers.updatePeerPose(poseMsg);
+  }
+
+  function updateRemotePlayerProfile(idOrMsg, name, appearance) {
+    remotePlayers.updatePeerProfile(idOrMsg, name, appearance);
+  }
+
+  function triggerRemotePlayerEmote(idOrMsg, kind) {
+    remotePlayers.triggerPeerEmote(idOrMsg, kind);
+  }
+
+  function removeRemotePlayer(idOrMsg) {
+    remotePlayers.removePeer(idOrMsg);
+  }
+
+  function getRemotePlayerCount() {
+    return remotePlayers.getPeerCount();
+  }
+
+  function refreshInteractionTarget() {
+    if (ogMode) {
+      activeInteractionTarget = null;
+      if (lastInteractionPromptKey !== "") {
+        lastInteractionPromptKey = "";
+        callbacks.onInteractionPromptChange?.(null);
+      }
+      return null;
+    }
+
+    const inside = interiorSystem.isInside();
+    const target = interiorSystem.findBestInteractionTarget({
+      fpActive: fp.active,
+      localX: fp.localX,
+      localY: fp.active && inside ? fp.y - INTERIOR_ORIGIN.y : FP_EYE_HEIGHT,
+      localZ: fp.localZ,
+      worldX: fp.x,
+      worldY: fp.y,
+      worldZ: fp.z,
+      yaw: fp.yaw,
+      pitch: fp.pitch,
+    });
+    activeInteractionTarget = target || null;
+
+    const promptInfo = target
+      ? {
+          kind: target.kind,
+          id: target.id,
+          label: target.label,
+          keyHint: target.keyHint || "F",
+        }
+      : null;
+    const nextKey = promptInfo
+      ? `${promptInfo.kind}|${promptInfo.id}|${promptInfo.label}|${promptInfo.keyHint}`
+      : "";
+    if (nextKey !== lastInteractionPromptKey) {
+      lastInteractionPromptKey = nextKey;
+      callbacks.onInteractionPromptChange?.(promptInfo);
+    }
+    return promptInfo;
+  }
+
+  function getActiveInteractionPrompt() {
+    if (!activeInteractionTarget) return null;
+    return {
+      kind: activeInteractionTarget.kind,
+      id: activeInteractionTarget.id,
+      label: activeInteractionTarget.label,
+      keyHint: activeInteractionTarget.keyHint || "F",
+    };
+  }
+
+  function enterBuildingById(id) {
+    if (!id) return false;
+    const ent = ensureCreationBuilt(id);
+    if (ent?.data && !canEnterCreation(ent.data)) return false;
+
+    cancelIntroSweep("walk");
+    if (interiorSystem.isRiding()) {
+      hopOffCurrentVehicle();
+    } else if (interiorSystem.isSitting() && !interiorSystem.isInside()) {
+      const wake = interiorSystem.standUp();
+      if (wake?.ok && wake.pose && !wake.pose.isInterior) {
+        fp.x = wake.pose.x;
+        fp.z = wake.pose.z;
+      }
+    }
+
+    const res = interiorSystem.enterBuilding(id, {
+      x: fp.x,
+      z: fp.z,
+      yaw: fp.yaw,
+      pitch: fp.pitch,
+    });
+    if (!res?.ok || !res.spawnLocal) return false;
+
+    clearInteractiveHover();
+    callbacks.onHoverCreation?.(null, 0, 0, null);
+    pointerGesture = null;
+    activePointers.clear();
+    fpTouchLook = null;
+
+    fp.active = true;
+    hasWalkedOnce = true;
+    dragMode = "walk";
+    fp.settleT = 1;
+    fp.localX = res.spawnLocal.x;
+    fp.localY = res.spawnLocal.y || 0;
+    fp.localZ = res.spawnLocal.z;
+    fp.yaw = fp.goalYaw = res.spawnLocal.yaw;
+    fp.pitch = fp.goalPitch = res.spawnLocal.pitch;
+    fp.vx = 0;
+    fp.vz = 0;
+    fp.jumpY = 0;
+    fp.jumpVy = 0;
+    fp.horizSpeed = 0;
+    fp.sprinting = false;
+    fp.y = INTERIOR_ORIGIN.y + fp.localY + FP_EYE_HEIGHT;
+
+    localAvatarRig.setFirstPersonMode(true);
+    skyDome.visible = true;
+    skyDome.position.set(INTERIOR_ORIGIN.x, INTERIOR_ORIGIN.y - 12, INTERIOR_ORIGIN.z);
+    sun.intensity = 0.28;
+    hemi.intensity = 0.68;
+    fpCamera.position.set(
+      INTERIOR_ORIGIN.x + fp.localX,
+      fp.y,
+      INTERIOR_ORIGIN.z + fp.localZ,
+    );
+    fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
+    fpCamera.updateMatrixWorld();
+    syncComposerCamera(fpCamera);
+    canvas.style.cursor = idleCursor();
+
+    callbacks.onDragModeChange?.("walk");
+    callbacks.onInteriorChange?.({
+      roomId: res.roomId,
+      name: res.creation?.name || "",
+    });
+    refreshInteractionTarget();
+    return true;
+  }
+
+  function exitCurrentBuilding() {
+    if (!interiorSystem.isInside()) return false;
+    const res = interiorSystem.exitBuilding();
+    if (!res?.ok || !res.exteriorPose) return false;
+
+    clearInteractiveHover();
+    fp.x = res.exteriorPose.x;
+    fp.z = res.exteriorPose.z;
+    fp.yaw = fp.goalYaw = res.exteriorPose.yaw;
+    fp.pitch = fp.goalPitch = res.exteriorPose.pitch;
+    fp.vx = 0;
+    fp.vz = 0;
+    fp.jumpY = 0;
+    fp.jumpVy = 0;
+    fp.horizSpeed = 0;
+    fp.sprinting = false;
+    fp.settleT = 1;
+    const gY = getIslandGroundHeight(fp.x, fp.z);
+    fp.feetY = gY;
+    fp.y = gY + FP_EYE_HEIGHT;
+
+    sun.intensity = 2.25;
+    hemi.intensity = 1.12;
+    if (fp.active) {
+      skyDome.visible = true;
+      skyDome.position.set(fp.x, 0, fp.z);
+      fpCamera.position.set(fp.x, fp.y, fp.z);
+      fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
+      fpCamera.updateMatrixWorld();
+    }
+    callbacks.onInteriorChange?.(null);
+    refreshInteractionTarget();
+    return true;
+  }
+
+  function boardVehicleById(rideId, preferredSeat = 0) {
+    if (!rideId) return false;
+    const baseId = String(rideId).replace(/#(?:sec|tram)$/, "");
+    ensureCreationBuilt(baseId);
+    cancelIntroSweep("walk");
+
+    const wasInside = interiorSystem.isInside();
+    const res = interiorSystem.boardVehicle(rideId, preferredSeat);
+    if (!res?.ok || !res.pose) return false;
+
+    if (wasInside) {
+      callbacks.onInteriorChange?.(null);
+    }
+    clearInteractiveHover();
+    callbacks.onHoverCreation?.(null, 0, 0, null);
+    pointerGesture = null;
+    activePointers.clear();
+    fpTouchLook = null;
+
+    fp.active = true;
+    hasWalkedOnce = true;
+    dragMode = "walk";
+    fp.settleT = 1;
+    fp.x = res.pose.x;
+    fp.z = res.pose.z;
+    fp.feetY = res.pose.y;
+    fp.y = res.pose.eyeY;
+    fp.yaw = fp.goalYaw = res.pose.yaw;
+    fp.pitch = fp.goalPitch = -0.03;
+    fp.vx = 0;
+    fp.vz = 0;
+    fp.jumpY = 0;
+    fp.jumpVy = 0;
+    fp.horizSpeed = 0;
+    fp.sprinting = false;
+
+    localAvatarRig.setFirstPersonMode(true);
+    sun.intensity = 2.25;
+    hemi.intensity = 1.12;
+    skyDome.visible = true;
+    skyDome.position.set(fp.x, 0, fp.z);
+    fpCamera.position.set(res.pose.eyeX, res.pose.eyeY, res.pose.eyeZ);
+    fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
+    fpCamera.updateMatrixWorld();
+    syncComposerCamera(fpCamera);
+    canvas.style.cursor = idleCursor();
+
+    callbacks.onDragModeChange?.("walk");
+    refreshInteractionTarget();
+    return true;
+  }
+
+  function hopOffCurrentVehicle() {
+    if (!interiorSystem.isRiding()) return false;
+    const res = interiorSystem.hopOffVehicle();
+    if (!res?.ok || !res.exteriorPose) return false;
+
+    fp.x = res.exteriorPose.x;
+    fp.z = res.exteriorPose.z;
+    fp.yaw = fp.goalYaw = res.exteriorPose.yaw;
+    fp.pitch = fp.goalPitch = res.exteriorPose.pitch;
+    fp.vx = 0;
+    fp.vz = 0;
+    fp.jumpY = 0;
+    fp.jumpVy = 0;
+    fp.horizSpeed = 0;
+    fp.sprinting = false;
+    fp.settleT = 1;
+    const gY = getIslandGroundHeight(fp.x, fp.z);
+    fp.feetY = gY;
+    fp.y = gY + FP_EYE_HEIGHT;
+
+    if (fp.active) {
+      fpCamera.position.set(fp.x, fp.y, fp.z);
+      fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
+      fpCamera.updateMatrixWorld();
+    }
+    refreshInteractionTarget();
+    return true;
+  }
+
+  function triggerActiveInteraction() {
+    if (!activeInteractionTarget) {
+      refreshInteractionTarget();
+    }
+    const target = activeInteractionTarget;
+    if (!target) return false;
+
+    if (target.kind === "enter_building") {
+      return enterBuildingById(target.id);
+    }
+    if (target.kind === "exit_building") {
+      return exitCurrentBuilding();
+    }
+    if (target.kind === "board_vehicle") {
+      return boardVehicleById(target.id);
+    }
+    if (target.kind === "hop_off") {
+      return hopOffCurrentVehicle();
+    }
+    if (target.kind === "sit") {
+      const res = target.execute?.();
+      if (res?.ok && res.pose) {
+        if (res.pose.isInterior) {
+          fp.localX = res.pose.x;
+          fp.localY = res.pose.y;
+          fp.localZ = res.pose.z;
+          fp.y = res.pose.worldEyeY;
+        } else {
+          fp.x = res.pose.x;
+          fp.z = res.pose.z;
+          const gY = getIslandGroundHeight(res.pose.x, res.pose.z);
+          fp.feetY = gY + res.pose.y;
+          fp.y = gY + res.pose.eyeY;
+        }
+        fp.yaw = fp.goalYaw = res.pose.yaw;
+        fp.pitch = fp.goalPitch = -0.04;
+        fp.vx = 0;
+        fp.vz = 0;
+        fp.jumpY = 0;
+        fp.jumpVy = 0;
+        fp.horizSpeed = 0;
+      }
+      refreshInteractionTarget();
+      return Boolean(res?.ok);
+    }
+    if (target.kind === "stand_up") {
+      const res = interiorSystem.standUp();
+      if (res?.ok && res.pose) {
+        if (res.pose.isInterior) {
+          fp.localX = res.pose.x;
+          fp.localY = 0;
+          fp.localZ = res.pose.z;
+          fp.y = INTERIOR_ORIGIN.y + FP_EYE_HEIGHT;
+        } else {
+          fp.x = res.pose.x;
+          fp.z = res.pose.z;
+          const gY = getIslandGroundHeight(res.pose.x, res.pose.z);
+          fp.feetY = gY;
+          fp.y = gY + FP_EYE_HEIGHT;
+        }
+        fp.vx = 0;
+        fp.vz = 0;
+        fp.jumpY = 0;
+        fp.jumpVy = 0;
+        fp.horizSpeed = 0;
+      }
+      refreshInteractionTarget();
+      return Boolean(res?.ok);
+    }
+    if (target.kind === "interactive_creation") {
+      const res = target.execute?.();
+      if (res?.creation) {
+        highlightedId = res.creation.id;
+        if (res.message) {
+          callbacks.onInteractiveEvent?.(res.creation, res.message);
+        }
+      }
+      refreshInteractionTarget();
+      return Boolean(res?.ok);
+    }
+
+    const res = target.execute?.();
+    refreshInteractionTarget();
+    return Boolean(res?.ok ?? true);
+  }
+
   function placeFirstPersonNear(targetX, targetZ, preferredAz = cam.az, standOverride = null, topYHint = null) {
     let focusX = targetX;
     let focusZ = targetZ;
@@ -4180,6 +4772,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     fp.jumpVy = 0;
     fp.settleT = prefersReducedMotion ? 1 : 0;
     const gY = getIslandGroundHeight(fp.x, fp.z);
+    fp.feetY = gY;
     fp.y = gY + (prefersReducedMotion ? FP_EYE_HEIGHT : FP_EYE_HEIGHT + 1.15);
   }
 
@@ -4194,8 +4787,33 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     fpJoystick.fwd = 0;
     fpTouchLook = null;
 
-    placeFirstPersonNear(cam.tx, cam.tz, cam.az);
+    const stayedAtStandingAvatar =
+      (!hasWalkedOnce && Math.hypot(cam.goalTx - HOME_TX, cam.goalTz - HOME_TZ) < 2.5) ||
+      (lastExitCamTarget &&
+        Math.hypot(cam.goalTx - lastExitCamTarget.x, cam.goalTz - lastExitCamTarget.z) < 2.5);
+
+    if (stayedAtStandingAvatar && isWalkPointClear(fp.x, fp.z, 0.1)) {
+      const [rx, rz] = resolveWalkPosition(fp.x, fp.z);
+      fp.x = rx;
+      fp.z = rz;
+      fp.vx = 0;
+      fp.vz = 0;
+      fp.jumpY = 0;
+      fp.jumpVy = 0;
+      fp.pitch = fp.goalPitch = -0.02;
+      fp.settleT = prefersReducedMotion ? 1 : 0;
+      const gY = getIslandGroundHeight(fp.x, fp.z);
+      fp.feetY = gY;
+      fp.y = gY + (prefersReducedMotion ? FP_EYE_HEIGHT : FP_EYE_HEIGHT + 1.15);
+    } else {
+      placeFirstPersonNear(cam.tx, cam.tz, cam.az);
+    }
+
+    hasWalkedOnce = true;
     fp.active = true;
+    localAvatarRig.setFirstPersonMode(true);
+    sun.intensity = 2.25;
+    hemi.intensity = 1.12;
     skyDome.visible = true;
     skyDome.position.set(fp.x, 0, fp.z);
     fpCamera.position.set(fp.x, fp.y, fp.z);
@@ -4203,11 +4821,31 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     fpCamera.updateMatrixWorld();
     syncComposerCamera(fpCamera);
     canvas.style.cursor = idleCursor();
+    refreshInteractionTarget();
   }
 
   function exitFirstPerson(toHome = false) {
+    if (interiorSystem.isInside()) {
+      exitCurrentBuilding();
+    }
+    if (interiorSystem.isRiding()) {
+      hopOffCurrentVehicle();
+    }
+    if (interiorSystem.isSitting()) {
+      const wake = interiorSystem.standUp();
+      if (wake?.ok && wake.pose && !wake.pose.isInterior) {
+        fp.x = wake.pose.x;
+        fp.z = wake.pose.z;
+      }
+    }
     if (!fp.active) return;
     fp.active = false;
+    fp.vx = 0;
+    fp.vz = 0;
+    fp.jumpY = 0;
+    fp.jumpVy = 0;
+    fp.horizSpeed = 0;
+    fp.sprinting = false;
     fpJoystick.right = 0;
     fpJoystick.fwd = 0;
     fpTouchLook = null;
@@ -4221,12 +4859,16 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         // ignore pointer-lock exit errors
       }
     }
+    localAvatarRig.setFirstPersonMode(false);
+    sun.intensity = 2.25;
+    hemi.intensity = 1.12;
     skyDome.visible = false;
     syncComposerCamera(camera);
 
     if (!toHome) {
       const aheadX = Math.max(-CLAMP_BOUND, Math.min(CLAMP_BOUND, fp.x - Math.sin(fp.yaw) * 6.5));
       const aheadZ = Math.max(-CLAMP_BOUND, Math.min(CLAMP_BOUND, fp.z - Math.cos(fp.yaw) * 6.5));
+      lastExitCamTarget = { x: aheadX, z: aheadZ };
       cam.tx = cam.goalTx = aheadX;
       cam.tz = cam.goalTz = aheadZ;
       cam.az = cam.goalAz = fp.yaw;
@@ -4236,8 +4878,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       cam.goalTy = 0;
       cam.zoom = prefersReducedMotion ? getHomeZoom() : 1.52;
       cam.goalZoom = getHomeZoom();
+    } else {
+      lastExitCamTarget = { x: HOME_TX, z: HOME_TZ };
     }
     canvas.style.cursor = idleCursor();
+    refreshInteractionTarget();
   }
 
   function setDragMode(mode) {
@@ -4294,6 +4939,19 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
   function recenterCamera() {
     cancelIntroSweep();
+    if (interiorSystem.isInside()) {
+      exitCurrentBuilding();
+    }
+    if (interiorSystem.isRiding()) {
+      hopOffCurrentVehicle();
+    }
+    if (interiorSystem.isSitting()) {
+      const wake = interiorSystem.standUp();
+      if (wake?.ok && wake.pose && !wake.pose.isInterior) {
+        fp.x = wake.pose.x;
+        fp.z = wake.pose.z;
+      }
+    }
     if (fp.active) {
       exitFirstPerson(true);
     }
@@ -4326,7 +4984,29 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           e.deltaMode !== 0 ||
           (e.deltaX === 0 && Math.abs(e.wheelDeltaY) >= 120 && e.wheelDeltaY % 120 === 0);
         if (notchedFp && nowFp - lastTrackpadAt > 400) {
+          if (interiorSystem.isRiding()) return;
+          if (interiorSystem.isSitting()) {
+            const wake = interiorSystem.standUp();
+            if (wake?.ok && wake.pose) {
+              if (wake.pose.isInterior) {
+                fp.localX = wake.pose.x;
+                fp.localZ = wake.pose.z;
+              } else {
+                fp.x = wake.pose.x;
+                fp.z = wake.pose.z;
+              }
+            }
+          }
           const step = -Math.sign(e.deltaY) * 2.2;
+          if (interiorSystem.isInside()) {
+            const [nlx, nlz] = interiorSystem.resolveInteriorWalkPosition(
+              fp.localX - Math.sin(fp.yaw) * step,
+              fp.localZ - Math.cos(fp.yaw) * step,
+            );
+            fp.localX = nlx;
+            fp.localZ = nlz;
+            return;
+          }
           const [nx, nz] = resolveWalkPosition(
             fp.x - Math.sin(fp.yaw) * step,
             fp.z - Math.cos(fp.yaw) * step,
@@ -4795,25 +5475,79 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     if (e.key) pressedKeys.delete(String(e.key).toLowerCase());
   });
 
+  function isEditableOrDialogElement(el) {
+    if (!el || typeof el !== "object") return false;
+    if (el.isContentEditable) return true;
+    const tag = typeof el.tagName === "string" ? el.tagName.toUpperCase() : "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (typeof el.closest === "function" && el.closest("dialog[open]")) return true;
+    return false;
+  }
+
+  function isKeyboardBlockedByUi(e) {
+    if (e.metaKey || e.ctrlKey || e.altKey) return true;
+    if (isEditableOrDialogElement(e.target)) return true;
+    if (isEditableOrDialogElement(document.activeElement)) return true;
+    if (document.querySelector?.("dialog[open]")) return true;
+    return false;
+  }
+
   window.addEventListener("keydown", (e) => {
-    if (e.target?.matches?.("input, textarea")) return;
+    if (isKeyboardBlockedByUi(e)) return;
+
+    const lowerKey = e.key ? String(e.key).toLowerCase() : "";
+
+    if (!e.repeat && (e.code === "KeyF" || lowerKey === "f")) {
+      if (triggerActiveInteraction()) {
+        e.preventDefault();
+      }
+      return;
+    }
+
+    if (!e.repeat && (e.code === "KeyG" || lowerKey === "g")) {
+      triggerLocalWave();
+      return;
+    }
 
     if (fp.active) {
       if (e.code === "Space" && e.target?.matches?.("button, a")) return;
+
+      if (e.code === "Space") {
+        e.preventDefault();
+        if (!e.repeat && interiorSystem.isRiding()) {
+          hopOffCurrentVehicle();
+          return;
+        }
+        if (!e.repeat && interiorSystem.isSitting()) {
+          const wake = interiorSystem.standUp();
+          if (wake?.ok && wake.pose) {
+            if (wake.pose.isInterior) {
+              fp.localX = wake.pose.x;
+              fp.localY = 0;
+              fp.localZ = wake.pose.z;
+            } else {
+              fp.x = wake.pose.x;
+              fp.z = wake.pose.z;
+            }
+          }
+          refreshInteractionTarget();
+          return;
+        }
+        if (fp.jumpY <= 0.002) {
+          fp.jumpVy = 5.2;
+        }
+      }
+
       if (e.code) pressedKeys.add(e.code);
-      if (e.key) pressedKeys.add(String(e.key).toLowerCase());
+      if (lowerKey) pressedKeys.add(lowerKey);
 
       if (
         e.key === "ArrowUp" ||
         e.key === "ArrowDown" ||
         e.key === "ArrowLeft" ||
-        e.key === "ArrowRight" ||
-        e.code === "Space"
+        e.key === "ArrowRight"
       ) {
         e.preventDefault();
-      }
-      if (e.code === "Space" && fp.jumpY <= 0.002) {
-        fp.jumpVy = 5.2;
       }
       return;
     }
@@ -4823,22 +5557,22 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       e.key === "ArrowRight" ||
       e.key === "ArrowUp" ||
       e.key === "ArrowDown" ||
-      e.key === "a" ||
-      e.key === "d" ||
-      e.key === "w" ||
-      e.key === "s" ||
-      e.key === "q" ||
-      e.key === "e"
+      lowerKey === "a" ||
+      lowerKey === "d" ||
+      lowerKey === "w" ||
+      lowerKey === "s" ||
+      lowerKey === "q" ||
+      lowerKey === "e"
     ) {
       cancelIntroSweep();
     }
     const step = 7 / Math.max(0.5, cam.zoom);
-    if (e.key === "ArrowLeft" || e.key === "a") cam.goalTx -= step;
-    else if (e.key === "ArrowRight" || e.key === "d") cam.goalTx += step;
-    else if (e.key === "ArrowUp" || e.key === "w") cam.goalTz -= step;
-    else if (e.key === "ArrowDown" || e.key === "s") cam.goalTz += step;
-    else if (e.key === "q") cam.goalAz -= 0.14;
-    else if (e.key === "e") cam.goalAz += 0.14;
+    if (e.key === "ArrowLeft" || lowerKey === "a") cam.goalTx -= step;
+    else if (e.key === "ArrowRight" || lowerKey === "d") cam.goalTx += step;
+    else if (e.key === "ArrowUp" || lowerKey === "w") cam.goalTz -= step;
+    else if (e.key === "ArrowDown" || lowerKey === "s") cam.goalTz += step;
+    else if (lowerKey === "q") cam.goalAz -= 0.14;
+    else if (lowerKey === "e") cam.goalAz += 0.14;
     clampTarget();
   });
 
@@ -4876,8 +5610,18 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     highlightedId = id;
     ent.triggerEyeSpinFlourish?.();
     if (fp.active) {
+      if (interiorSystem.isInside()) {
+        exitCurrentBuilding();
+      }
+      if (interiorSystem.isRiding()) {
+        hopOffCurrentVehicle();
+      }
+      if (interiorSystem.isSitting()) {
+        interiorSystem.standUp();
+      }
       const stand = Math.max(7.5, (ent.footprintRadius || 3.4) + 5.0);
       placeFirstPersonNear(ent.x, ent.z, fp.yaw, stand, ent.topY);
+      refreshInteractionTarget();
       return;
     }
     const altOffset = ent.y > 1 ? ent.y / Math.max(0.35, Math.tan(cam.el)) : 0;
@@ -4983,6 +5727,13 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     const t = now * 0.001;
     frameTick = (frameTick + 1) | 0;
 
+    if (waveTimer > 0) {
+      waveTimer = Math.max(0, waveTimer - dt);
+    }
+    if (pressedKeys.size > 0 && document.querySelector?.("dialog[open]")) {
+      pressedKeys.clear();
+    }
+
     // Dynamic quality governor: step down heavy post-FX / high-DPI on struggling laptops
     if (!ogMode && !isStreamingCreations && currentWorld && rawDeltaMs > 4 && rawDeltaMs < 240) {
       govFrameCount++;
@@ -5002,11 +5753,115 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
     grassUniforms.uTime.value = t;
 
-    let focusWorldX = cam.tx;
-    let focusWorldZ = cam.tz;
-    let activeAz = cam.az;
-    let viewerPos = null;
+    // 1. Step all world entities (vehicles, contraptions, landmarks) & villagers FIRST
+    // so passenger riding poses, doorway beacons, and remote peers lock onto exact frame-t transforms!
+    const preInside = interiorSystem.isInside();
+    const preFocusX = fp.active ? fp.x : cam.tx;
+    const preFocusZ = fp.active ? fp.z : cam.tz;
+    const preActiveAz = fp.active ? fp.yaw : cam.az;
+    const preViewerPos = fp.active && !preInside ? fp : null;
 
+    rebuildSceneListsIfNeeded();
+    simCtx.vehicles = cachedVehicles;
+    simCtx.buildings = cachedBuildings;
+    simCtx.focusX = preFocusX;
+    simCtx.focusZ = preFocusZ;
+    simCtx.frameTick = frameTick;
+
+    for (let i = 0; i < cachedAllEntities.length; i++) {
+      cachedAllEntities[i].step(
+        dt,
+        t,
+        cachedAllEntities,
+        cachedPonds,
+        preActiveAz,
+        preViewerPos,
+        simCtx,
+      );
+    }
+
+    for (let i = 1; i < cachedVillagerObstacles.length; i++) {
+      const obs = cachedVillagerObstacles[i];
+      if (obs.ent && !obs.ent.staticRootFrozen) {
+        obs.x = obs.ent.x;
+        obs.z = obs.ent.z;
+      }
+    }
+
+    for (let i = 0; i < cachedVillagers.length; i++) {
+      cachedVillagers[i].step(
+        dt,
+        t,
+        cachedVehicles,
+        cachedPonds,
+        cachedVillagers,
+        cachedVillagerObstacles,
+      );
+    }
+
+    // 2. Gather first-person movement inputs & step interiors/transit system
+    let inFwd = 0;
+    let inRight = 0;
+    let sprint = false;
+    if (fp.active) {
+      inFwd = fpJoystick.fwd;
+      inRight = fpJoystick.right;
+      if (isKeyDown("KeyW", "w", "ArrowUp", "arrowup")) inFwd += 1;
+      if (isKeyDown("KeyS", "s", "ArrowDown", "arrowdown")) inFwd -= 1;
+      if (isKeyDown("KeyD", "d")) inRight += 1;
+      if (isKeyDown("KeyA", "a")) inRight -= 1;
+      sprint = isKeyDown("ShiftLeft", "ShiftRight", "shift");
+
+      if (interiorSystem.isSitting()) {
+        const wake = interiorSystem.handleMovementWake(
+          Math.hypot(inFwd, inRight),
+          fp.jumpY > 0.02 || fp.jumpVy > 0,
+        );
+        if (wake?.ok && wake.pose) {
+          if (wake.pose.isInterior) {
+            fp.localX = wake.pose.x;
+            fp.localY = 0;
+            fp.localZ = wake.pose.z;
+          } else {
+            fp.x = wake.pose.x;
+            fp.z = wake.pose.z;
+          }
+        }
+      }
+    }
+
+    if (!ogMode) {
+      interiorSystem.step(
+        dt,
+        t,
+        fp.active ? { inFwd, inRight, jumping: fp.jumpY > 0.02 } : null,
+      );
+    }
+
+    const reportFpCameraChange = (txVal, tzVal) => {
+      const azDeltaFromHome = wrapPi(fp.yaw - HOME_AZ);
+      if (
+        callbacks.onCameraChange &&
+        (Number.isNaN(lastReportedAz) ||
+          Math.abs(fp.yaw - lastReportedAz) > 0.004 ||
+          lastReportedHome !== false)
+      ) {
+        lastReportedAz = fp.yaw;
+        lastReportedHome = false;
+        callbacks.onCameraChange({
+          az: fp.yaw,
+          el: fp.pitch,
+          zoom: 1,
+          tx: txVal,
+          tz: tzVal,
+          azDeltaFromHome,
+          isHome: false,
+          fpActive: true,
+        });
+      }
+    };
+
+    // 3. Update active camera (Walk / Ride / Interior / Seated / Aerial) & local embodied character
     if (fp.active) {
       const turnRate = 1.95;
       if (isKeyDown("ArrowLeft", "arrowleft", "KeyQ", "q")) {
@@ -5023,109 +5878,358 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       }
 
       const lookDamp = 1 - Math.exp(-dt * 20);
-      fp.yaw += (fp.goalYaw - fp.yaw) * lookDamp;
-      fp.pitch += (fp.goalPitch - fp.pitch) * lookDamp;
+      const rideState = interiorSystem.isRiding() ? interiorSystem.getRidingState() : null;
+      const rPose = rideState
+        ? interiorSystem.computePassengerPose(rideState.rideId, rideState.seat)
+        : null;
 
-      let inFwd = fpJoystick.fwd;
-      let inRight = fpJoystick.right;
-      if (isKeyDown("KeyW", "w", "ArrowUp", "arrowup")) inFwd += 1;
-      if (isKeyDown("KeyS", "s", "ArrowDown", "arrowdown")) inFwd -= 1;
-      if (isKeyDown("KeyD", "d")) inRight += 1;
-      if (isKeyDown("KeyA", "a")) inRight -= 1;
-
-      const sprint = isKeyDown("ShiftLeft", "ShiftRight", "shift");
-      const maxSpeed = sprint ? 9.6 : 5.8;
-
-      const fwdX = -Math.sin(fp.yaw);
-      const fwdZ = -Math.cos(fp.yaw);
-      const rightX = Math.cos(fp.yaw);
-      const rightZ = -Math.sin(fp.yaw);
-
-      let wishVx = 0;
-      let wishVz = 0;
-      const inMag = Math.hypot(inFwd, inRight);
-      if (inMag > 0.02) {
-        const scale = Math.min(1, inMag) / inMag;
-        const nf = inFwd * scale;
-        const nr = inRight * scale;
-        wishVx = (fwdX * nf + rightX * nr) * maxSpeed;
-        wishVz = (fwdZ * nf + rightZ * nr) * maxSpeed;
+      if (rideState && !rPose) {
+        hopOffCurrentVehicle();
       }
 
-      const velDamp = 1 - Math.exp(-dt * 14);
-      fp.vx += (wishVx - fp.vx) * velDamp;
-      fp.vz += (wishVz - fp.vz) * velDamp;
+      if (rPose) {
+        if (rPose.deltaYaw) {
+          fp.yaw += rPose.deltaYaw;
+          fp.goalYaw += rPose.deltaYaw;
+        }
+        fp.yaw += (fp.goalYaw - fp.yaw) * lookDamp;
+        fp.pitch += (fp.goalPitch - fp.pitch) * lookDamp;
 
-      const prevX = fp.x;
-      const prevZ = fp.z;
-      const [rx, rz] = resolveWalkPosition(fp.x + fp.vx * dt, fp.z + fp.vz * dt);
-      fp.x = rx;
-      fp.z = rz;
+        fp.x = rPose.x;
+        fp.z = rPose.z;
+        fp.feetY = rPose.y;
+        fp.y = rPose.eyeY;
+        fp.vx = 0;
+        fp.vz = 0;
+        fp.jumpY = 0;
+        fp.jumpVy = 0;
+        fp.horizSpeed = 0;
+        fp.sprinting = false;
 
-      if (fp.jumpY > 0 || fp.jumpVy > 0) {
-        fp.jumpY += fp.jumpVy * dt;
-        fp.jumpVy -= 15.5 * dt;
-        if (fp.jumpY <= 0) {
+        fpCamera.position.set(rPose.eyeX, rPose.eyeY, rPose.eyeZ);
+        fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
+        fpCamera.updateMatrixWorld();
+
+        sun.intensity = 2.25;
+        hemi.intensity = 1.12;
+        skyDome.visible = true;
+        skyDome.position.set(rPose.x, 0, rPose.z);
+        oceanMesh.position.set(rPose.x, -0.56, rPose.z);
+        grassUniforms.uFocusXZ.value.set(rPose.x, rPose.z);
+        grassUniforms.uHorizonRange.value.set(96, 238);
+        updateTexelSnappedSun(
+          rPose.x - Math.sin(fp.yaw) * 18,
+          rPose.z - Math.cos(fp.yaw) * 18,
+        );
+        reportFpCameraChange(rPose.x, rPose.z);
+
+        localAvatarRig.root.visible = !ogMode;
+        localAvatarRig.root.position.set(
+          rPose.x,
+          Math.min(rPose.y, rPose.eyeY - 1.24),
+          rPose.z,
+        );
+        localAvatarRig.applyPose({
+          dt,
+          t,
+          yaw: fp.yaw,
+          pitch: fp.pitch,
+          speed: 0,
+          anim: "ride",
+          jumpY: 0,
+          waveTimer,
+          isFirstPerson: true,
+        });
+      } else if (interiorSystem.isInside()) {
+        fp.yaw += (fp.goalYaw - fp.yaw) * lookDamp;
+        fp.pitch += (fp.goalPitch - fp.pitch) * lookDamp;
+
+        sun.intensity = 0.28;
+        hemi.intensity = 0.68;
+        skyDome.visible = true;
+        skyDome.position.set(INTERIOR_ORIGIN.x, INTERIOR_ORIGIN.y - 12, INTERIOR_ORIGIN.z);
+
+        const sPose = interiorSystem.isSitting() ? interiorSystem.getSeatPose() : null;
+        if (sPose) {
+          fp.localX = sPose.x;
+          fp.localY = sPose.y;
+          fp.localZ = sPose.z;
+          fp.vx = 0;
+          fp.vz = 0;
           fp.jumpY = 0;
           fp.jumpVy = 0;
+          fp.horizSpeed = 0;
+          fp.sprinting = false;
+          fp.y = sPose.worldEyeY;
+
+          fpCamera.position.set(sPose.worldX, sPose.worldEyeY, sPose.worldZ);
+          fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
+          fpCamera.updateMatrixWorld();
+
+          localAvatarRig.root.visible = !ogMode;
+          localAvatarRig.root.position.set(
+            sPose.worldX,
+            Math.min(sPose.worldY, sPose.worldEyeY - 1.24),
+            sPose.worldZ,
+          );
+          localAvatarRig.applyPose({
+            dt,
+            t,
+            yaw: fp.yaw,
+            pitch: fp.pitch,
+            speed: 0,
+            anim: "sit",
+            jumpY: 0,
+            waveTimer,
+            isFirstPerson: true,
+          });
+        } else {
+          const maxSpeed = sprint ? 6.8 : 4.6;
+          const fwdX = -Math.sin(fp.yaw);
+          const fwdZ = -Math.cos(fp.yaw);
+          const rightX = Math.cos(fp.yaw);
+          const rightZ = -Math.sin(fp.yaw);
+
+          let wishVx = 0;
+          let wishVz = 0;
+          const inMag = Math.hypot(inFwd, inRight);
+          if (inMag > 0.02) {
+            const scale = Math.min(1, inMag) / inMag;
+            const nf = inFwd * scale;
+            const nr = inRight * scale;
+            wishVx = (fwdX * nf + rightX * nr) * maxSpeed;
+            wishVz = (fwdZ * nf + rightZ * nr) * maxSpeed;
+          }
+
+          const velDamp = 1 - Math.exp(-dt * 14);
+          fp.vx += (wishVx - fp.vx) * velDamp;
+          fp.vz += (wishVz - fp.vz) * velDamp;
+
+          const prevLX = fp.localX;
+          const prevLZ = fp.localZ;
+          const [nx, nz] = interiorSystem.resolveInteriorWalkPosition(
+            fp.localX + fp.vx * dt,
+            fp.localZ + fp.vz * dt,
+          );
+          fp.localX = nx;
+          fp.localZ = nz;
+
+          if (fp.jumpY > 0 || fp.jumpVy > 0) {
+            fp.jumpY += fp.jumpVy * dt;
+            fp.jumpVy -= 15.5 * dt;
+            if (fp.jumpY <= 0) {
+              fp.jumpY = 0;
+              fp.jumpVy = 0;
+            }
+          }
+
+          const floorY = interiorSystem.getInteriorFloorHeight?.(fp.localX, fp.localZ) || 0;
+          fp.localY = floorY + fp.jumpY;
+
+          const horizSpeed = Math.hypot(fp.localX - prevLX, fp.localZ - prevLZ) / Math.max(0.001, dt);
+          fp.horizSpeed = horizSpeed;
+          fp.sprinting = sprint && horizSpeed > 5.4;
+
+          const bobBlend = prefersReducedMotion || fp.jumpY > 0.02 ? 0 : Math.min(1, horizSpeed / 4.4);
+          if (bobBlend > 0.02) {
+            fp.bobPhase += dt * (7.0 + horizSpeed * 0.5);
+          }
+          const bobY = Math.sin(fp.bobPhase * 2) * 0.032 * bobBlend;
+          const swayX = Math.cos(fp.bobPhase) * 0.014 * bobBlend;
+
+          const worldX = INTERIOR_ORIGIN.x + fp.localX;
+          const worldZ = INTERIOR_ORIGIN.z + fp.localZ;
+          const worldFeetY = INTERIOR_ORIGIN.y + fp.localY;
+          fp.y = worldFeetY + FP_EYE_HEIGHT + bobY;
+
+          fpCamera.position.set(worldX + rightX * swayX, fp.y, worldZ + rightZ * swayX);
+          fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
+          fpCamera.updateMatrixWorld();
+
+          const indoorAnim =
+            fp.jumpY > 0.03
+              ? "jump"
+              : fp.sprinting
+                ? "run"
+                : horizSpeed > 0.35
+                  ? "walk"
+                  : waveTimer > 0
+                    ? "wave"
+                    : "idle";
+
+          localAvatarRig.root.visible = !ogMode;
+          localAvatarRig.root.position.set(worldX, worldFeetY, worldZ);
+          localAvatarRig.applyPose({
+            dt,
+            t,
+            yaw: fp.yaw,
+            pitch: fp.pitch,
+            speed: horizSpeed,
+            anim: indoorAnim,
+            jumpY: fp.jumpY,
+            waveTimer,
+            isFirstPerson: true,
+          });
         }
-      }
+        reportFpCameraChange(fp.x, fp.z);
+      } else if (interiorSystem.isSitting()) {
+        fp.yaw += (fp.goalYaw - fp.yaw) * lookDamp;
+        fp.pitch += (fp.goalPitch - fp.pitch) * lookDamp;
 
-      if (fp.settleT < 1) {
-        fp.settleT = Math.min(1, fp.settleT + dt * 3.4);
-      }
-      const settleEase = 1 - (1 - fp.settleT) ** 3;
-      const settleLift = (1 - settleEase) * 1.15;
+        const sPose = interiorSystem.getSeatPose();
+        const gY = getIslandGroundHeight(sPose.x, sPose.z);
+        const seatWorldY = gY + sPose.y;
+        const eyeWorldY = gY + sPose.eyeY;
 
-      const horizSpeed = Math.hypot(fp.x - prevX, fp.z - prevZ) / Math.max(0.001, dt);
-      const bobBlend = prefersReducedMotion || fp.jumpY > 0.02 ? 0 : Math.min(1, horizSpeed / 4.8);
-      if (bobBlend > 0.02) {
-        fp.bobPhase += dt * (7.2 + horizSpeed * 0.52);
-      }
-      const bobY = Math.sin(fp.bobPhase * 2) * 0.036 * bobBlend;
-      const swayX = Math.cos(fp.bobPhase) * 0.016 * bobBlend;
+        fp.x = sPose.x;
+        fp.z = sPose.z;
+        fp.feetY = seatWorldY;
+        fp.y = eyeWorldY;
+        fp.vx = 0;
+        fp.vz = 0;
+        fp.jumpY = 0;
+        fp.jumpVy = 0;
+        fp.horizSpeed = 0;
+        fp.sprinting = false;
 
-      const groundY = getIslandGroundHeight(fp.x, fp.z);
-      fp.y = groundY + FP_EYE_HEIGHT + settleLift + fp.jumpY + bobY;
-      fpCamera.position.set(fp.x + rightX * swayX, fp.y, fp.z + rightZ * swayX);
-      fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
-      fpCamera.updateMatrixWorld();
+        fpCamera.position.set(sPose.x, eyeWorldY, sPose.z);
+        fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
+        fpCamera.updateMatrixWorld();
 
-      skyDome.visible = true;
-      skyDome.position.set(fp.x, 0, fp.z);
+        sun.intensity = 2.25;
+        hemi.intensity = 1.12;
+        skyDome.visible = true;
+        skyDome.position.set(fp.x, 0, fp.z);
+        oceanMesh.position.set(fp.x, -0.56, fp.z);
+        grassUniforms.uFocusXZ.value.set(fp.x, fp.z);
+        grassUniforms.uHorizonRange.value.set(96, 238);
+        updateTexelSnappedSun(
+          fp.x - Math.sin(fp.yaw) * 18,
+          fp.z - Math.cos(fp.yaw) * 18,
+        );
+        reportFpCameraChange(fp.x, fp.z);
 
-      focusWorldX = fp.x;
-      focusWorldZ = fp.z;
-      activeAz = fp.yaw;
-      viewerPos = fp;
+        localAvatarRig.root.visible = !ogMode;
+        localAvatarRig.root.position.set(
+          sPose.x,
+          Math.min(seatWorldY, eyeWorldY - 1.24),
+          sPose.z,
+        );
+        localAvatarRig.applyPose({
+          dt,
+          t,
+          yaw: fp.yaw,
+          pitch: fp.pitch,
+          speed: 0,
+          anim: "sit",
+          jumpY: 0,
+          waveTimer,
+          isFirstPerson: true,
+        });
+      } else {
+        fp.yaw += (fp.goalYaw - fp.yaw) * lookDamp;
+        fp.pitch += (fp.goalPitch - fp.pitch) * lookDamp;
 
-      const azDeltaFromHome = wrapPi(fp.yaw - HOME_AZ);
-      if (
-        callbacks.onCameraChange &&
-        (Number.isNaN(lastReportedAz) ||
-          Math.abs(fp.yaw - lastReportedAz) > 0.004 ||
-          lastReportedHome !== false)
-      ) {
-        lastReportedAz = fp.yaw;
-        lastReportedHome = false;
-        callbacks.onCameraChange({
-          az: fp.yaw,
-          el: fp.pitch,
-          zoom: 1,
-          tx: fp.x,
-          tz: fp.z,
-          azDeltaFromHome,
-          isHome: false,
-          fpActive: true,
+        const maxSpeed = sprint ? 9.6 : 5.8;
+        const fwdX = -Math.sin(fp.yaw);
+        const fwdZ = -Math.cos(fp.yaw);
+        const rightX = Math.cos(fp.yaw);
+        const rightZ = -Math.sin(fp.yaw);
+
+        let wishVx = 0;
+        let wishVz = 0;
+        const inMag = Math.hypot(inFwd, inRight);
+        if (inMag > 0.02) {
+          const scale = Math.min(1, inMag) / inMag;
+          const nf = inFwd * scale;
+          const nr = inRight * scale;
+          wishVx = (fwdX * nf + rightX * nr) * maxSpeed;
+          wishVz = (fwdZ * nf + rightZ * nr) * maxSpeed;
+        }
+
+        const velDamp = 1 - Math.exp(-dt * 14);
+        fp.vx += (wishVx - fp.vx) * velDamp;
+        fp.vz += (wishVz - fp.vz) * velDamp;
+
+        const prevX = fp.x;
+        const prevZ = fp.z;
+        const [rx, rz] = resolveWalkPosition(fp.x + fp.vx * dt, fp.z + fp.vz * dt);
+        fp.x = rx;
+        fp.z = rz;
+
+        if (fp.jumpY > 0 || fp.jumpVy > 0) {
+          fp.jumpY += fp.jumpVy * dt;
+          fp.jumpVy -= 15.5 * dt;
+          if (fp.jumpY <= 0) {
+            fp.jumpY = 0;
+            fp.jumpVy = 0;
+          }
+        }
+
+        if (fp.settleT < 1) {
+          fp.settleT = Math.min(1, fp.settleT + dt * 3.4);
+        }
+        const settleEase = 1 - (1 - fp.settleT) ** 3;
+        const settleLift = (1 - settleEase) * 1.15;
+
+        const horizSpeed = Math.hypot(fp.x - prevX, fp.z - prevZ) / Math.max(0.001, dt);
+        fp.horizSpeed = horizSpeed;
+        fp.sprinting = sprint && horizSpeed > 6.4;
+
+        const bobBlend = prefersReducedMotion || fp.jumpY > 0.02 ? 0 : Math.min(1, horizSpeed / 4.8);
+        if (bobBlend > 0.02) {
+          fp.bobPhase += dt * (7.2 + horizSpeed * 0.52);
+        }
+        const bobY = Math.sin(fp.bobPhase * 2) * 0.036 * bobBlend;
+        const swayX = Math.cos(fp.bobPhase) * 0.016 * bobBlend;
+
+        const groundY = getIslandGroundHeight(fp.x, fp.z);
+        fp.feetY = groundY + fp.jumpY;
+        fp.y = groundY + FP_EYE_HEIGHT + settleLift + fp.jumpY + bobY;
+        fpCamera.position.set(fp.x + rightX * swayX, fp.y, fp.z + rightZ * swayX);
+        fpCamera.rotation.set(fp.pitch, fp.yaw, 0);
+        fpCamera.updateMatrixWorld();
+
+        sun.intensity = 2.25;
+        hemi.intensity = 1.12;
+        skyDome.visible = true;
+        skyDome.position.set(fp.x, 0, fp.z);
+        oceanMesh.position.set(fp.x, -0.56, fp.z);
+        grassUniforms.uFocusXZ.value.set(fp.x, fp.z);
+        grassUniforms.uHorizonRange.value.set(96, 238);
+        updateTexelSnappedSun(fp.x + fwdX * 18, fp.z + fwdZ * 18);
+        reportFpCameraChange(fp.x, fp.z);
+
+        const walkAnim =
+          fp.jumpY > 0.03
+            ? "jump"
+            : fp.sprinting
+              ? "run"
+              : horizSpeed > 0.35
+                ? "walk"
+                : waveTimer > 0
+                  ? "wave"
+                  : "idle";
+
+        localAvatarRig.root.visible = !ogMode;
+        localAvatarRig.root.position.set(fp.x, groundY + settleLift + fp.jumpY, fp.z);
+        localAvatarRig.applyPose({
+          dt,
+          t,
+          yaw: fp.yaw,
+          pitch: fp.pitch,
+          speed: horizSpeed,
+          anim: walkAnim,
+          jumpY: fp.jumpY,
+          waveTimer,
+          isFirstPerson: true,
         });
       }
-
-      oceanMesh.position.set(fp.x, -0.56, fp.z);
-      grassUniforms.uFocusXZ.value.set(fp.x, fp.z);
-      grassUniforms.uHorizonRange.value.set(96, 238);
-      updateTexelSnappedSun(fp.x + fwdX * 18, fp.z + fwdZ * 18);
     } else {
+      sun.intensity = 2.25;
+      hemi.intensity = 1.12;
       let handledByFpSwoop = false;
+      let swoopHideHead = false;
       if (introSweep.active) {
         if (currentWorld || bootWaitElapsed > 0.45) {
           introSweep.elapsed += dt;
@@ -5180,10 +6284,13 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           // Stage 3: Click "Walk" button & swoop seamlessly into 1st-person street mode
           if (!introSweep.firedWalk) {
             introSweep.firedWalk = true;
-            const [wx, wz] = resolveWalkPosition(10.6, -0.6);
+            const [wx, wz] = resolveWalkPosition(introSweep.walkX, introSweep.walkZ);
             introSweep.walkX = wx;
             introSweep.walkZ = wz;
+            fp.x = wx;
+            fp.z = wz;
             introSweep.walkYaw = Math.atan2(-(2.4 - wx), -(-18.5 - wz));
+            fp.yaw = fp.goalYaw = introSweep.walkYaw;
             introSweep.walkPitch = 0.045;
             introSweep.usingFpCam = true;
             dragMode = "walk";
@@ -5193,6 +6300,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           const rawW = (introSweep.elapsed - walkStart) / introSweep.walkDurSec;
           if (rawW < 1) {
             handledByFpSwoop = true;
+            swoopHideHead = rawW > 0.78;
             const e = smootherstep01(rawW);
             const fov0 = 14;
             const fov1 = getBaseFpFov();
@@ -5208,8 +6316,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
             const fwd1X = -Math.sin(wYaw) * Math.cos(wPitch);
             const fwd1Y = Math.sin(wPitch);
             const fwd1Z = -Math.cos(wYaw) * Math.cos(wPitch);
+            const walkGroundY = getIslandGroundHeight(introSweep.walkX, introSweep.walkZ);
             const t1X = introSweep.walkX + fwd1X * lookDist1;
-            const t1Y = FP_EYE_HEIGHT + fwd1Y * lookDist1;
+            const t1Y = walkGroundY + FP_EYE_HEIGHT + fwd1Y * lookDist1;
             const t1Z = introSweep.walkZ + fwd1Z * lookDist1;
 
             const curTx = HOME_TX + (t1X - HOME_TX) * e;
@@ -5235,9 +6344,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
             const groundFocusX = HOME_TX + (introSweep.walkX - HOME_TX) * e;
             const groundFocusZ = HOME_TZ + (introSweep.walkZ - HOME_TZ) * e;
-            focusWorldX = groundFocusX;
-            focusWorldZ = groundFocusZ;
-            activeAz = curAz;
 
             const azDeltaFromHome = wrapPi(curAz - HOME_AZ);
             if (
@@ -5277,15 +6383,20 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
             const [rx, rz] = resolveWalkPosition(introSweep.walkX, introSweep.walkZ);
             fp.x = rx;
             fp.z = rz;
-            fp.y = getIslandGroundHeight(rx, rz) + FP_EYE_HEIGHT;
+            const gY = getIslandGroundHeight(rx, rz);
+            fp.feetY = gY;
+            fp.y = gY + FP_EYE_HEIGHT;
             fp.yaw = fp.goalYaw = introSweep.walkYaw;
             fp.pitch = fp.goalPitch = introSweep.walkPitch;
             fp.vx = 0;
             fp.vz = 0;
             fp.jumpY = 0;
             fp.jumpVy = 0;
+            fp.horizSpeed = 0;
+            fp.sprinting = false;
             fp.settleT = 1;
             fp.active = true;
+            hasWalkedOnce = true;
             dragMode = "walk";
 
             cam.tx = cam.goalTx = HOME_TX;
@@ -5308,10 +6419,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
             canvas.style.cursor = idleCursor();
             callbacks.onDragModeChange?.("walk");
 
-            focusWorldX = fp.x;
-            focusWorldZ = fp.z;
-            activeAz = fp.yaw;
-            viewerPos = fp;
             oceanMesh.position.set(fp.x, -0.56, fp.z);
             grassUniforms.uFocusXZ.value.set(fp.x, fp.z);
             grassUniforms.uHorizonRange.value.set(96, 238);
@@ -5319,6 +6426,20 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
               fp.x - Math.sin(fp.yaw) * 18,
               fp.z - Math.cos(fp.yaw) * 18,
             );
+
+            localAvatarRig.root.visible = !ogMode;
+            localAvatarRig.root.position.set(fp.x, gY, fp.z);
+            localAvatarRig.applyPose({
+              dt,
+              t,
+              yaw: fp.yaw,
+              pitch: fp.pitch,
+              speed: 0,
+              anim: waveTimer > 0 ? "wave" : "idle",
+              jumpY: 0,
+              waveTimer,
+              isFirstPerson: true,
+            });
           }
         }
       } else {
@@ -5382,41 +6503,44 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         );
         updateTexelSnappedSun(cam.tx, cam.tz);
       }
-    }
 
-    rebuildSceneListsIfNeeded();
-    simCtx.vehicles = cachedVehicles;
-    simCtx.buildings = cachedBuildings;
-    simCtx.focusX = focusWorldX;
-    simCtx.focusZ = focusWorldZ;
-    simCtx.frameTick = frameTick;
-
-    for (let i = 0; i < cachedAllEntities.length; i++) {
-      cachedAllEntities[i].step(dt, t, cachedAllEntities, cachedPonds, activeAz, viewerPos, simCtx);
-    }
-
-    for (let i = 1; i < cachedVillagerObstacles.length; i++) {
-      const obs = cachedVillagerObstacles[i];
-      if (obs.ent && !obs.ent.staticRootFrozen) {
-        obs.x = obs.ent.x;
-        obs.z = obs.ent.z;
+      if (!fp.active) {
+        const avatarGroundY = getIslandGroundHeight(fp.x, fp.z);
+        fp.feetY = avatarGroundY;
+        fp.horizSpeed = 0;
+        fp.sprinting = false;
+        localAvatarRig.root.visible = !ogMode;
+        localAvatarRig.root.position.set(fp.x, avatarGroundY, fp.z);
+        localAvatarRig.applyPose({
+          dt,
+          t,
+          yaw: fp.yaw,
+          pitch: 0,
+          speed: 0,
+          anim: waveTimer > 0 ? "wave" : "idle",
+          jumpY: 0,
+          waveTimer,
+          isFirstPerson: swoopHideHead,
+        });
       }
     }
 
-    for (let i = 0; i < cachedVillagers.length; i++) {
-      cachedVillagers[i].step(
-        dt,
-        t,
-        cachedVehicles,
-        cachedPonds,
-        cachedVillagers,
-        cachedVillagerObstacles,
-      );
+    // 4. Step remote multiplayer peers & contextual [F] interaction scanner
+    remotePlayers.group.visible = !ogMode;
+    if (!ogMode) {
+      remotePlayers.step(dt, t, {
+        localRoomId: interiorSystem.getCurrentRoomId(),
+        interiorOrigin: INTERIOR_ORIGIN,
+        resolveRidePose: (rideId, seat) => interiorSystem.computePassengerPose(rideId, seat),
+        getGroundHeight: getIslandGroundHeight,
+      });
     }
+
+    refreshInteractionTarget();
 
     processPendingHover();
 
-    if (!ogMode && highlightedId && creationEntities.has(highlightedId)) {
+    if (!ogMode && !interiorSystem.isInside() && highlightedId && creationEntities.has(highlightedId)) {
       const myEnt = creationEntities.get(highlightedId);
       if (myEnt.y <= 2.5) {
         selectionHalo.visible = true;
@@ -5476,6 +6600,26 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     enterFirstPerson: () => setDragMode("walk"),
     exitFirstPerson: () => setDragMode("pan"),
     isFirstPerson: () => fp.active,
+    setLocalAppearance,
+    getLocalAppearance,
+    triggerLocalWave,
+    getLocalMultiplayerPose,
+    syncMultiplayerWelcome,
+    upsertRemotePlayer,
+    updateRemotePlayerPose,
+    updateRemotePlayerProfile,
+    triggerRemotePlayerEmote,
+    removeRemotePlayer,
+    getRemotePlayerCount,
+    triggerActiveInteraction,
+    getActiveInteractionPrompt,
+    enterBuildingById,
+    exitCurrentBuilding,
+    isInsideBuilding: () => interiorSystem.isInside(),
+    getCurrentRoomId: () => interiorSystem.getCurrentRoomId(),
+    boardVehicleById,
+    hopOffCurrentVehicle,
+    getRidingState: () => interiorSystem.getRidingState(),
     getCameraTarget: () =>
       fp.active ? { x: fp.x, z: fp.z, zoom: 1 } : { x: cam.tx, z: cam.tz, zoom: cam.zoom },
     getCameraState: () => ({
@@ -5495,6 +6639,8 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       fpPitch: fp.pitch,
       joyRight: fpJoystick.right,
       joyFwd: fpJoystick.fwd,
+      insideRoom: interiorSystem.getCurrentRoomId(),
+      riding: interiorSystem.getRidingState(),
     }),
     getPlotRadius: () => plotMarker.getPlotRadius(),
     isPointerActive: () =>
@@ -5543,6 +6689,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         props: summarize(propsGroup),
         creations: summarize(creationsGroup),
         villagers: summarize(villagersGroup),
+        remotePlayers: summarize(remotePlayers.group),
       };
     },
   };

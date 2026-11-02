@@ -1,7 +1,6 @@
 import { sculptWithArgon } from "./argon_sculptor";
 import { resolveWorldLiveFeeds } from "./live_feeds";
 import { chooseMoveWithGeminiFlashLite, validateMinigameRequest } from "./minigame_ai";
-import { refreshOgScreenshots } from "./og_renderer";
 import {
   buildSecurityHeaders,
   isLocalDevRequest,
@@ -25,9 +24,6 @@ import { WorldDO } from "./world_do";
 export { WorldDO };
 
 type AppEnv = Env & { ENABLE_DEV_ENDPOINTS?: string; MINIGAME_MODEL?: string };
-
-// Must match the daily entry in wrangler.jsonc triggers.crons; Browser Run bills per session, so OG cards refresh once a day only.
-const OG_REFRESH_CRON = "0 3 * * *";
 
 const minigameBuckets = new Map<string, { windowStart: number; count: number }>();
 function allowMinigameMove(ipHash: string): boolean {
@@ -70,19 +66,10 @@ function getWorldStub(env: Env): DurableObjectStub<WorldDO> {
   return env.WORLD_DO.get(id);
 }
 
-function base64ToBytes(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) {
-    out[i] = bin.charCodeAt(i);
-  }
-  return out;
-}
-
-const OG_ROUTE_VARIANTS: Record<string, "vertical" | "square" | "landscape"> = {
-  "/og-vertical.jpg": "vertical",
-  "/og-square.jpg": "square",
-  "/og-image.jpg": "landscape",
+const OG_IMAGE_PATHS: Record<string, true> = {
+  "/og-vertical.jpg": true,
+  "/og-square.jpg": true,
+  "/og-image.jpg": true,
 };
 
 export default {
@@ -104,25 +91,8 @@ export default {
         return stub.fetch(request);
       }
 
-      // Dynamic 24-hour live island social media pull-through images (GET + HEAD for unfurl crawlers)
-      const ogVariant = OG_ROUTE_VARIANTS[url.pathname];
-      if (ogVariant && (request.method === "GET" || request.method === "HEAD")) {
-        const stub = getWorldStub(env);
-        const snap = await stub.getOgSnapshot(ogVariant).catch(() => null);
-        if (snap && snap.b64) {
-          const bytes = base64ToBytes(snap.b64);
-          return new Response(request.method === "HEAD" ? null : bytes, {
-            status: 200,
-            headers: {
-              ...buildSecurityHeaders(isHttps),
-              "content-type": "image/jpeg",
-              "content-length": String(bytes.byteLength),
-              "cache-control": "public, max-age=3600, s-maxage=86400",
-              "cross-origin-resource-policy": "cross-origin",
-            },
-          });
-        }
-        // Fallback to bundled baseline public/og-*.jpg if DO snapshot hasn't run yet
+      // Static social preview images: cross-origin so unfurl crawlers can embed them
+      if (OG_IMAGE_PATHS[url.pathname] && (request.method === "GET" || request.method === "HEAD")) {
         const assetRes = await env.ASSETS.fetch(request);
         const headers = new Headers(assetRes.headers);
         for (const [k, v] of Object.entries(buildSecurityHeaders(isHttps))) {
@@ -136,26 +106,14 @@ export default {
         });
       }
 
-      // Serve / and /index.html with daily cache-busted OG image URLs so social crawlers refresh every 24h
+      // Serve / and /index.html with hardened headers and a short HTML cache
       if (
         (url.pathname === "/" || url.pathname === "/index.html") &&
         (request.method === "GET" || request.method === "HEAD")
       ) {
         const assetUrl = new URL("/index.html", request.url);
         const assetRes = await env.ASSETS.fetch(new Request(assetUrl.toString(), { method: "GET" }));
-        const stub = getWorldStub(env);
-        const lastOgAt = await stub.getLastOgCaptureAt().catch(() => 0);
-        const versionTag =
-          lastOgAt > 0
-            ? String(Math.floor(lastOgAt / 1000))
-            : String(Math.floor(Date.now() / (24 * 60 * 60 * 1000)));
-
-        const htmlRaw = await assetRes.text();
-        const html = htmlRaw
-          .replace(/\/og-vertical\.jpg(?!\?)/g, `/og-vertical.jpg?v=${versionTag}`)
-          .replace(/\/og-square\.jpg(?!\?)/g, `/og-square.jpg?v=${versionTag}`)
-          .replace(/\/og-image\.jpg(?!\?)/g, `/og-image.jpg?v=${versionTag}`);
-
+        const html = await assetRes.text();
         const headers = new Headers(assetRes.headers);
         headers.set("content-type", "text/html; charset=utf-8");
         headers.set("cache-control", "public, max-age=300");
@@ -595,11 +553,6 @@ export default {
           const telemetry = await stub.getBuildEtaTelemetry();
           return jsonResponse(request, { ok: true, telemetry }, 200);
         }
-        if (url.pathname === "/api/dev/refresh-og" && request.method === "POST") {
-          const stub = getWorldStub(env);
-          const res = await refreshOgScreenshots(env, stub, url.origin);
-          return jsonResponse(request, { ok: true, ...res }, 200);
-        }
         if (url.pathname === "/api/dev/load-world-snapshot" && request.method === "POST") {
           const parsed = await readBoundedJsonBody(request, 8_000_000);
           if (!parsed.ok) return jsonResponse(request, { ok: false, error: parsed.error }, 400);
@@ -633,14 +586,10 @@ export default {
     }
   },
 
-  async scheduled(controller: ScheduledController, env: AppEnv, ctx: ExecutionContext): Promise<void> {
+  async scheduled(_controller: ScheduledController, env: AppEnv, ctx: ExecutionContext): Promise<void> {
     const stub = getWorldStub(env);
-    const task =
-      controller.cron === OG_REFRESH_CRON
-        ? refreshOgScreenshots(env, stub, "https://geminisland.raph.plus")
-        : stub.runCronWeaver();
     ctx.waitUntil(
-      task.catch((err) => {
+      stub.runCronWeaver().catch((err) => {
         safeLogError("scheduled_cron", err, [env.GEMINI_API_KEY, env.CREATOR_HMAC_SECRET]);
       }),
     );

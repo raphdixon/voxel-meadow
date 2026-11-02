@@ -536,11 +536,6 @@ export class WorldDO extends DurableObject<Env> {
       );
       CREATE INDEX IF NOT EXISTS idx_build_telemetry_created
         ON build_telemetry (created_at DESC);
-      CREATE TABLE IF NOT EXISTS og_snapshots (
-        variant TEXT PRIMARY KEY,
-        b64 TEXT NOT NULL,
-        captured_at INTEGER NOT NULL
-      );
     `);
 
     const seeded = sql.exec(`SELECT value FROM meta WHERE key = 'seeded'`).toArray();
@@ -720,12 +715,9 @@ export class WorldDO extends DurableObject<Env> {
       this.bumpVersion();
     }
 
-    const upgradedOgV2 = sql.exec(`SELECT value FROM meta WHERE key = 'upgrade_v8_og_v2'`).toArray();
-    if (upgradedOgV2.length === 0) {
-      sql.exec(`DELETE FROM og_snapshots`);
-      sql.exec(`DELETE FROM meta WHERE key = 'lastOgCaptureAt'`);
-      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v8_og_v2', '1')`);
-    }
+    // OG cards are static assets now; drop the old live-capture storage.
+    sql.exec(`DROP TABLE IF EXISTS og_snapshots`);
+    sql.exec(`DELETE FROM meta WHERE key IN ('lastOgCaptureAt', 'upgrade_v8_og_v2')`);
 
     // Non-destructive v9 upgrade: add phase/round1_ms/has_image columns to existing build_jobs & backfill telemetry
     const jobCols = new Set(
@@ -815,7 +807,6 @@ export class WorldDO extends DurableObject<Env> {
     if (upgradedV16.length === 0) {
       this.runUpgradeV16OrganicWorld();
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v16_organic_world', '1')`);
-      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('lastOgCaptureAt', '0')`);
     }
 
     // One-time v17 SimCity town planning upgrade (structured street grid, distant quarry + paved haul highway,
@@ -826,7 +817,6 @@ export class WorldDO extends DurableObject<Env> {
     if (upgradedV17.length === 0) {
       this.runUpgradeV17SimCityWorld();
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v17_simcity_world', '1')`);
-      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('lastOgCaptureAt', '0')`);
     }
 
     // One-time v18 wander clearance upgrade (routes Aegis Perimeter Titan and all wander creatures
@@ -854,9 +844,6 @@ export class WorldDO extends DurableObject<Env> {
       .exec(`SELECT value FROM meta WHERE key = 'upgrade_v14_refined_roads' LIMIT 1`)
       .toArray();
     if (upgradedV14.length === 0) {
-      if (bootAudit.repairedCount > 0) {
-        sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('lastOgCaptureAt', '0')`);
-      }
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v14_refined_roads', '1')`);
     }
 
@@ -3607,45 +3594,6 @@ export class WorldDO extends DurableObject<Env> {
         myCreationId: creation.id,
       },
     };
-  }
-
-  public getLastOgCaptureAt(): number {
-    return Number(this.getMeta("lastOgCaptureAt", "0")) || 0;
-  }
-
-  public getOgSnapshot(
-    variant: "vertical" | "square" | "landscape",
-  ): { b64: string; capturedAt: number } | null {
-    const rows = this.ctx.storage.sql
-      .exec(`SELECT b64, captured_at FROM og_snapshots WHERE variant = ? LIMIT 1`, variant)
-      .toArray();
-    if (rows.length === 0) return null;
-    return {
-      b64: String(rows[0].b64),
-      capturedAt: Number(rows[0].captured_at) || Date.now(),
-    };
-  }
-
-  public saveOgSnapshots(payload: {
-    vertical?: string;
-    square?: string;
-    landscape?: string;
-    capturedAt: number;
-  }): void {
-    const sql = this.ctx.storage.sql;
-    const ts = payload.capturedAt || Date.now();
-    for (const variant of ["vertical", "square", "landscape"] as const) {
-      const b64 = payload[variant];
-      if (typeof b64 === "string" && b64.length > 100) {
-        sql.exec(
-          `INSERT OR REPLACE INTO og_snapshots (variant, b64, captured_at) VALUES (?, ?, ?)`,
-          variant,
-          b64,
-          ts,
-        );
-      }
-    }
-    this.setMeta("lastOgCaptureAt", String(ts));
   }
 
   override async alarm(): Promise<void> {

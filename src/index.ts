@@ -1,7 +1,7 @@
 import { sculptWithArgon } from "./argon_sculptor";
 import { resolveWorldLiveFeeds } from "./live_feeds";
 import { chooseMoveWithGeminiFlashLite, validateMinigameRequest } from "./minigame_ai";
-import { refreshDailyOgScreenshotsIfDue } from "./og_renderer";
+import { refreshOgScreenshots } from "./og_renderer";
 import {
   buildSecurityHeaders,
   isLocalDevRequest,
@@ -25,6 +25,9 @@ import { WorldDO } from "./world_do";
 export { WorldDO };
 
 type AppEnv = Env & { ENABLE_DEV_ENDPOINTS?: string; MINIGAME_MODEL?: string };
+
+// Must match the daily entry in wrangler.jsonc triggers.crons; Browser Run bills per session, so OG cards refresh once a day only.
+const OG_REFRESH_CRON = "0 3 * * *";
 
 const minigameBuckets = new Map<string, { windowStart: number; count: number }>();
 function allowMinigameMove(ipHash: string): boolean {
@@ -594,10 +597,7 @@ export default {
         }
         if (url.pathname === "/api/dev/refresh-og" && request.method === "POST") {
           const stub = getWorldStub(env);
-          const res = await refreshDailyOgScreenshotsIfDue(env, stub, {
-            force: true,
-            siteOrigin: url.origin,
-          });
+          const res = await refreshOgScreenshots(env, stub, url.origin);
           return jsonResponse(request, { ok: true, ...res }, 200);
         }
         if (url.pathname === "/api/dev/load-world-snapshot" && request.method === "POST") {
@@ -633,15 +633,14 @@ export default {
     }
   },
 
-  async scheduled(_controller: ScheduledController, env: AppEnv, ctx: ExecutionContext): Promise<void> {
+  async scheduled(controller: ScheduledController, env: AppEnv, ctx: ExecutionContext): Promise<void> {
     const stub = getWorldStub(env);
+    const task =
+      controller.cron === OG_REFRESH_CRON
+        ? refreshOgScreenshots(env, stub, "https://geminisland.raph.plus")
+        : stub.runCronWeaver();
     ctx.waitUntil(
-      Promise.allSettled([
-        stub.runCronWeaver(),
-        refreshDailyOgScreenshotsIfDue(env, stub, {
-          siteOrigin: "https://geminisland.raph.plus",
-        }),
-      ]).catch((err) => {
+      task.catch((err) => {
         safeLogError("scheduled_cron", err, [env.GEMINI_API_KEY, env.CREATOR_HMAC_SECRET]);
       }),
     );

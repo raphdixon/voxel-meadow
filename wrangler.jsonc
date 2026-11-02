@@ -38,7 +38,7 @@
     }
   ],
   "triggers": {
-    "crons": ["*/2 * * * *"]
+    "crons": ["*/2 * * * *", "0 3 * * *"]
   },
   "vars": {
     "ARGON_MODEL": "gemini-4-argon",

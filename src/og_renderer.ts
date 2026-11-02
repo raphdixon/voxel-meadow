@@ -2,35 +2,17 @@ import puppeteer, { type BrowserWorker } from "@cloudflare/puppeteer";
 import { safeLogError } from "./security";
 import type { WorldDO } from "./world_do";
 
-const OG_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
-let lastAttemptEpochMs = 0;
-
-export async function refreshDailyOgScreenshotsIfDue(
+export async function refreshOgScreenshots(
   env: Env,
   stub: DurableObjectStub<WorldDO>,
-  options?: { force?: boolean; siteOrigin?: string },
+  siteOrigin: string,
 ): Promise<{ refreshed: boolean; note: string; capturedAt?: number }> {
-  const now = Date.now();
-  const force = Boolean(options?.force);
-
   if (!env.BROWSER) {
     return { refreshed: false, note: "BROWSER binding unavailable" };
   }
 
-  if (!force) {
-    const lastCaptured = await stub.getLastOgCaptureAt();
-    if (lastCaptured > 0 && now - lastCaptured < OG_REFRESH_INTERVAL_MS) {
-      return { refreshed: false, note: "24h OG screenshot still fresh", capturedAt: lastCaptured };
-    }
-    // Back off 20 minutes between automatic retries if headless Chromium is temporarily busy
-    if (now - lastAttemptEpochMs < 20 * 60 * 1000) {
-      return { refreshed: false, note: "Backed off after recent attempt" };
-    }
-  }
-
-  lastAttemptEpochMs = now;
-  const origin = (options?.siteOrigin || "https://geminisland.raph.plus").replace(/\/+$/, "");
-  const targetUrl = `${origin}/?og=1&ts=${now}`;
+  const origin = siteOrigin.replace(/\/+$/, "");
+  const targetUrl = `${origin}/?og=1&ts=${Date.now()}`;
 
   let browser: Awaited<ReturnType<typeof puppeteer.launch>> | null = null;
   try {

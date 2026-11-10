@@ -10,16 +10,33 @@ export interface GeminiAttemptRecord {
   reason?: string;
 }
 
+/**
+ * Complete Hydrogen model family discovered on `generativelanguage.googleapis.com/v1beta/models`.
+ * Ordered by empirical live availability, 3D voxel blueprint fidelity & SSE first-chunk latency:
+ *  - `hydrogen-l`: latest Hydrogen release (~2.3s first SSE thought chunk, ~18–24s full 3D voxel blueprint)
+ *  - `hydrogen-l-high-0p70`: Hydrogen-l pinned at 0.70 high thinking effort (~1.9s first chunk, fast & detailed)
+ *  - `hydrogen-l-high-1p00`: Hydrogen-l pinned at 1.00 max thinking effort (~2.2s first chunk, deep 3D CSG)
+ *  - `hydrogen-l-high-0p50`, `hydrogen-l-high-0p30`, `hydrogen-l-high-0p10`: active Hydrogen-l effort pools
+ *  - `hydrogen-g`: previous Hydrogen generation (fast ~0.9s 503 failover if saturated, streams when free)
+ *  - `hydrogen-f`: earlier Hydrogen generation (guarded by fast 4.2s first-byte timeout when unscheduled)
+ *  - `hydrogen-j`: listed Hydrogen-j alias (fast ~0.8s 404 failover when unmounted, 3.8s guard if mounted)
+ */
+export const DEFAULT_HYDROGEN_MODELS = [
+  "hydrogen-l",
+  "hydrogen-l-high-0p70",
+  "hydrogen-l-high-1p00",
+  "hydrogen-l-high-0p50",
+  "hydrogen-l-high-0p30",
+  "hydrogen-l-high-0p10",
+  "hydrogen-g",
+  "hydrogen-f",
+  "hydrogen-j",
+] as const;
+
 export const DEFAULT_ARGON_MODELS = ["gemini-4-argon", "gemini-4-argon-eap"] as const;
 
 /**
  * Complete Barium fallback family discovered on `generativelanguage.googleapis.com/v1beta/models`.
- * Ordered by empirical live availability & latency:
- *  - `barium-b`: active 200 OK (~2.5s first SSE chunk, ~8–15s full 3D voxel blueprint)
- *  - `barium-c`: active serving pool (fast ~0.7s 503 if at spike demand, streams when free)
- *  - `barium-bb-v2`, `barium-bb3`, `barium-bb2`, `barium-bb`: extended-output Barium variants
- *    (guarded by fast first-chunk timeout when unscheduled, full 50s budget once streaming)
- *  - `barium-a`, `barium-cc3`: fast ~0.6s failover if unmounted, full 45s budget if mounted
  */
 export const DEFAULT_BARIUM_FALLBACK_MODELS = [
   "barium-b",
@@ -40,7 +57,106 @@ export const DEFAULT_GEMINI_SAFETY_NET_MODELS = [
 ] as const;
 
 const MODEL_ID_RE = /^[a-zA-Z0-9._-]+$/;
+const HYDROGEN_MODEL_RE = /^hydrogen(?:$|[-_.])/i;
+const SPECULATIVE_HYDROGEN_RE = /^hydrogen-(?:[fgj](?:$|[-_.])|.*(?:preview|exp))/i;
 const SPECULATIVE_BARIUM_RE = /^barium-(bb|a|cc)/i;
+
+export function isHydrogenModel(model: string): boolean {
+  const clean = String(model ?? "").trim().replace(/^models\//, "");
+  return HYDROGEN_MODEL_RE.test(clean);
+}
+
+interface ModelHealthEntry {
+  cooldownUntil: number;
+  hardUnavailable: boolean;
+  consecutiveFailures: number;
+  lastReason: string;
+}
+
+// Bounded primitive-only per-isolate circuit-breaker health map (never stores secrets or I/O handles)
+const modelHealthMap = new Map<string, ModelHealthEntry>();
+const MAX_HEALTH_ENTRIES = 128;
+
+interface DiscoveredHydrogenCache {
+  models: string[];
+  fetchedAt: number;
+}
+let discoveredHydrogenCache: DiscoveredHydrogenCache | null = null;
+const DISCOVERY_CACHE_TTL_MS = 5 * 60_000;
+
+export function resetModelHealthForTesting(): void {
+  modelHealthMap.clear();
+  discoveredHydrogenCache = null;
+}
+
+function recordModelSuccess(model: string): void {
+  modelHealthMap.delete(model);
+}
+
+function recordModelFailure(model: string, httpStatus: number | undefined, reason: string): void {
+  const now = Date.now();
+  if (modelHealthMap.size >= MAX_HEALTH_ENTRIES && !modelHealthMap.has(model)) {
+    for (const [k, v] of modelHealthMap.entries()) {
+      if (v.cooldownUntil <= now) modelHealthMap.delete(k);
+    }
+    if (modelHealthMap.size >= MAX_HEALTH_ENTRIES) {
+      const oldestKey = modelHealthMap.keys().next().value;
+      if (oldestKey) modelHealthMap.delete(oldestKey);
+    }
+  }
+
+  const prev = modelHealthMap.get(model);
+  const consecutiveFailures = (prev?.consecutiveFailures ?? 0) + 1;
+  const isNotFoundOrDenied =
+    httpStatus === 404 ||
+    httpStatus === 403 ||
+    /model not found|not_found|permission_denied|not supported for generatecontent/i.test(reason);
+  const isOverloadedOrTimeout =
+    httpStatus === 429 ||
+    httpStatus === 503 ||
+    httpStatus === 529 ||
+    /FirstByteTimeout|RESOURCE_EXHAUSTED|UNAVAILABLE|high demand|overloaded/i.test(reason);
+
+  let cooldownMs = 8_000;
+  if (isNotFoundOrDenied) {
+    cooldownMs = 10 * 60_000;
+  } else if (isOverloadedOrTimeout) {
+    cooldownMs = Math.min(60_000, 20_000 * Math.min(3, consecutiveFailures));
+  } else if (httpStatus && httpStatus >= 500) {
+    cooldownMs = 14_000;
+  }
+
+  modelHealthMap.set(model, {
+    cooldownUntil: now + cooldownMs,
+    hardUnavailable: isNotFoundOrDenied,
+    consecutiveFailures,
+    lastReason: reason.slice(0, 120),
+  });
+}
+
+function orderTierByHealth(models: readonly string[], now: number): string[] {
+  const healthy: string[] = [];
+  const softCooled: string[] = [];
+  const hardCooled: string[] = [];
+
+  for (const m of models) {
+    const h = modelHealthMap.get(m);
+    if (!h || h.cooldownUntil <= now) {
+      healthy.push(m);
+    } else if (h.hardUnavailable) {
+      hardCooled.push(m);
+    } else {
+      softCooled.push(m);
+    }
+  }
+
+  // Always try healthy endpoints first, then soft-cooled (503/429/timeout) endpoints, and only
+  // re-probe hard-404 endpoints if no healthy or soft-cooled endpoints exist in the tier.
+  if (healthy.length > 0 || softCooled.length > 0) {
+    return [...healthy, ...softCooled];
+  }
+  return [...hardCooled];
+}
 
 export function parseModelList(raw?: string | readonly string[] | null): string[] {
   if (!raw) return [];
@@ -55,7 +171,107 @@ export function parseModelList(raw?: string | readonly string[] | null): string[
   return out;
 }
 
+function rankHydrogenModelId(id: string): [number, number, string] {
+  // Sort newest generation token descending (e.g. hydrogen-z .. hydrogen-m > hydrogen-l > hydrogen-j > hydrogen-g > hydrogen-f)
+  const lower = id.toLowerCase();
+  const m = lower.match(/^hydrogen-([a-z0-9]+)(?:-(.*))?$/);
+  if (!m) return [0, 0, lower];
+  const gen = m[1];
+  const suffix = m[2] ?? "";
+  let genScore = 0;
+  for (let i = 0; i < Math.min(gen.length, 4); i++) {
+    genScore = genScore * 40 + Math.max(1, gen.charCodeAt(i) - 47);
+  }
+  // Prefer base model (`hydrogen-l`) first, then mid/high effort pools (`0p70`, `1p00`, `0p50`, `0p30`, `0p10`)
+  let variantRank = 50;
+  if (!suffix) variantRank = 100;
+  else if (suffix === "high-0p70") variantRank = 92;
+  else if (suffix === "high-1p00") variantRank = 90;
+  else if (suffix === "high-0p50") variantRank = 86;
+  else if (suffix === "high-0p30") variantRank = 82;
+  else if (suffix === "high-0p10") variantRank = 78;
+  else if (/preview|exp|launch-prep/.test(suffix)) variantRank = 20;
+  return [genScore, variantRank, lower];
+}
+
+export function sortHydrogenModelsLatestFirst(models: readonly string[]): string[] {
+  return [...models].sort((a, b) => {
+    const ra = rankHydrogenModelId(a);
+    const rb = rankHydrogenModelId(b);
+    if (rb[0] !== ra[0]) return rb[0] - ra[0];
+    if (rb[1] !== ra[1]) return rb[1] - ra[1];
+    return ra[2].localeCompare(rb[2]);
+  });
+}
+
+/**
+ * Queries `generativelanguage.googleapis.com/v1beta/models` using `x-goog-api-key` header
+ * to dynamically discover all `hydrogen*` models available on the API key (including any newly
+ * rolled-out Hydrogen generations beyond the static list). Cached for 5 minutes per isolate.
+ */
+export async function discoverHydrogenModelsFromApi(
+  apiKey: string,
+  opts?: { forceRefresh?: boolean },
+): Promise<string[]> {
+  const now = Date.now();
+  if (
+    !opts?.forceRefresh &&
+    discoveredHydrogenCache &&
+    now - discoveredHydrogenCache.fetchedAt < DISCOVERY_CACHE_TTL_MS
+  ) {
+    return discoveredHydrogenCache.models;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4_500);
+  try {
+    const res = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models?pageSize=250",
+      {
+        method: "GET",
+        signal: controller.signal,
+        headers: {
+          accept: "application/json",
+          "x-goog-api-key": apiKey,
+        },
+      },
+    );
+    clearTimeout(timer);
+    if (!res.ok) return discoveredHydrogenCache?.models ?? [];
+
+    const data = (await res.json()) as {
+      models?: {
+        name?: string;
+        supportedGenerationMethods?: string[];
+      }[];
+    };
+
+    const found = new Set<string>();
+    for (const entry of data.models ?? []) {
+      const clean = String(entry?.name ?? "").trim().replace(/^models\//, "");
+      if (!clean || !MODEL_ID_RE.test(clean) || !isHydrogenModel(clean)) continue;
+      const methods = entry?.supportedGenerationMethods;
+      if (Array.isArray(methods) && methods.length > 0 && !methods.includes("generateContent")) {
+        continue;
+      }
+      found.add(clean);
+    }
+
+    const sorted = sortHydrogenModelsLatestFirst([...found]);
+    if (sorted.length > 0) {
+      discoveredHydrogenCache = { models: sorted, fetchedAt: now };
+    }
+    return sorted;
+  } catch {
+    clearTimeout(timer);
+    return discoveredHydrogenCache?.models ?? [];
+  }
+}
+
 export function buildGeminiModelCascade(opts?: {
+  mode?: GeminiCallMode;
+  hydrogenModel?: string;
+  hydrogenModels?: string | readonly string[];
   primaryModel?: string;
   bariumModels?: string | readonly string[];
   fallbackModel?: string;
@@ -74,15 +290,32 @@ export function buildGeminiModelCascade(opts?: {
     return out;
   }
 
+  const mode: GeminiCallMode = opts?.mode ?? "sculpt";
+  const configuredHydrogen = parseModelList(opts?.hydrogenModels);
   const configuredBarium = parseModelList(opts?.bariumModels);
-  const rawOrder: string[] = [
-    opts?.primaryModel?.trim() || DEFAULT_ARGON_MODELS[0],
-    ...DEFAULT_ARGON_MODELS.slice(1),
-    ...configuredBarium,
-    ...DEFAULT_BARIUM_FALLBACK_MODELS,
-    opts?.fallbackModel?.trim() || DEFAULT_GEMINI_SAFETY_NET_MODELS[0],
-    ...DEFAULT_GEMINI_SAFETY_NET_MODELS,
-  ];
+
+  const rawOrder: string[] =
+    mode === "sculpt"
+      ? [
+          opts?.hydrogenModel?.trim() || DEFAULT_HYDROGEN_MODELS[0],
+          ...configuredHydrogen,
+          ...DEFAULT_HYDROGEN_MODELS,
+          ...(discoveredHydrogenCache?.models ?? []),
+          opts?.primaryModel?.trim() || DEFAULT_ARGON_MODELS[0],
+          ...DEFAULT_ARGON_MODELS.slice(1),
+          ...configuredBarium,
+          ...DEFAULT_BARIUM_FALLBACK_MODELS,
+          opts?.fallbackModel?.trim() || DEFAULT_GEMINI_SAFETY_NET_MODELS[0],
+          ...DEFAULT_GEMINI_SAFETY_NET_MODELS,
+        ]
+      : [
+          opts?.primaryModel?.trim() || DEFAULT_ARGON_MODELS[0],
+          ...DEFAULT_ARGON_MODELS.slice(1),
+          ...configuredBarium,
+          ...DEFAULT_BARIUM_FALLBACK_MODELS,
+          opts?.fallbackModel?.trim() || DEFAULT_GEMINI_SAFETY_NET_MODELS[0],
+          ...DEFAULT_GEMINI_SAFETY_NET_MODELS,
+        ];
 
   const seen = new Set<string>();
   const deduped: string[] = [];
@@ -95,24 +328,172 @@ export function buildGeminiModelCascade(opts?: {
   return deduped;
 }
 
+/**
+ * String-aware JSON sanitizer for 3D voxel blueprints:
+ *  - Escapes raw literal newlines/tabs/control chars inside JSON strings
+ *  - Strips `//` and `/* ... *\/` comments outside strings
+ *  - Strips unary `+` on numeric coordinates (`"x0": +4`, `[+2, 7, 9]`)
+ *  - Replaces bare `NaN` / `Infinity` literals outside strings with `0`
+ *  - Removes trailing commas before `}` or `]`
+ */
+function repairJsonCandidate(input: string): string {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  const len = input.length;
+
+  for (let i = 0; i < len; i++) {
+    const ch = input[i];
+
+    if (inString) {
+      if (escaped) {
+        out += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        out += ch;
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') {
+        out += ch;
+        inString = false;
+        continue;
+      }
+      const code = ch.charCodeAt(0);
+      if (code < 0x20) {
+        if (ch === "\n") out += "\\n";
+        else if (ch === "\r") out += "\\r";
+        else if (ch === "\t") out += "\\t";
+        else out += `\\u${code.toString(16).padStart(4, "0")}`;
+        continue;
+      }
+      out += ch;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+
+    // Strip single-line // comments outside strings
+    if (ch === "/" && input[i + 1] === "/") {
+      i += 2;
+      while (i < len && input[i] !== "\n") i++;
+      if (i < len) out += "\n";
+      continue;
+    }
+
+    // Strip /* ... */ block comments outside strings
+    if (ch === "/" && input[i + 1] === "*") {
+      i += 2;
+      while (i < len && !(input[i] === "*" && input[i + 1] === "/")) i++;
+      i += 1;
+      continue;
+    }
+
+    // Strip unary '+' before digits in coordinate values (e.g. `: +4` or `[+2,`)
+    if (ch === "+" && i + 1 < len && input[i + 1] >= "0" && input[i + 1] <= "9") {
+      const prevNonWs = out.trimEnd().slice(-1);
+      if (prevNonWs === ":" || prevNonWs === "[" || prevNonWs === ",") {
+        continue;
+      }
+    }
+
+    out += ch;
+  }
+
+  return out
+    .replace(/\b(?:-?Infinity|NaN)\b/g, "0")
+    .replace(/,\s*([}\]])/g, "$1");
+}
+
+function extractBalancedObjectSlices(text: string): string[] {
+  const slices: string[] = [];
+  const len = text.length;
+
+  for (let start = 0; start < len; start++) {
+    if (text[start] !== "{") continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let i = start; i < len; i++) {
+      const ch = text[i];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === "\\") {
+          escaped = true;
+        } else if (ch === '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (ch === '"') {
+        inString = true;
+      } else if (ch === "{") {
+        depth++;
+      } else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          slices.push(text.slice(start, i + 1));
+          start = i;
+          break;
+        }
+      }
+    }
+  }
+
+  slices.sort((a, b) => b.length - a.length);
+  return slices;
+}
+
 export function extractJsonObject(raw: unknown): Record<string, unknown> {
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     return raw as Record<string, unknown>;
   }
   const text = String(raw ?? "").trim();
-  const stripped = text.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
-  const start = stripped.indexOf("{");
-  const end = stripped.lastIndexOf("}");
-  if (start === -1 || end <= start) {
+  const stripped = text.replace(/```(?:json)?\s*/gi, "").replace(/```/g, "").trim();
+  const firstStart = stripped.indexOf("{");
+  const lastEnd = stripped.lastIndexOf("}");
+  if (firstStart === -1 || lastEnd <= firstStart) {
     throw new Error("Model response did not contain a JSON object");
   }
-  const slice = stripped.slice(start, end + 1);
-  try {
-    return JSON.parse(slice) as Record<string, unknown>;
-  } catch {
-    const repaired = slice.replace(/,\s*([}\]])/g, "$1");
-    return JSON.parse(repaired) as Record<string, unknown>;
+
+  const candidates: string[] = [stripped.slice(firstStart, lastEnd + 1)];
+  for (const balanced of extractBalancedObjectSlices(stripped)) {
+    if (!candidates.includes(balanced)) {
+      candidates.push(balanced);
+    }
   }
+
+  let lastErr: unknown = null;
+  for (const slice of candidates) {
+    try {
+      const parsed = JSON.parse(slice);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch (err) {
+      lastErr = err;
+    }
+
+    try {
+      const repaired = repairJsonCandidate(slice);
+      const parsed = JSON.parse(repaired);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+
+  throw lastErr instanceof Error ? lastErr : new Error("Failed to parse JSON object from response");
 }
 
 interface StreamTimeouts {
@@ -122,8 +503,26 @@ interface StreamTimeouts {
 }
 
 function getModelStreamTimeouts(model: string, mode: GeminiCallMode): StreamTimeouts {
-  const isSpeculativeBarium = SPECULATIVE_BARIUM_RE.test(model);
-  if (isSpeculativeBarium) {
+  if (SPECULATIVE_HYDROGEN_RE.test(model)) {
+    // Older/unmounted Hydrogen generations (`hydrogen-g`, `hydrogen-f`, `hydrogen-j`):
+    // fail fast in <=4.2s if unscheduled/unmounted, but allow full 58s once streaming begins.
+    return {
+      firstChunkTimeoutMs: mode === "critic" ? 3_500 : 4_200,
+      idleChunkTimeoutMs: 22_000,
+      totalTimeoutMs: mode === "critic" ? 36_000 : 58_000,
+    };
+  }
+  if (isHydrogenModel(model)) {
+    // Active Hydrogen family (`hydrogen-l` and `hydrogen-l-high-*`):
+    // with `includeThoughts: true`, first SSE thought chunk arrives in ~1.9–2.6s and
+    // full 45-op 3D voxel blueprints complete in ~18–45s.
+    return {
+      firstChunkTimeoutMs: mode === "critic" ? 12_000 : 18_000,
+      idleChunkTimeoutMs: 28_000,
+      totalTimeoutMs: mode === "critic" ? 40_000 : mode === "director" ? 52_000 : 72_000,
+    };
+  }
+  if (SPECULATIVE_BARIUM_RE.test(model)) {
     return {
       firstChunkTimeoutMs: mode === "critic" ? 3_200 : 3_800,
       idleChunkTimeoutMs: 18_000,
@@ -158,6 +557,11 @@ function getModelStreamTimeouts(model: string, mode: GeminiCallMode): StreamTime
   };
 }
 
+type ThinkingConfigStrategy =
+  | { kind: "native_thoughts" }
+  | { kind: "budget"; budget: number }
+  | { kind: "none" };
+
 interface SseAccumulator {
   nonThoughtText: string;
   allText: string;
@@ -172,7 +576,7 @@ function consumeSseLine(rawLine: string, acc: SseAccumulator): void {
   const payload = line.slice(5).trim();
   if (!payload || payload === "[DONE]") return;
 
-  const ev = JSON.parse(payload) as {
+  let ev: {
     error?: { code?: number; message?: string; status?: string };
     promptFeedback?: { blockReason?: string };
     candidates?: {
@@ -180,6 +584,12 @@ function consumeSseLine(rawLine: string, acc: SseAccumulator): void {
       content?: { parts?: { text?: string; thought?: boolean }[] };
     }[];
   };
+  try {
+    ev = JSON.parse(payload);
+  } catch {
+    // Ignore isolated malformed/non-JSON diagnostic SSE frames rather than aborting the stream
+    return;
+  }
 
   if (ev.error) {
     acc.streamError = `SSE ${ev.error.code ?? ""} ${ev.error.status ?? ""}: ${ev.error.message ?? "stream error"}`.trim();
@@ -202,6 +612,48 @@ function consumeSseLine(rawLine: string, acc: SseAccumulator): void {
   }
 }
 
+function buildGenerationConfig(opts: {
+  temperature: number;
+  maxOutputTokens: number;
+  thinking: ThinkingConfigStrategy;
+  useJsonMimeType: boolean;
+}): Record<string, unknown> {
+  const generationConfig: Record<string, unknown> = {
+    temperature: opts.temperature,
+    maxOutputTokens: opts.maxOutputTokens,
+  };
+  if (opts.useJsonMimeType) {
+    generationConfig.responseMimeType = "application/json";
+  }
+  if (opts.thinking.kind === "native_thoughts") {
+    generationConfig.thinkingConfig = {
+      includeThoughts: true,
+    };
+  } else if (opts.thinking.kind === "budget" && opts.thinking.budget > 0) {
+    generationConfig.thinkingConfig = {
+      thinkingBudget: opts.thinking.budget,
+      includeThoughts: true,
+    };
+  }
+  return generationConfig;
+}
+
+type SingleAttemptOutcome =
+  | {
+      ok: true;
+      rawText: string;
+      blockReason: string | null;
+      finishReason: string | null;
+      firstChunkMs: number;
+    }
+  | {
+      ok: false;
+      httpStatus?: number;
+      errorBody?: string;
+      transportDropped?: boolean;
+      reason: string;
+    };
+
 async function streamSingleModelAttempt(opts: {
   model: string;
   apiKey: string;
@@ -209,20 +661,10 @@ async function streamSingleModelAttempt(opts: {
   userParts: Record<string, unknown>[];
   temperature: number;
   maxOutputTokens: number;
-  thinkingBudget: number | null;
+  thinking: ThinkingConfigStrategy;
+  useJsonMimeType: boolean;
   timeouts: StreamTimeouts;
-}): Promise<{
-  ok: true;
-  rawText: string;
-  blockReason: string | null;
-  finishReason: string | null;
-  firstChunkMs: number;
-} | {
-  ok: false;
-  httpStatus?: number;
-  errorBody?: string;
-  reason: string;
-}> {
+}): Promise<SingleAttemptOutcome> {
   const t0 = Date.now();
   const controller = new AbortController();
   let abortReason = "aborted";
@@ -258,20 +700,16 @@ async function streamSingleModelAttempt(opts: {
     }
   };
 
+  let receivedHttp200 = false;
   try {
     // Security invariant: API key MUST only be sent via x-goog-api-key header, NEVER in URL query parameters
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(opts.model)}:streamGenerateContent?alt=sse`;
-    const generationConfig: Record<string, unknown> = {
+    const generationConfig = buildGenerationConfig({
       temperature: opts.temperature,
       maxOutputTokens: opts.maxOutputTokens,
-      responseMimeType: "application/json",
-    };
-    if (opts.thinkingBudget !== null && opts.thinkingBudget > 0) {
-      generationConfig.thinkingConfig = {
-        thinkingBudget: opts.thinkingBudget,
-        includeThoughts: true,
-      };
-    }
+      thinking: opts.thinking,
+      useJsonMimeType: opts.useJsonMimeType,
+    });
 
     const res = await fetch(endpoint, {
       method: "POST",
@@ -294,13 +732,15 @@ async function streamSingleModelAttempt(opts: {
         ok: false,
         httpStatus: res.status,
         errorBody: errBody,
-        reason: `HTTP ${res.status}: ${redactSecrets(errBody.slice(0, 140), [opts.apiKey])}`,
+        reason: `HTTP ${res.status}: ${redactSecrets(errBody.slice(0, 160), [opts.apiKey])}`,
       };
     }
 
+    receivedHttp200 = true;
+
     if (!res.body) {
       clearAllTimers();
-      return { ok: false, reason: "Empty response stream body" };
+      return { ok: false, transportDropped: true, reason: "Empty response stream body" };
     }
 
     const reader = res.body.getReader();
@@ -368,16 +808,224 @@ async function streamSingleModelAttempt(opts: {
     };
   } catch (err) {
     clearAllTimers();
+    const aborted = controller.signal.aborted;
+    const msg = aborted ? abortReason : redactSecrets(err, [opts.apiKey]);
+    return {
+      ok: false,
+      transportDropped: !aborted && receivedHttp200,
+      reason: msg,
+    };
+  }
+}
+
+/**
+ * Non-streaming `:generateContent` fallback for cases where an intermediary/edge proxy drops an
+ * HTTP 200 SSE stream mid-transfer (`terminated` / empty stream body).
+ */
+async function nonStreamSingleModelAttempt(opts: {
+  model: string;
+  apiKey: string;
+  systemPrompt: string;
+  userParts: Record<string, unknown>[];
+  temperature: number;
+  maxOutputTokens: number;
+  thinking: ThinkingConfigStrategy;
+  useJsonMimeType: boolean;
+  timeoutMs: number;
+}): Promise<SingleAttemptOutcome> {
+  const t0 = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+
+  try {
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(opts.model)}:generateContent`;
+    const generationConfig = buildGenerationConfig({
+      temperature: opts.temperature,
+      maxOutputTokens: opts.maxOutputTokens,
+      thinking: opts.thinking,
+      useJsonMimeType: opts.useJsonMimeType,
+    });
+
+    const res = await fetch(endpoint, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "content-type": "application/json",
+        "x-goog-api-key": opts.apiKey,
+      },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: opts.systemPrompt }] },
+        contents: [{ role: "user", parts: opts.userParts }],
+        generationConfig,
+      }),
+    });
+
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "");
+      return {
+        ok: false,
+        httpStatus: res.status,
+        errorBody: errBody,
+        reason: `HTTP ${res.status}: ${redactSecrets(errBody.slice(0, 160), [opts.apiKey])}`,
+      };
+    }
+
+    const payload = (await res.json()) as {
+      promptFeedback?: { blockReason?: string };
+      candidates?: {
+        finishReason?: string;
+        content?: { parts?: { text?: string; thought?: boolean }[] };
+      }[];
+    };
+
+    const cand = payload.candidates?.[0];
+    let nonThought = "";
+    let allText = "";
+    for (const part of cand?.content?.parts ?? []) {
+      if (typeof part.text === "string") {
+        allText += part.text;
+        if (!part.thought) nonThought += part.text;
+      }
+    }
+
+    return {
+      ok: true,
+      rawText: nonThought.trim() || allText.trim(),
+      blockReason: payload.promptFeedback?.blockReason ?? null,
+      finishReason: cand?.finishReason ?? null,
+      firstChunkMs: Date.now() - t0,
+    };
+  } catch (err) {
+    clearTimeout(timer);
     const msg = controller.signal.aborted
-      ? abortReason
+      ? `NonStreamTimeout(${opts.timeoutMs}ms)`
       : redactSecrets(err, [opts.apiKey]);
     return { ok: false, reason: msg };
   }
 }
 
+async function runResilientModelAttempt(opts: {
+  model: string;
+  mode: GeminiCallMode;
+  apiKey: string;
+  systemPrompt: string;
+  userParts: Record<string, unknown>[];
+  temperature: number;
+  requestedMaxOutputTokens: number;
+  requestedThinkingBudget: number;
+  timeouts: StreamTimeouts;
+  priorTransportDrops: number;
+}): Promise<SingleAttemptOutcome> {
+  const hydrogen = isHydrogenModel(opts.model);
+  let maxOutputTokens = hydrogen
+    ? Math.max(opts.requestedMaxOutputTokens, opts.mode === "sculpt" ? 32_768 : 16_384)
+    : opts.requestedMaxOutputTokens;
+
+  // Hydrogen models expose 1,048,576 maxOutputTokens and perform best with native thinking effort
+  // (`includeThoughts: true` without an artificial thinkingBudget cap), which streams thought
+  // summaries in ~2s while preserving full 3D spatial reasoning.
+  let thinking: ThinkingConfigStrategy = hydrogen
+    ? { kind: "native_thoughts" }
+    : opts.requestedThinkingBudget > 0
+      ? { kind: "budget", budget: opts.requestedThinkingBudget }
+      : { kind: "none" };
+  let useJsonMimeType = true;
+
+  let res = await streamSingleModelAttempt({
+    model: opts.model,
+    apiKey: opts.apiKey,
+    systemPrompt: opts.systemPrompt,
+    userParts: opts.userParts,
+    temperature: opts.temperature,
+    maxOutputTokens,
+    thinking,
+    useJsonMimeType,
+    timeouts: opts.timeouts,
+  });
+
+  // Self-healing HTTP 400 parameter compatibility retries on the SAME model (up to 2 quick adjustments)
+  for (let compatPass = 0; compatPass < 2 && !res.ok && res.httpStatus === 400 && res.errorBody; compatPass++) {
+    const body = res.errorBody;
+    let adjusted = false;
+
+    if (thinking.kind !== "none" && /thinking|thought/i.test(body)) {
+      thinking = { kind: "none" };
+      adjusted = true;
+    } else if (maxOutputTokens > 16_384 && /max_?output_?tokens|output.*token|token.*limit/i.test(body)) {
+      maxOutputTokens = 16_384;
+      adjusted = true;
+    } else if (useJsonMimeType && /response_?mime_?type|mime.*type|application\/json/i.test(body)) {
+      useJsonMimeType = false;
+      adjusted = true;
+    }
+
+    if (!adjusted) break;
+
+    res = await streamSingleModelAttempt({
+      model: opts.model,
+      apiKey: opts.apiKey,
+      systemPrompt: opts.systemPrompt,
+      userParts: opts.userParts,
+      temperature: opts.temperature,
+      maxOutputTokens,
+      thinking,
+      useJsonMimeType,
+      timeouts: opts.timeouts,
+    });
+  }
+
+  // If SSE stream body was dropped mid-transfer after HTTP 200 (or multiple SSE transport drops occurred),
+  // rescue on the same active Hydrogen model via non-streaming `:generateContent`.
+  if (
+    !res.ok &&
+    res.transportDropped &&
+    hydrogen &&
+    !SPECULATIVE_HYDROGEN_RE.test(opts.model) &&
+    (res.reason === "Empty response stream body" || opts.priorTransportDrops >= 1)
+  ) {
+    res = await nonStreamSingleModelAttempt({
+      model: opts.model,
+      apiKey: opts.apiKey,
+      systemPrompt: opts.systemPrompt,
+      userParts: opts.userParts,
+      temperature: opts.temperature,
+      maxOutputTokens,
+      thinking,
+      useJsonMimeType,
+      timeoutMs: Math.min(50_000, opts.timeouts.totalTimeoutMs),
+    });
+  }
+
+  // If a thinking-heavy Hydrogen response hit MAX_TOKENS truncation, retry once with 65,536 token headroom
+  if (
+    res.ok &&
+    hydrogen &&
+    res.finishReason === "MAX_TOKENS" &&
+    maxOutputTokens < 65_536
+  ) {
+    res = await streamSingleModelAttempt({
+      model: opts.model,
+      apiKey: opts.apiKey,
+      systemPrompt: opts.systemPrompt,
+      userParts: opts.userParts,
+      temperature: opts.temperature,
+      maxOutputTokens: 65_536,
+      thinking,
+      useJsonMimeType,
+      timeouts: opts.timeouts,
+    });
+  }
+
+  return res;
+}
+
 export async function callGeminiWithFallbacks(opts: {
   apiKey: string;
   mode?: GeminiCallMode;
+  hydrogenModel?: string;
+  hydrogenModels?: string | readonly string[];
   primaryModel?: string;
   bariumModels?: string | readonly string[];
   fallbackModel?: string;
@@ -391,18 +1039,39 @@ export async function callGeminiWithFallbacks(opts: {
   thinkingBudget?: number;
   maxOutputTokens?: number;
   maxCascadeMs?: number;
+  validateJson?: (json: Record<string, unknown>) => string | null;
 }): Promise<{
   json: Record<string, unknown>;
   modelUsed: string;
   attempts: GeminiAttemptRecord[];
 }> {
   const mode: GeminiCallMode = opts.mode ?? "sculpt";
-  const models = buildGeminiModelCascade({
+  const baseCascade = buildGeminiModelCascade({
+    mode,
+    hydrogenModel: opts.hydrogenModel,
+    hydrogenModels: opts.hydrogenModels,
     primaryModel: opts.primaryModel,
     bariumModels: opts.bariumModels,
     fallbackModel: opts.fallbackModel,
     overrideModels: opts.overrideModels,
   });
+
+  // Order within each model family using live circuit-breaker health while strictly keeping ALL
+  // Hydrogen models ahead of any emergency non-Hydrogen safety-net models in `sculpt` mode.
+  const now = Date.now();
+  let models: string[];
+  if (opts.overrideModels && opts.overrideModels.length > 0) {
+    models = [...baseCascade];
+  } else if (mode === "sculpt") {
+    const hydrogenTier = baseCascade.filter((m) => isHydrogenModel(m));
+    const safetyNetTier = baseCascade.filter((m) => !isHydrogenModel(m));
+    models = [
+      ...orderTierByHealth(hydrogenTier, now),
+      ...orderTierByHealth(safetyNetTier, now),
+    ];
+  } else {
+    models = orderTierByHealth(baseCascade, now);
+  }
 
   const userParts: Record<string, unknown>[] = [];
   if (opts.imageBase64 && opts.imageMimeType) {
@@ -430,20 +1099,44 @@ export async function callGeminiWithFallbacks(opts: {
   const cascadeStart = Date.now();
   const maxCascadeMs =
     opts.maxCascadeMs ??
-    (mode === "critic" ? 55_000 : mode === "director" ? 75_000 : 135_000);
+    (mode === "critic" ? 55_000 : mode === "director" ? 75_000 : 145_000);
 
   const attempts: GeminiAttemptRecord[] = [];
+  const attemptedSet = new Set<string>();
+  let ranDynamicHydrogenDiscovery = false;
+  let priorTransportDrops = 0;
 
   for (let idx = 0; idx < models.length; idx++) {
     const model = models[idx];
+    if (attemptedSet.has(model)) continue;
+
+    // Before stepping out of the Hydrogen family in `sculpt` mode, dynamically query `v1beta/models`
+    // once in case newer `hydrogen-*` endpoints were added to the API key.
+    if (
+      mode === "sculpt" &&
+      !opts.overrideModels &&
+      !ranDynamicHydrogenDiscovery &&
+      !isHydrogenModel(model) &&
+      attempts.length > 0
+    ) {
+      ranDynamicHydrogenDiscovery = true;
+      const liveHydrogen = await discoverHydrogenModelsFromApi(opts.apiKey, { forceRefresh: true });
+      const unseenHydrogen = liveHydrogen.filter((m) => !attemptedSet.has(m) && !models.slice(idx).includes(m));
+      if (unseenHydrogen.length > 0) {
+        models.splice(idx, 0, ...unseenHydrogen);
+        idx--;
+        continue;
+      }
+    }
+
     const elapsedTotal = Date.now() - cascadeStart;
 
-    // If >=72% of total wall-clock cascade budget is already spent, skip speculative secondary
-    // Barium variants so guaranteed fast Flash/Pro safety-net models still get clean headroom.
+    // If >=70% of total wall-clock cascade budget is already spent, skip older/speculative aliases
+    // (`hydrogen-f/g/j` or `barium-bb/a/cc`) so active Hydrogen-l / Flash safety-net pools get clean time.
     if (
       idx > 0 &&
-      elapsedTotal > maxCascadeMs * 0.72 &&
-      SPECULATIVE_BARIUM_RE.test(model)
+      elapsedTotal > maxCascadeMs * 0.7 &&
+      (SPECULATIVE_HYDROGEN_RE.test(model) || SPECULATIVE_BARIUM_RE.test(model))
     ) {
       continue;
     }
@@ -451,49 +1144,44 @@ export async function callGeminiWithFallbacks(opts: {
       break;
     }
 
+    attemptedSet.add(model);
     const attemptStart = Date.now();
     const timeouts = getModelStreamTimeouts(model, mode);
     const desiredThinking = opts.thinkingBudget ?? (mode === "critic" ? 512 : 1024);
 
-    let res = await streamSingleModelAttempt({
+    const res = await runResilientModelAttempt({
       model,
+      mode,
       apiKey: opts.apiKey,
       systemPrompt: opts.systemPrompt,
       userParts,
       temperature: opts.temperature ?? 0.42,
-      maxOutputTokens: opts.maxOutputTokens ?? 12288,
-      thinkingBudget: desiredThinking,
+      requestedMaxOutputTokens: opts.maxOutputTokens ?? 12_288,
+      requestedThinkingBudget: desiredThinking,
       timeouts,
+      priorTransportDrops,
     });
-
-    // Automatic compatibility fallback if a model rejects `thinkingConfig` / `includeThoughts` with HTTP 400
-    if (
-      !res.ok &&
-      res.httpStatus === 400 &&
-      res.errorBody &&
-      /thinking/i.test(res.errorBody)
-    ) {
-      res = await streamSingleModelAttempt({
-        model,
-        apiKey: opts.apiKey,
-        systemPrompt: opts.systemPrompt,
-        userParts,
-        temperature: opts.temperature ?? 0.42,
-        maxOutputTokens: opts.maxOutputTokens ?? 12288,
-        thinkingBudget: null,
-        timeouts,
-      });
-    }
 
     const attemptMs = Math.max(1, Date.now() - attemptStart);
 
     if (!res.ok) {
+      if (res.transportDropped) priorTransportDrops++;
+      recordModelFailure(model, res.httpStatus, res.reason);
       attempts.push({
         model,
         ok: false,
         ms: attemptMs,
         reason: res.reason,
       });
+
+      // Short jittered pause on 429 / 503 spikes to desynchronize burst retries across Hydrogen pools
+      if (
+        (res.httpStatus === 429 || res.httpStatus === 503) &&
+        Date.now() - cascadeStart + 450 < maxCascadeMs
+      ) {
+        const jitterMs = 160 + Math.floor(Math.random() * 200);
+        await new Promise((r) => setTimeout(r, jitterMs));
+      }
       continue;
     }
 
@@ -503,6 +1191,7 @@ export async function callGeminiWithFallbacks(opts: {
       /^(SAFETY|PROHIBITED_CONTENT|BLOCKLIST|IMAGE_SAFETY)$/i.test(res.blockReason) &&
       mode === "sculpt"
     ) {
+      recordModelSuccess(model);
       attempts.push({
         model,
         ok: true,
@@ -522,6 +1211,29 @@ export async function callGeminiWithFallbacks(opts: {
 
     try {
       const json = extractJsonObject(res.rawText);
+
+      if (opts.validateJson) {
+        let validationErr: string | null = null;
+        try {
+          validationErr = opts.validateJson(json);
+        } catch (vErr) {
+          validationErr = redactSecrets(vErr, [opts.apiKey]).slice(0, 90);
+        }
+        if (validationErr) {
+          const reason = `Blueprint validation failed: ${validationErr}`;
+          recordModelFailure(model, undefined, reason);
+          attempts.push({
+            model,
+            ok: false,
+            ms: attemptMs,
+            firstChunkMs: res.firstChunkMs,
+            reason,
+          });
+          continue;
+        }
+      }
+
+      recordModelSuccess(model);
       attempts.push({
         model,
         ok: true,
@@ -529,7 +1241,7 @@ export async function callGeminiWithFallbacks(opts: {
         firstChunkMs: res.firstChunkMs,
       });
 
-      if (idx > 0) {
+      if (attempts.length > 1) {
         const failedSummary = attempts
           .slice(0, -1)
           .map((a) => `${a.model}(${a.reason ?? "err"},${a.ms}ms)`)
@@ -543,7 +1255,9 @@ export async function callGeminiWithFallbacks(opts: {
 
       return { json, modelUsed: model, attempts };
     } catch (parseErr) {
-      const parseReason = `JSON parse error (${res.finishReason ?? "unknown"}): ${redactSecrets(parseErr, [opts.apiKey]).slice(0, 90)}`;
+      const parseReason = `JSON parse error (${res.finishReason ?? "incomplete_stream"}): ${redactSecrets(parseErr, [opts.apiKey]).slice(0, 90)}`;
+      if (!res.finishReason) priorTransportDrops++;
+      recordModelFailure(model, undefined, parseReason);
       attempts.push({
         model,
         ok: false,
@@ -559,7 +1273,7 @@ export async function callGeminiWithFallbacks(opts: {
     .join(" | ");
   throw new Error(
     redactSecrets(
-      `All ${attempts.length}/${models.length} Argon/Barium/Gemini models failed [${mode}]: ${trace}`,
+      `All ${attempts.length}/${models.length} Hydrogen/Gemini cascade models failed [${mode}]: ${trace}`,
       [opts.apiKey],
     ),
   );

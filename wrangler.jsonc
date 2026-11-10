@@ -38,6 +38,8 @@
     "crons": ["*/2 * * * *"]
   },
   "vars": {
+    "HYDROGEN_MODEL": "hydrogen-l",
+    "HYDROGEN_MODELS": "hydrogen-l,hydrogen-l-high-0p70,hydrogen-l-high-1p00,hydrogen-l-high-0p50,hydrogen-l-high-0p30,hydrogen-l-high-0p10,hydrogen-g,hydrogen-f,hydrogen-j",
     "ARGON_MODEL": "gemini-4-argon",
     "BARIUM_MODELS": "barium-b,barium-c,barium-bb-v2,barium-bb3,barium-bb2,barium-bb,barium-a,barium-cc3",
     "FALLBACK_MODEL": "gemini-3.8-flash",

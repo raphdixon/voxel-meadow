@@ -371,6 +371,8 @@ export default {
               env.ARGON_MODEL,
               env.FALLBACK_MODEL,
               env.BARIUM_MODELS,
+              env.HYDROGEN_MODEL,
+              env.HYDROGEN_MODELS,
             );
             if (!sculpted.ok) {
               return jsonResponse(
@@ -438,6 +440,8 @@ export default {
               env.ARGON_MODEL,
               env.FALLBACK_MODEL,
               env.BARIUM_MODELS,
+              env.HYDROGEN_MODEL,
+              env.HYDROGEN_MODELS,
             );
             if (resculpted.ok) {
               resculptedContactSheetPngBase64 = await renderBlueprintContactSheetPng(

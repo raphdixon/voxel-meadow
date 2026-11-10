@@ -2,6 +2,7 @@ const ALLOWED_PROD_ORIGINS = new Set(["https://geminisland.raph.plus"]);
 
 const SECRET_PATTERNS: RegExp[] = [
   /AIza[0-9A-Za-z_-]{16,}/g,
+  /\bAQ\.[0-9A-Za-z._-]{16,}/g,
   /ya29\.[0-9A-Za-z._-]+/g,
   /(x-goog-api-key\s*[:=]\s*)([^\s"',;}\]]+)/gi,
   /([?&](?:key|api_key|token|secret)=)([^&\s"'#]+)/gi,
@@ -55,10 +56,11 @@ export function redactSecrets(
   }
 
   out = out.replace(SECRET_PATTERNS[0], "[REDACTED_GCP_KEY]");
-  out = out.replace(SECRET_PATTERNS[1], "[REDACTED_TOKEN]");
-  out = out.replace(SECRET_PATTERNS[2], "$1[REDACTED]");
+  out = out.replace(SECRET_PATTERNS[1], "[REDACTED_GCP_KEY]");
+  out = out.replace(SECRET_PATTERNS[2], "[REDACTED_TOKEN]");
   out = out.replace(SECRET_PATTERNS[3], "$1[REDACTED]");
   out = out.replace(SECRET_PATTERNS[4], "$1[REDACTED]");
+  out = out.replace(SECRET_PATTERNS[5], "$1[REDACTED]");
 
   return out.slice(0, 400);
 }

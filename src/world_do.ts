@@ -2288,6 +2288,9 @@ export class WorldDO extends DurableObject<Env> {
 
     return {
       modelCascade: buildGeminiModelCascade({
+        mode: "sculpt",
+        hydrogenModel: this.env.HYDROGEN_MODEL,
+        hydrogenModels: this.env.HYDROGEN_MODELS,
         primaryModel: this.env.ARGON_MODEL,
         bariumModels: this.env.BARIUM_MODELS,
         fallbackModel: this.env.FALLBACK_MODEL,
@@ -3014,6 +3017,8 @@ export class WorldDO extends DurableObject<Env> {
         this.env.ARGON_MODEL,
         this.env.FALLBACK_MODEL,
         this.env.BARIUM_MODELS,
+        this.env.HYDROGEN_MODEL,
+        this.env.HYDROGEN_MODELS,
       );
 
       if (!sculpted.ok) {
@@ -3724,6 +3729,8 @@ export class WorldDO extends DurableObject<Env> {
         this.env.ARGON_MODEL,
         this.env.FALLBACK_MODEL,
         this.env.BARIUM_MODELS,
+        this.env.HYDROGEN_MODEL,
+        this.env.HYDROGEN_MODELS,
       );
 
       if (!resculpted.ok) {

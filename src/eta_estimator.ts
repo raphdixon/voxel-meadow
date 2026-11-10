@@ -52,8 +52,8 @@ const COMPACT_PROMPT_RE =
   /\b(tiny|mini|small|little|micro|mushroom|toadstool|mailbox|postbox|lantern|lamp|bench|signpost|flower|tulip|sunflower|rose|rock|pebble|boulder|bush|shrub|hydrant|barrel|crate|campfire|bonfire|birdhouse|snowman|cactus|bonsai|chair|stool|table|cat|kitten|dog|puppy|duck|frog|bunny|rabbit|squirrel|hedgehog|owl|bee|butterfly|chest|bicycle|scooter|skateboard)\b/i;
 
 /**
- * Cold-start Bayesian prior pseudo-samples (ms) calibrated to `gemini-4-argon` micro-voxel
- * sculpting latencies. Their weight decays automatically as real builds accumulate in SQLite.
+ * Cold-start Bayesian prior pseudo-samples (ms) calibrated to `hydrogen-l` micro-voxel
+ * sculpting + 3D critic review latencies. Their weight decays automatically as real builds accumulate in SQLite.
  */
 const PRIOR_TOTAL_SAMPLES: Record<BuildComplexityBucket, number[]> = {
   compact: [30_000, 36_000, 42_000, 52_000],

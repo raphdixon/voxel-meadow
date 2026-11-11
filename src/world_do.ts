@@ -863,6 +863,9 @@ export class WorldDO extends DurableObject<Env> {
 
     // Lightweight startup overlap & planar road-crossing repair (< 4ms, zero LLM calls)
     const bootAudit = this.auditAndRepairWorld();
+    if (bootAudit.repairedCount > 0) {
+      this.auditAndRepairWorld();
+    }
     const upgradedV14 = sql
       .exec(`SELECT value FROM meta WHERE key = 'upgrade_v14_refined_roads' LIMIT 1`)
       .toArray();
@@ -2210,6 +2213,9 @@ export class WorldDO extends DurableObject<Env> {
     }
     this.runUpgradeV20OuterRingAndPolicy();
     const repairRes = this.auditAndRepairWorld();
+    if (repairRes.repairedCount > 0) {
+      this.auditAndRepairWorld();
+    }
     const after = this.readBaseWorld();
     this.bumpVersion();
     return {

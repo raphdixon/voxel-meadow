@@ -1667,10 +1667,6 @@ export function auditAndRepairWorldSpatial(
     return 3;
   };
   const sortDistKey = (p: WorldPath): number => {
-    if (p.id.startsWith("spur-")) {
-      const owner = creationsById.get(p.id.slice("spur-".length));
-      if (owner) return Math.hypot(owner.x, owner.z);
-    }
     return Math.min(...p.points.map(([x, z]) => Math.hypot(x, z)));
   };
 
@@ -2535,7 +2531,7 @@ export function auditAndRepairWorldSpatial(
       }
     }
 
-    if (moved) {
+    if (moved && Math.hypot(px - pr.x, pz - pr.z) >= 0.05) {
       propNudgeCount++;
       details.push(`nudged prop "${pr.id}" (${pr.kind}) to [${px}, ${pz}]`);
       repairedProps.push({ ...pr, x: px, z: pz });

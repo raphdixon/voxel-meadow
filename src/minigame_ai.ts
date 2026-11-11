@@ -1,11 +1,15 @@
-import { extractJsonObject, parseModelList } from "./gemini_models";
+import { extractJsonObject, isHydrogenModel, parseModelList } from "./gemini_models";
 import { redactSecrets, safeLogWarn, sanitizePlainText } from "./security";
 
 export const DEFAULT_FLASH_LITE_MODELS = [
+  "hydrogen-l-high-0p10",
+  "hydrogen-l",
   "gemini-3.1-flash-lite",
   "gemini-3.5-flash-lite",
   "gemini-2.5-flash-lite",
   "gemini-flash-lite-latest",
+  "gemini-3.8-flash",
+  "gemini-2.5-flash",
 ] as const;
 
 export type MinigameAiKind = "tic_tac_toe" | "connect_four";
@@ -141,9 +145,11 @@ async function callSingleFlashLiteModel(opts: {
   try {
     // Security invariant: API key MUST only be sent via x-goog-api-key header, NEVER in URL query parameters
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(opts.model)}:generateContent`;
+    const hydrogen = isHydrogenModel(opts.model);
+    const isNoTempModel = /^gemini-(?:4|3\.8)/i.test(opts.model);
     const generationConfig: Record<string, unknown> = {
-      temperature: 0.3,
-      maxOutputTokens: 128,
+      ...(isNoTempModel ? {} : { temperature: 0.3 }),
+      maxOutputTokens: hydrogen ? 2048 : 128,
       responseMimeType: "application/json",
       responseSchema: {
         type: "OBJECT",
@@ -154,7 +160,7 @@ async function callSingleFlashLiteModel(opts: {
         required: ["move"],
       },
     };
-    if (opts.withZeroThinking) {
+    if (opts.withZeroThinking && !isNoTempModel && !hydrogen) {
       generationConfig.thinkingConfig = /^gemini-3/i.test(opts.model)
         ? { thinkingLevel: "MINIMAL" }
         : { thinkingBudget: 0 };

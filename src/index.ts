@@ -1,4 +1,5 @@
 import { sculptWithArgon } from "./argon_sculptor";
+import { checkIslandContentPolicy } from "./content_policy";
 import { resolveWorldLiveFeeds } from "./live_feeds";
 import { chooseMoveWithGeminiFlashLite, validateMinigameRequest } from "./minigame_ai";
 import {
@@ -12,6 +13,7 @@ import {
   verifyMutationSecurity,
   verifyWebSocketOrigin,
 } from "./security";
+import type { TrafficIncidentReason } from "./types";
 import { autoRepairBlueprintOverlaps } from "./voxel_audit";
 import {
   renderBlueprintContactSheetPng,
@@ -39,6 +41,24 @@ function allowMinigameMove(ipHash: string): boolean {
     return true;
   }
   if (cur.count >= 90) return false;
+  cur.count++;
+  return true;
+}
+
+const incidentBuckets = new Map<string, { windowStart: number; count: number }>();
+function allowTrafficIncidentReport(ipHash: string): boolean {
+  const now = Date.now();
+  if (incidentBuckets.size > 1024) {
+    for (const [k, b] of incidentBuckets.entries()) {
+      if (now - b.windowStart > 60_000) incidentBuckets.delete(k);
+    }
+  }
+  const cur = incidentBuckets.get(ipHash);
+  if (!cur || now - cur.windowStart > 60_000) {
+    incidentBuckets.set(ipHash, { windowStart: now, count: 1 });
+    return true;
+  }
+  if (cur.count >= 24) return false;
   cur.count++;
   return true;
 }
@@ -210,6 +230,54 @@ export default {
         );
       }
 
+      // Live vehicle telemetry & Observer Agent routing resolution endpoint
+      if (url.pathname === "/api/traffic-incident") {
+        if (request.method !== "POST") {
+          return jsonResponse(request, { ok: false, error: "Method not allowed." }, 405);
+        }
+        const csrfErr = verifyMutationSecurity(request);
+        if (csrfErr) {
+          return jsonResponse(request, { ok: false, error: csrfErr }, 403);
+        }
+        const id = await resolveVisitorIdentity(request, env);
+        if (!allowTrafficIncidentReport(id.ipHash)) {
+          return jsonResponse(request, { ok: false, error: "Rate limited." }, 429);
+        }
+        const parsedBody = await readBoundedJsonBody(request, 4_096);
+        if (!parsedBody.ok) {
+          return jsonResponse(request, { ok: false, error: parsedBody.error }, parsedBody.status);
+        }
+        const raw = parsedBody.data;
+        const vehicleId = sanitizePlainText(raw.vehicleId, 64, true);
+        const peerVehicleId = raw.peerVehicleId
+          ? sanitizePlainText(raw.peerVehicleId, 64, true)
+          : null;
+        const allowedReasons = new Set<TrafficIncidentReason>([
+          "clash_gridlock",
+          "turnaround_blocked",
+          "building_obstruction",
+          "self_restored",
+        ]);
+        const rawReason = sanitizePlainText(raw.reason, 32, true) as TrafficIncidentReason;
+        const reason: TrafficIncidentReason = allowedReasons.has(rawReason)
+          ? rawReason
+          : "self_restored";
+        const x = typeof raw.x === "number" && Number.isFinite(raw.x) ? raw.x : 0;
+        const z = typeof raw.z === "number" && Number.isFinite(raw.z) ? raw.z : 0;
+        if (!vehicleId) {
+          return jsonResponse(request, { ok: false, error: "vehicleId required." }, 400);
+        }
+        const stub = getWorldStub(env);
+        const result = await stub.reportTrafficIncident({
+          vehicleId,
+          peerVehicleId,
+          x,
+          z,
+          reason,
+        });
+        return jsonResponse(request, result, result.ok ? 200 : 404);
+      }
+
       // Live in-world board game opponent powered by Gemini Flash-Lite (using env.GEMINI_API_KEY)
       if (url.pathname === "/api/minigame-move") {
         if (request.method !== "POST") {
@@ -287,6 +355,12 @@ export default {
             { ok: false, error: "Add a photo or short description first." },
             400,
           );
+        }
+        if (prompt) {
+          const policyRes = checkIslandContentPolicy(prompt);
+          if (!policyRes.allowed) {
+            return jsonResponse(request, { ok: false, error: policyRes.reason }, 400);
+          }
         }
 
         const id = await resolveVisitorIdentity(request, env);
@@ -420,6 +494,8 @@ export default {
             blueprint: bp,
             promptText: prompt,
             apiKey: env.GEMINI_API_KEY,
+            hydrogenModel: env.HYDROGEN_MODEL,
+            hydrogenModels: env.HYDROGEN_MODELS,
             primaryModel: env.ARGON_MODEL,
             bariumModels: env.BARIUM_MODELS,
             fallbackModel: env.FALLBACK_MODEL,

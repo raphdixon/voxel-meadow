@@ -28,9 +28,12 @@ export const DEFAULT_HYDROGEN_MODELS = [
   "hydrogen-l-high-0p50",
   "hydrogen-l-high-0p30",
   "hydrogen-l-high-0p10",
+  "hydrogen-k",
+  "hydrogen-j",
+  "hydrogen-h",
   "hydrogen-g",
   "hydrogen-f",
-  "hydrogen-j",
+  "gemini-4-hydrogen",
 ] as const;
 
 export const DEFAULT_ARGON_MODELS = ["gemini-4-argon", "gemini-4-argon-eap"] as const;
@@ -51,19 +54,35 @@ export const DEFAULT_BARIUM_FALLBACK_MODELS = [
 
 export const DEFAULT_GEMINI_SAFETY_NET_MODELS = [
   "gemini-3.8-flash",
+  "gemini-flash-latest",
   "gemini-3.1-pro-preview",
   "gemini-3.7-flash",
   "gemini-3.6-flash",
+  "gemini-3.1-flash-lite",
+  "gemini-2.5-pro",
+  "gemini-2.5-flash",
 ] as const;
 
 const MODEL_ID_RE = /^[a-zA-Z0-9._-]+$/;
-const HYDROGEN_MODEL_RE = /^hydrogen(?:$|[-_.])/i;
-const SPECULATIVE_HYDROGEN_RE = /^hydrogen-(?:[fgj](?:$|[-_.])|.*(?:preview|exp))/i;
+const HYDROGEN_MODEL_RE = /^(?:hydrogen|gemini-[0-9.]+-hydrogen)(?:$|[-_.])/i;
+const BARIUM_MODEL_RE = /^barium(?:$|[-_.])/i;
+const MODERN_NO_BUDGET_MODEL_RE = /^gemini-(?:4|3\.8)(?:$|[-_.])/i;
+const SPECULATIVE_HYDROGEN_RE = /^(?:hydrogen-(?:[fghjk](?:$|[-_.])|.*(?:preview|exp))|gemini-[0-9.]+-hydrogen)/i;
 const SPECULATIVE_BARIUM_RE = /^barium-(bb|a|cc)/i;
 
 export function isHydrogenModel(model: string): boolean {
   const clean = String(model ?? "").trim().replace(/^models\//, "");
   return HYDROGEN_MODEL_RE.test(clean);
+}
+
+function isBariumModel(model: string): boolean {
+  const clean = String(model ?? "").trim().replace(/^models\//, "");
+  return BARIUM_MODEL_RE.test(clean);
+}
+
+function isModernNoBudgetModel(model: string): boolean {
+  const clean = String(model ?? "").trim().replace(/^models\//, "");
+  return MODERN_NO_BUDGET_MODEL_RE.test(clean);
 }
 
 interface ModelHealthEntry {
@@ -78,11 +97,24 @@ const modelHealthMap = new Map<string, ModelHealthEntry>();
 const MAX_HEALTH_ENTRIES = 128;
 
 interface DiscoveredHydrogenCache {
+  keyHash: string;
   models: string[];
+  allModels: Set<string>;
   fetchedAt: number;
 }
 let discoveredHydrogenCache: DiscoveredHydrogenCache | null = null;
 const DISCOVERY_CACHE_TTL_MS = 5 * 60_000;
+
+function fingerprintApiKey(apiKey: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < apiKey.length; i++) {
+    const c = apiKey.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ (c + i), 0x85ebca6b) >>> 0;
+  }
+  return `${h1.toString(16).padStart(8, "0")}${h2.toString(16).padStart(8, "0")}`;
+}
 
 export function resetModelHealthForTesting(): void {
   modelHealthMap.clear();
@@ -206,24 +238,31 @@ export function sortHydrogenModelsLatestFirst(models: readonly string[]): string
 
 /**
  * Queries `generativelanguage.googleapis.com/v1beta/models` using `x-goog-api-key` header
- * to dynamically discover all `hydrogen*` models available on the API key (including any newly
- * rolled-out Hydrogen generations beyond the static list). Cached for 5 minutes per isolate.
+ * to dynamically discover all `hydrogen*` models AND all supported `generateContent` models
+ * available on the API key. Cached for 5 minutes per isolate.
  */
-export async function discoverHydrogenModelsFromApi(
+async function discoverModelCatalogFromApi(
   apiKey: string,
   opts?: { forceRefresh?: boolean },
-): Promise<string[]> {
+): Promise<{ hydrogenModels: string[]; allModels: Set<string> }> {
   const now = Date.now();
+  const keyHash = fingerprintApiKey(apiKey);
   if (
     !opts?.forceRefresh &&
     discoveredHydrogenCache &&
+    discoveredHydrogenCache.keyHash === keyHash &&
     now - discoveredHydrogenCache.fetchedAt < DISCOVERY_CACHE_TTL_MS
   ) {
-    return discoveredHydrogenCache.models;
+    return {
+      hydrogenModels: discoveredHydrogenCache.models,
+      allModels: discoveredHydrogenCache.allModels,
+    };
   }
 
+  const allFound = new Set<string>();
+  const hydrogenFound = new Set<string>();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 4_500);
+  const timer = setTimeout(() => controller.abort(), 4_200);
   try {
     const res = await fetch(
       "https://generativelanguage.googleapis.com/v1beta/models?pageSize=250",
@@ -237,35 +276,55 @@ export async function discoverHydrogenModelsFromApi(
       },
     );
     clearTimeout(timer);
-    if (!res.ok) return discoveredHydrogenCache?.models ?? [];
-
-    const data = (await res.json()) as {
-      models?: {
-        name?: string;
-        supportedGenerationMethods?: string[];
-      }[];
-    };
-
-    const found = new Set<string>();
-    for (const entry of data.models ?? []) {
-      const clean = String(entry?.name ?? "").trim().replace(/^models\//, "");
-      if (!clean || !MODEL_ID_RE.test(clean) || !isHydrogenModel(clean)) continue;
-      const methods = entry?.supportedGenerationMethods;
-      if (Array.isArray(methods) && methods.length > 0 && !methods.includes("generateContent")) {
-        continue;
+    if (res.ok) {
+      const data = (await res.json()) as {
+        models?: {
+          name?: string;
+          supportedGenerationMethods?: string[];
+        }[];
+      };
+      for (const entry of data.models ?? []) {
+        const clean = String(entry?.name ?? "").trim().replace(/^models\//, "");
+        if (!clean || !MODEL_ID_RE.test(clean)) continue;
+        const methods = entry?.supportedGenerationMethods;
+        if (Array.isArray(methods) && methods.length > 0 && !methods.includes("generateContent")) {
+          continue;
+        }
+        allFound.add(clean);
+        if (isHydrogenModel(clean)) {
+          hydrogenFound.add(clean);
+        }
       }
-      found.add(clean);
     }
-
-    const sorted = sortHydrogenModelsLatestFirst([...found]);
-    if (sorted.length > 0) {
-      discoveredHydrogenCache = { models: sorted, fetchedAt: now };
-    }
-    return sorted;
   } catch {
     clearTimeout(timer);
-    return discoveredHydrogenCache?.models ?? [];
   }
+
+  const sortedHydrogen = sortHydrogenModelsLatestFirst([...hydrogenFound]);
+  if (allFound.size > 0 || sortedHydrogen.length > 0) {
+    discoveredHydrogenCache = {
+      keyHash,
+      models: sortedHydrogen,
+      allModels: allFound,
+      fetchedAt: now,
+    };
+  }
+  const sameKeyCache =
+    discoveredHydrogenCache && discoveredHydrogenCache.keyHash === keyHash
+      ? discoveredHydrogenCache
+      : null;
+  return {
+    hydrogenModels: sortedHydrogen.length > 0 ? sortedHydrogen : (sameKeyCache?.models ?? []),
+    allModels: allFound.size > 0 ? allFound : (sameKeyCache?.allModels ?? new Set()),
+  };
+}
+
+export async function discoverHydrogenModelsFromApi(
+  apiKey: string,
+  opts?: { forceRefresh?: boolean },
+): Promise<string[]> {
+  const catalog = await discoverModelCatalogFromApi(apiKey, opts);
+  return catalog.hydrogenModels;
 }
 
 export function buildGeminiModelCascade(opts?: {
@@ -290,32 +349,24 @@ export function buildGeminiModelCascade(opts?: {
     return out;
   }
 
-  const mode: GeminiCallMode = opts?.mode ?? "sculpt";
   const configuredHydrogen = parseModelList(opts?.hydrogenModels);
   const configuredBarium = parseModelList(opts?.bariumModels);
+  const discoveredHydrogen = discoveredHydrogenCache?.models ?? [];
 
-  const rawOrder: string[] =
-    mode === "sculpt"
-      ? [
-          opts?.hydrogenModel?.trim() || DEFAULT_HYDROGEN_MODELS[0],
-          ...configuredHydrogen,
-          ...DEFAULT_HYDROGEN_MODELS,
-          ...(discoveredHydrogenCache?.models ?? []),
-          opts?.primaryModel?.trim() || DEFAULT_ARGON_MODELS[0],
-          ...DEFAULT_ARGON_MODELS.slice(1),
-          ...configuredBarium,
-          ...DEFAULT_BARIUM_FALLBACK_MODELS,
-          opts?.fallbackModel?.trim() || DEFAULT_GEMINI_SAFETY_NET_MODELS[0],
-          ...DEFAULT_GEMINI_SAFETY_NET_MODELS,
-        ]
-      : [
-          opts?.primaryModel?.trim() || DEFAULT_ARGON_MODELS[0],
-          ...DEFAULT_ARGON_MODELS.slice(1),
-          ...configuredBarium,
-          ...DEFAULT_BARIUM_FALLBACK_MODELS,
-          opts?.fallbackModel?.trim() || DEFAULT_GEMINI_SAFETY_NET_MODELS[0],
-          ...DEFAULT_GEMINI_SAFETY_NET_MODELS,
-        ];
+  // Lead with Hydrogen and fall back through ALL versions of Hydrogen across sculpt, critic, and director modes,
+  // before falling back to Argon, Barium, and Gemini safety-net models.
+  const rawOrder: string[] = [
+    opts?.hydrogenModel?.trim() || DEFAULT_HYDROGEN_MODELS[0],
+    ...configuredHydrogen,
+    ...discoveredHydrogen,
+    ...DEFAULT_HYDROGEN_MODELS,
+    opts?.primaryModel?.trim() || DEFAULT_ARGON_MODELS[0],
+    ...DEFAULT_ARGON_MODELS.slice(1),
+    ...configuredBarium,
+    ...DEFAULT_BARIUM_FALLBACK_MODELS,
+    opts?.fallbackModel?.trim() || DEFAULT_GEMINI_SAFETY_NET_MODELS[0],
+    ...DEFAULT_GEMINI_SAFETY_NET_MODELS,
+  ];
 
   const seen = new Set<string>();
   const deduped: string[] = [];
@@ -613,15 +664,17 @@ function consumeSseLine(rawLine: string, acc: SseAccumulator): void {
 }
 
 function buildGenerationConfig(opts: {
-  temperature: number;
+  temperature?: number;
   maxOutputTokens: number;
   thinking: ThinkingConfigStrategy;
   useJsonMimeType: boolean;
 }): Record<string, unknown> {
   const generationConfig: Record<string, unknown> = {
-    temperature: opts.temperature,
     maxOutputTokens: opts.maxOutputTokens,
   };
+  if (typeof opts.temperature === "number") {
+    generationConfig.temperature = opts.temperature;
+  }
   if (opts.useJsonMimeType) {
     generationConfig.responseMimeType = "application/json";
   }
@@ -659,7 +712,7 @@ async function streamSingleModelAttempt(opts: {
   apiKey: string;
   systemPrompt: string;
   userParts: Record<string, unknown>[];
-  temperature: number;
+  temperature?: number;
   maxOutputTokens: number;
   thinking: ThinkingConfigStrategy;
   useJsonMimeType: boolean;
@@ -827,7 +880,7 @@ async function nonStreamSingleModelAttempt(opts: {
   apiKey: string;
   systemPrompt: string;
   userParts: Record<string, unknown>[];
-  temperature: number;
+  temperature?: number;
   maxOutputTokens: number;
   thinking: ThinkingConfigStrategy;
   useJsonMimeType: boolean;
@@ -919,18 +972,22 @@ async function runResilientModelAttempt(opts: {
   priorTransportDrops: number;
 }): Promise<SingleAttemptOutcome> {
   const hydrogen = isHydrogenModel(opts.model);
-  let maxOutputTokens = hydrogen
-    ? Math.max(opts.requestedMaxOutputTokens, opts.mode === "sculpt" ? 32_768 : 16_384)
-    : opts.requestedMaxOutputTokens;
+  const modernNoBudget = isModernNoBudgetModel(opts.model);
+  let maxOutputTokens =
+    hydrogen || modernNoBudget
+      ? Math.max(opts.requestedMaxOutputTokens, opts.mode === "sculpt" ? 32_768 : 16_384)
+      : opts.requestedMaxOutputTokens;
 
-  // Hydrogen models expose 1,048,576 maxOutputTokens and perform best with native thinking effort
-  // (`includeThoughts: true` without an artificial thinkingBudget cap), which streams thought
-  // summaries in ~2s while preserving full 3D spatial reasoning.
-  let thinking: ThinkingConfigStrategy = hydrogen
-    ? { kind: "native_thoughts" }
-    : opts.requestedThinkingBudget > 0
-      ? { kind: "budget", budget: opts.requestedThinkingBudget }
-      : { kind: "none" };
+  // Hydrogen, Gemini 4, and Gemini 3.8 models use native thinking without `thinkingBudget`
+  // (`thinkingBudget` returns HTTP 400 on `gemini-4-argon` and `gemini-3.8-flash`), and omit
+  // deprecated `temperature` on Gemini 4 / 3.8 models.
+  let thinking: ThinkingConfigStrategy =
+    hydrogen || modernNoBudget
+      ? { kind: "native_thoughts" }
+      : opts.requestedThinkingBudget > 0
+        ? { kind: "budget", budget: opts.requestedThinkingBudget }
+        : { kind: "none" };
+  let temperature: number | undefined = modernNoBudget ? undefined : opts.temperature;
   let useJsonMimeType = true;
 
   let res = await streamSingleModelAttempt({
@@ -938,20 +995,23 @@ async function runResilientModelAttempt(opts: {
     apiKey: opts.apiKey,
     systemPrompt: opts.systemPrompt,
     userParts: opts.userParts,
-    temperature: opts.temperature,
+    temperature,
     maxOutputTokens,
     thinking,
     useJsonMimeType,
     timeouts: opts.timeouts,
   });
 
-  // Self-healing HTTP 400 parameter compatibility retries on the SAME model (up to 2 quick adjustments)
-  for (let compatPass = 0; compatPass < 2 && !res.ok && res.httpStatus === 400 && res.errorBody; compatPass++) {
+  // Self-healing HTTP 400 parameter compatibility retries on the SAME model (up to 3 quick adjustments)
+  for (let compatPass = 0; compatPass < 3 && !res.ok && res.httpStatus === 400 && res.errorBody; compatPass++) {
     const body = res.errorBody;
     let adjusted = false;
 
     if (thinking.kind !== "none" && /thinking|thought/i.test(body)) {
       thinking = { kind: "none" };
+      adjusted = true;
+    } else if (temperature !== undefined && /temperature|sampling/i.test(body)) {
+      temperature = undefined;
       adjusted = true;
     } else if (maxOutputTokens > 16_384 && /max_?output_?tokens|output.*token|token.*limit/i.test(body)) {
       maxOutputTokens = 16_384;
@@ -968,7 +1028,7 @@ async function runResilientModelAttempt(opts: {
       apiKey: opts.apiKey,
       systemPrompt: opts.systemPrompt,
       userParts: opts.userParts,
-      temperature: opts.temperature,
+      temperature,
       maxOutputTokens,
       thinking,
       useJsonMimeType,
@@ -990,7 +1050,7 @@ async function runResilientModelAttempt(opts: {
       apiKey: opts.apiKey,
       systemPrompt: opts.systemPrompt,
       userParts: opts.userParts,
-      temperature: opts.temperature,
+      temperature,
       maxOutputTokens,
       thinking,
       useJsonMimeType,
@@ -998,10 +1058,10 @@ async function runResilientModelAttempt(opts: {
     });
   }
 
-  // If a thinking-heavy Hydrogen response hit MAX_TOKENS truncation, retry once with 65,536 token headroom
+  // If a thinking-heavy response hit MAX_TOKENS truncation, retry once with 65,536 token headroom
   if (
     res.ok &&
-    hydrogen &&
+    (hydrogen || modernNoBudget) &&
     res.finishReason === "MAX_TOKENS" &&
     maxOutputTokens < 65_536
   ) {
@@ -1010,7 +1070,7 @@ async function runResilientModelAttempt(opts: {
       apiKey: opts.apiKey,
       systemPrompt: opts.systemPrompt,
       userParts: opts.userParts,
-      temperature: opts.temperature,
+      temperature,
       maxOutputTokens: 65_536,
       thinking,
       useJsonMimeType,
@@ -1046,6 +1106,16 @@ export async function callGeminiWithFallbacks(opts: {
   attempts: GeminiAttemptRecord[];
 }> {
   const mode: GeminiCallMode = opts.mode ?? "sculpt";
+  if (!opts.overrideModels || opts.overrideModels.length === 0) {
+    await discoverModelCatalogFromApi(opts.apiKey);
+  }
+  const sameKeyCache =
+    discoveredHydrogenCache && discoveredHydrogenCache.keyHash === fingerprintApiKey(opts.apiKey)
+      ? discoveredHydrogenCache
+      : null;
+  const catalogSet = sameKeyCache?.allModels ?? new Set<string>();
+  const discoveredHydrogenSet = new Set(sameKeyCache?.models ?? []);
+
   const baseCascade = buildGeminiModelCascade({
     mode,
     hydrogenModel: opts.hydrogenModel,
@@ -1056,21 +1126,40 @@ export async function callGeminiWithFallbacks(opts: {
     overrideModels: opts.overrideModels,
   });
 
-  // Order within each model family using live circuit-breaker health while strictly keeping ALL
-  // Hydrogen models ahead of any emergency non-Hydrogen safety-net models in `sculpt` mode.
+  // Strictly keep ALL Hydrogen versions ahead of non-Hydrogen safety-net models, prioritizing
+  // live-discovered Hydrogen versions first (when `models.list` reports them) followed by all
+  // remaining Hydrogen versions so every Hydrogen fallback is attempted before stepping down.
   const now = Date.now();
   let models: string[];
   if (opts.overrideModels && opts.overrideModels.length > 0) {
     models = [...baseCascade];
-  } else if (mode === "sculpt") {
-    const hydrogenTier = baseCascade.filter((m) => isHydrogenModel(m));
-    const safetyNetTier = baseCascade.filter((m) => !isHydrogenModel(m));
-    models = [
-      ...orderTierByHealth(hydrogenTier, now),
-      ...orderTierByHealth(safetyNetTier, now),
-    ];
   } else {
-    models = orderTierByHealth(baseCascade, now);
+    const allHydrogenTier = baseCascade.filter((m) => isHydrogenModel(m));
+    const listedHydrogen =
+      discoveredHydrogenSet.size > 0
+        ? allHydrogenTier.filter((m) => discoveredHydrogenSet.has(m))
+        : [];
+    const unlistedHydrogen =
+      discoveredHydrogenSet.size > 0
+        ? allHydrogenTier.filter((m) => !discoveredHydrogenSet.has(m))
+        : allHydrogenTier;
+
+    const orderedHydrogen = [
+      ...orderTierByHealth(listedHydrogen, now),
+      ...orderTierByHealth(unlistedHydrogen, now),
+    ];
+
+    const safetyNetTier = baseCascade.filter((m) => !isHydrogenModel(m));
+    const orderedSafety = orderTierByHealth(safetyNetTier, now);
+    const filteredSafety =
+      catalogSet.size > 0
+        ? [
+            ...orderedSafety.filter((m) => catalogSet.has(m)),
+            ...orderedSafety.filter((m) => !catalogSet.has(m)),
+          ]
+        : orderedSafety;
+
+    models = [...orderedHydrogen, ...filteredSafety];
   }
 
   const userParts: Record<string, unknown>[] = [];
@@ -1110,10 +1199,9 @@ export async function callGeminiWithFallbacks(opts: {
     const model = models[idx];
     if (attemptedSet.has(model)) continue;
 
-    // Before stepping out of the Hydrogen family in `sculpt` mode, dynamically query `v1beta/models`
-    // once in case newer `hydrogen-*` endpoints were added to the API key.
+    // Before stepping out of the Hydrogen family, dynamically query `v1beta/models` once
+    // in case newer `hydrogen-*` versions were mounted on `GEMINI_API_KEY`.
     if (
-      mode === "sculpt" &&
       !opts.overrideModels &&
       !ranDynamicHydrogenDiscovery &&
       !isHydrogenModel(model) &&
@@ -1121,7 +1209,9 @@ export async function callGeminiWithFallbacks(opts: {
     ) {
       ranDynamicHydrogenDiscovery = true;
       const liveHydrogen = await discoverHydrogenModelsFromApi(opts.apiKey, { forceRefresh: true });
-      const unseenHydrogen = liveHydrogen.filter((m) => !attemptedSet.has(m) && !models.slice(idx).includes(m));
+      const unseenHydrogen = liveHydrogen.filter(
+        (m) => !attemptedSet.has(m) && !models.slice(idx).includes(m),
+      );
       if (unseenHydrogen.length > 0) {
         models.splice(idx, 0, ...unseenHydrogen);
         idx--;
@@ -1132,7 +1222,7 @@ export async function callGeminiWithFallbacks(opts: {
     const elapsedTotal = Date.now() - cascadeStart;
 
     // If >=70% of total wall-clock cascade budget is already spent, skip older/speculative aliases
-    // (`hydrogen-f/g/j` or `barium-bb/a/cc`) so active Hydrogen-l / Flash safety-net pools get clean time.
+    // (`hydrogen-f/g/h/j/k` or `barium-bb/a/cc`) so active Hydrogen-l / Flash safety-net pools get clean time.
     if (
       idx > 0 &&
       elapsedTotal > maxCascadeMs * 0.7 &&
@@ -1173,6 +1263,24 @@ export async function callGeminiWithFallbacks(opts: {
         ms: attemptMs,
         reason: res.reason,
       });
+
+      // If the API key itself is rejected as invalid, abort cascade immediately rather than stalling across 25 more models
+      if (res.reason && /API_KEY_INVALID|API key not valid|key not found|invalid api key/i.test(res.reason)) {
+        break;
+      }
+
+      // Never bulk-skip Hydrogen versions when a single Hydrogen variant returns 404/403 —
+      // always allow the cascade to try every remaining Hydrogen version (`hydrogen-l`,
+      // `hydrogen-l-high-*`, `hydrogen-k/j/h/g/f`, etc.) before stepping down to non-Hydrogen fallbacks.
+      const isHardUnavail =
+        res.httpStatus === 404 ||
+        res.httpStatus === 403 ||
+        /model not found|not_found|permission_denied|not supported for generatecontent/i.test(res.reason);
+      if (isHardUnavail && !opts.overrideModels && isBariumModel(model) && !catalogSet.has(model)) {
+        for (let k = idx + 1; k < models.length; k++) {
+          if (isBariumModel(models[k])) attemptedSet.add(models[k]);
+        }
+      }
 
       // Short jittered pause on 429 / 503 spikes to desynchronize burst retries across Hydrogen pools
       if (

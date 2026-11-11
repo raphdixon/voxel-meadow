@@ -188,7 +188,7 @@
 
     <!-- Contextual First-Person Interaction Prompt -->
     <button type="button" id="interact-prompt" class="interact-prompt" hidden>
-      <kbd id="interact-key" class="interact-key">F</kbd><span id="interact-label">Enter</span>
+      <kbd id="interact-key" class="interact-key">E</kbd><span id="interact-label">Enter</span>
     </button>
 
     <!-- Bottom-Anchored Explore & Build Dock (never blocks the 3D meadow) -->
@@ -251,7 +251,10 @@
       <!-- 4. Building in background pill -->
       <div id="building-pill" class="dock-pill dock-pill-building" role="status" aria-live="polite" hidden>
         <span class="pill-spinner" aria-hidden="true"></span>
-        <span id="building-pill-label">Building…</span>
+        <div class="building-pill-copy">
+          <span id="building-pill-label">Approving query…</span>
+          <span id="building-pill-sub" class="building-pill-sub">Being built with Gemini 4 Hydrogen</span>
+        </div>
       </div>
 
       <!-- 5. Ready -> Click to fly camera to it -->

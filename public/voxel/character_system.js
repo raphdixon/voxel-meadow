@@ -1030,6 +1030,7 @@ export function buildCharacterAvatarRig(appearance, options = {}) {
   let smoothLeftArmRx = 0;
   let smoothLeftArmRz = 0;
   let smoothRightArmRx = 0;
+  let smoothRightArmRy = 0;
   let smoothRightArmRz = 0;
 
   function rebuildParts(cleanApp) {
@@ -1159,6 +1160,7 @@ export function buildCharacterAvatarRig(appearance, options = {}) {
     let goalLArmRx = 0;
     let goalLArmRz = 0.04;
     let goalRArmRx = 0;
+    let goalRArmRy = 0;
     let goalRArmRz = -0.04;
 
     if (isSeated) {
@@ -1214,9 +1216,11 @@ export function buildCharacterAvatarRig(appearance, options = {}) {
     if (isWaving) {
       const waveOsc = Math.sin(t * 11.5);
       if (fpMode) {
-        // Bring waving hand comfortably into lower-right peripheral view
-        goalRArmRx = -2.02 + Math.cos(t * 11.5) * 0.08;
-        goalRArmRz = -0.18 + waveOsc * 0.26;
+        // Bring waving hand clearly into lower-right first-person view and wag side-to-side
+        const pitchFollow = Math.max(-0.45, Math.min(0.45, Number(pitch) || 0)) * 0.65;
+        goalRArmRx = -1.92 - pitchFollow + Math.cos(t * 11.5) * 0.06;
+        goalRArmRy = 0.28 + waveOsc * 0.22;
+        goalRArmRz = -0.08 + waveOsc * 0.22;
       } else {
         goalRArmRx = -2.55;
         goalRArmRz = -0.3 + waveOsc * 0.32;
@@ -1231,13 +1235,14 @@ export function buildCharacterAvatarRig(appearance, options = {}) {
     smoothLeftArmRx += (goalLArmRx - smoothLeftArmRx) * blend;
     smoothLeftArmRz += (goalLArmRz - smoothLeftArmRz) * blend;
     smoothRightArmRx += (goalRArmRx - smoothRightArmRx) * blend;
+    smoothRightArmRy += (goalRArmRy - smoothRightArmRy) * blend;
     smoothRightArmRz += (goalRArmRz - smoothRightArmRz) * blend;
 
     torsoPivot.rotation.x = smoothTorsoRx;
     leftLeg.rotation.x = smoothLeftLegRx;
     rightLeg.rotation.x = smoothRightLegRx;
     leftArm.rotation.set(smoothLeftArmRx, 0, smoothLeftArmRz);
-    rightArm.rotation.set(smoothRightArmRx, 0, smoothRightArmRz);
+    rightArm.rotation.set(smoothRightArmRx, smoothRightArmRy, smoothRightArmRz);
 
     const legZ = fpMode ? 0.05 * (s / 0.145) : 0;
     leftLeg.position.z = legZ;

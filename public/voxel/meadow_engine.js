@@ -37,6 +37,16 @@ import {
   getWorldVoxelSize,
   mergeVoxelMeshInstances,
 } from "./vox.js";
+import {
+  computeProactiveTrafficControl,
+  computeVehicleHullExtents,
+  createVehiclePhysicsState,
+  getBuildingTightBox,
+  planVehicleTurnaround,
+  pushPointOutOfVehicleOBB,
+  stepVehicleTurnaround,
+  stepWorldVehiclePhysicsPass,
+} from "./vehicle_physics.js";
 
 const CITY_SIGN_POS = [3.8, -10.8];
 const CITY_SIGN_YAW = 0.62;
@@ -386,13 +396,318 @@ function createContributorSignboard(maxAniso = 4) {
     tex.needsUpdate = true;
   }
 
+  let targetCount = 0;
+  let animFrom = 0;
+  let animElapsed = 0;
+  let animDuration = 0.88;
+  let animActive = false;
+
+  function setTargetCount(nextCount, immediate = false) {
+    const target = Math.max(0, Math.round(Number(nextCount) || 0));
+    targetCount = target;
+    if (immediate || renderedCount < 0 || Math.abs(target - renderedCount) <= 1) {
+      animActive = false;
+      updateCount(target);
+      return;
+    }
+    animFrom = renderedCount;
+    animElapsed = 0;
+    animDuration = renderedCount === 0 ? 0.92 : 0.48;
+    animActive = true;
+  }
+
+  function stepCount(dt, canStart = true) {
+    if (!animActive || !canStart) return;
+    animElapsed += dt;
+    const p = Math.min(1, animElapsed / Math.max(0.1, animDuration));
+    const eased = 1 - Math.pow(1 - p, 2.5);
+    const cur = p >= 1 ? targetCount : Math.round(animFrom + (targetCount - animFrom) * eased);
+    updateCount(cur);
+    if (p >= 1) {
+      animActive = false;
+    }
+  }
+
   updateCount(0);
   group.position.set(CITY_SIGN_POS[0], 0, CITY_SIGN_POS[1]);
   group.position.y = 0;
   group.rotation.y = CITY_SIGN_YAW;
   group.userData.creationId = "__city_sign__";
 
-  return { group, updateCount };
+  return { group, updateCount, setTargetCount, stepCount };
+}
+
+const SKY_BANNER_GLYPHS = {
+  G: [
+    ".#####.",
+    "#######",
+    "##...##",
+    "##.....",
+    "##.....",
+    "##..###",
+    "##..###",
+    "##...##",
+    "##...##",
+    "#######",
+    ".#####.",
+  ],
+  E: [
+    "#######",
+    "#######",
+    "##.....",
+    "##.....",
+    "######.",
+    "######.",
+    "##.....",
+    "##.....",
+    "##.....",
+    "#######",
+    "#######",
+  ],
+  M: [
+    "##.....##",
+    "###...###",
+    "####.####",
+    "#########",
+    "##.###.##",
+    "##..#..##",
+    "##.....##",
+    "##.....##",
+    "##.....##",
+    "##.....##",
+    "##.....##",
+  ],
+  I: [
+    "######",
+    "######",
+    "..##..",
+    "..##..",
+    "..##..",
+    "..##..",
+    "..##..",
+    "..##..",
+    "..##..",
+    "######",
+    "######",
+  ],
+  N: [
+    "##....##",
+    "###...##",
+    "####..##",
+    "####..##",
+    "##.##.##",
+    "##.##.##",
+    "##.##.##",
+    "##..####",
+    "##..####",
+    "##...###",
+    "##....##",
+  ],
+  S: [
+    ".#####.",
+    "#######",
+    "##...##",
+    "###....",
+    ".####..",
+    ".#####.",
+    "..####.",
+    "....###",
+    "##...##",
+    "#######",
+    ".#####.",
+  ],
+  L: [
+    "##.....",
+    "##.....",
+    "##.....",
+    "##.....",
+    "##.....",
+    "##.....",
+    "##.....",
+    "##.....",
+    "##.....",
+    "#######",
+    "#######",
+  ],
+  A: [
+    "..####..",
+    ".######.",
+    "##....##",
+    "##....##",
+    "##....##",
+    "########",
+    "########",
+    "##....##",
+    "##....##",
+    "##....##",
+    "##....##",
+  ],
+  D: [
+    "#####..",
+    "######.",
+    "##...##",
+    "##...##",
+    "##...##",
+    "##...##",
+    "##...##",
+    "##...##",
+    "##...##",
+    "######.",
+    "#####..",
+  ],
+};
+
+function createFloatingSkyBanner() {
+  const group = new THREE.Group();
+  const text = "GEMINISLAND";
+  const voxScale = 0.56;
+  const letterGapCols = 2.1;
+
+  // Curated Hollywood-sign-meets-sky-whimsy vertical & depth stagger per letter
+  const staggerOffsetsY = [0.72, -0.82, 1.08, -0.56, 0.88, -0.94, 0.66, -0.78, 1.12, -0.58, 0.82];
+  const staggerOffsetsZ = [0.35, -0.42, 0.48, -0.28, 0.38, -0.46, 0.32, -0.38, 0.44, -0.32, 0.36];
+  const baseRolls = [-0.038, 0.032, -0.026, 0.041, -0.03, 0.036, -0.034, 0.028, -0.036, 0.031, -0.028];
+  const baseYaws = [0.04, -0.025, 0.03, -0.032, 0.024, -0.028, 0.032, -0.024, 0.028, -0.03, 0.036];
+
+  const chars = text.split("");
+  let totalCols = 0;
+  for (let i = 0; i < chars.length; i++) {
+    const rows = SKY_BANNER_GLYPHS[chars[i]];
+    totalCols += rows[0].length + (i < chars.length - 1 ? letterGapCols : 0);
+  }
+
+  const letters = [];
+  let cursorCol = -totalCols * 0.5;
+
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    const rows = SKY_BANNER_GLYPHS[ch];
+    const hRows = rows.length;
+    const wCols = rows[0].length;
+    const v = new Vox(1700 + i * 37);
+
+    const xOff = -wCols * 0.5;
+    const yOff = -hRows * 0.5;
+
+    for (let r = 0; r < hRows; r++) {
+      const rowStr = rows[r];
+      const vy = Math.round(yOff + (hRows - 1 - r));
+      const isTopCap = r === 0 || (r > 0 && rows[r - 1] !== undefined);
+      for (let c = 0; c < wCols; c++) {
+        if (rowStr[c] !== "#") continue;
+        const vx = Math.round(xOff + c);
+        const openAbove = r === 0 || rows[r - 1][c] !== "#";
+        const faceCol = openAbove ? "snow" : r >= hRows - 2 ? "cream" : "white";
+        v.put(vx, vy, 1, faceCol, openAbove ? 0.08 : 0.03);
+        v.put(vx, vy, 0, "gold", openAbove && isTopCap ? 0.14 : 0.04);
+        v.put(vx, vy, -1, "marble", 0.02);
+      }
+    }
+
+    const mesh = buildVoxelMesh(v, {
+      scale: voxScale,
+      jitter: 0.024,
+      castShadow: false,
+      receiveShadow: false,
+    });
+    mesh.raycast = () => {};
+
+    const holder = new THREE.Group();
+    holder.add(mesh);
+
+    const centerCol = cursorCol + wCols * 0.5;
+    cursorCol += wCols + letterGapCols;
+
+    const u = chars.length > 1 ? (i / (chars.length - 1)) * 2 - 1 : 0;
+    const archY = (1 - u * u) * 1.15;
+    const archZ = -u * u * 1.35;
+    const baseX = centerCol * voxScale;
+    const baseY = archY + staggerOffsetsY[i % staggerOffsetsY.length];
+    const baseZ = archZ + staggerOffsetsZ[i % staggerOffsetsZ.length];
+    const baseRoll = baseRolls[i % baseRolls.length];
+    const baseYaw = baseYaws[i % baseYaws.length] - u * 0.055;
+
+    holder.position.set(baseX, baseY, baseZ);
+    holder.rotation.set(0, baseYaw, baseRoll);
+    group.add(holder);
+
+    letters.push({
+      holder,
+      baseX,
+      baseY,
+      baseZ,
+      baseRoll,
+      baseYaw,
+      phase: i * 0.78 + (i % 3) * 0.42,
+    });
+  }
+
+  // Subtle whimsical drifting voxel cloudlet puffs accompanying the sky banner
+  const cloudSeeds = [
+    { x: -27.5, y: -3.7, z: 1.6, scale: 0.46, phase: 0.4 },
+    { x: -13.2, y: -4.2, z: -1.8, scale: 0.4, phase: 2.1 },
+    { x: 1.4, y: -3.9, z: 1.7, scale: 0.48, phase: 3.7 },
+    { x: 15.8, y: -4.1, z: -1.5, scale: 0.42, phase: 5.0 },
+    { x: 28.0, y: -3.6, z: 1.4, scale: 0.45, phase: 1.3 },
+  ];
+  const clouds = [];
+  cloudSeeds.forEach((cs, idx) => {
+    const cv = new Vox(1920 + idx * 29);
+    cv.sphere(0, 0, 0, 4.2, 2.0, 2.4, "white", 0.04);
+    cv.sphere(-2.6, -0.3, 0.3, 2.8, 1.5, 1.9, "snow", 0.04);
+    cv.sphere(2.7, -0.2, -0.2, 3.0, 1.6, 2.0, "cream", 0.03);
+    cv.clear(-9, -5, -6, 9, -1, 6);
+    const cMesh = buildVoxelMesh(cv, {
+      scale: cs.scale,
+      jitter: 0.04,
+      castShadow: false,
+      receiveShadow: false,
+    });
+    cMesh.raycast = () => {};
+    cMesh.position.set(cs.x, cs.y, cs.z);
+    group.add(cMesh);
+    clouds.push({ mesh: cMesh, ...cs });
+  });
+
+  const anchorX = -48;
+  const anchorY = 31.5;
+  const anchorZ = -95;
+  const anchorYaw = 0.55;
+
+  group.position.set(anchorX, anchorY, anchorZ);
+  group.rotation.y = anchorYaw;
+
+  function step(t) {
+    // Gentle slow island-sky drift on the whole banner + independent subtle letter float
+    group.position.x = anchorX + Math.sin(t * 0.13) * 0.95;
+    group.position.y = anchorY + Math.cos(t * 0.17) * 0.42;
+    group.position.z = anchorZ + Math.sin(t * 0.11 + 1.2) * 0.65;
+
+    for (let i = 0; i < letters.length; i++) {
+      const L = letters[i];
+      const ph = L.phase;
+      const dy = Math.sin(t * 0.58 + ph) * 0.48 + Math.sin(t * 0.29 + ph * 1.6) * 0.22;
+      const dx = Math.cos(t * 0.36 + ph * 0.9) * 0.14;
+      const dz = Math.sin(t * 0.33 + ph * 1.15) * 0.2;
+      L.holder.position.set(L.baseX + dx, L.baseY + dy, L.baseZ + dz);
+      L.holder.rotation.set(
+        Math.cos(t * 0.41 + ph) * 0.026,
+        L.baseYaw + Math.sin(t * 0.31 + ph * 0.8) * 0.032,
+        L.baseRoll + Math.sin(t * 0.46 + ph * 1.1) * 0.03,
+      );
+    }
+
+    for (let i = 0; i < clouds.length; i++) {
+      const C = clouds[i];
+      C.mesh.position.set(
+        C.x + Math.sin(t * 0.24 + C.phase) * 0.75,
+        C.y + Math.cos(t * 0.42 + C.phase) * 0.34,
+        C.z + Math.sin(t * 0.28 + C.phase * 1.3) * 0.3,
+      );
+    }
+  }
+
+  return { group, step };
 }
 
 function buildPlotMarkerGroup() {
@@ -1262,25 +1577,31 @@ function computeRouteBuildingDetour(posX, posZ, rightX, rightZ, baseLane, buildi
     const other = buildingEntities[i];
     if (other === selfEnt) continue;
     if (other.data.category !== "building" && other.data.behavior?.type !== "landmark") continue;
-    const clearR = (other.footprintRadius || 3.8) + 2.25;
+    const box = getBuildingTightBox(other, 0.78);
+    const maxHalf = Math.max(box.halfX, box.halfZ);
+    const clearPad = 0.88;
     const dx = other.x - posX;
     const dz = other.z - posZ;
-    if (Math.abs(dx) > clearR + 4.5 || Math.abs(dz) > clearR + 4.5) continue;
-    const centerDist = Math.hypot(dx, dz);
-    if (centerDist > clearR + 4.5) continue;
+    if (Math.abs(dx) > maxHalf + 4.2 || Math.abs(dz) > maxHalf + 4.2) continue;
 
     const candX = posX + rightX * (baseLane + extraOffset);
     const candZ = posZ + rightZ * (baseLane + extraOffset);
-    const candDist = Math.hypot(candX - other.x, candZ - other.z);
-    if (candDist >= clearR) continue;
+    const bYaw = other.yaw || 0;
+    const bFx = Math.sin(bYaw);
+    const bFz = Math.cos(bYaw);
+    const bRx = -bFz;
+    const bRz = bFx;
+    const cdx = candX - other.x;
+    const cdz = candZ - other.z;
+    const lR = Math.abs(cdx * bRx + cdz * bRz) - box.halfX;
+    const lF = Math.abs(cdx * bFx + cdz * bFz) - box.halfZ;
+    const boxDist = lR > 0 && lF > 0 ? Math.hypot(lR, lF) : Math.max(lR, lF);
+    if (boxDist >= clearPad) continue;
 
-    // Project obstacle position onto route normal (`rightX, rightZ`) and steer cleanly around the open side
     const obsLat = dx * rightX + dz * rightZ;
-    const fwdSq = Math.max(0, centerDist * centerDist - obsLat * obsLat);
-    const reqLatSep = Math.sqrt(Math.max(0.25, clearR * clearR - fwdSq));
+    const pen = clearPad - boxDist;
     const pushRight = obsLat - baseLane <= 0;
-    const desiredLane = pushRight ? obsLat + reqLatSep : obsLat - reqLatSep;
-    const needed = Math.max(-6.5, Math.min(6.5, desiredLane - baseLane));
+    const needed = Math.max(-1.65, Math.min(1.65, extraOffset + (pushRight ? pen : -pen)));
     if (Math.abs(needed) > Math.abs(extraOffset)) {
       extraOffset = needed;
     }
@@ -1347,23 +1668,30 @@ class CreationSimEntity {
     this.feedMesh = null;
 
     this.routeCurve = null;
+    this.routeSignature = "";
     this.routeClosed = true;
     this.routeDir = 1;
     this.routeLength = 1;
     this.routeDist = (index * 37.3) % 120;
-    this.effectiveSpeed = splitGroups ? 8.4 : null;
+    this.effectiveSpeed = splitGroups ? 5.45 : null;
     this.deBunchedOnce = false;
+    this.hasSteppedOnce = false;
     this.stopArcPositions = [];
     this.dwellingStop = null;
     this.dwellTimer = 0;
     this.lastStoppedId = null;
-    this.currentLaneOffset = 0.92;
+    this.currentLaneOffset = splitGroups ? 0.68 : 1.12;
     this.buildingDetourOffset = 0;
     this.smoothVelX = Math.sin(this.yaw);
     this.smoothVelZ = Math.cos(this.yaw);
     this.yieldTimer = 0;
     this.doorX = this.x;
     this.doorZ = this.z;
+    this.phys = createVehiclePhysicsState(index);
+    const initHull = computeVehicleHullExtents(creation, worldUnit, false, this.isDualTransit);
+    this.phys.hw = initHull.hw;
+    this.phys.hl = initHull.hl;
+    this.phys.mass = initHull.mass;
 
     this.flightCurve = null;
     this.flightLength = 1;
@@ -1411,6 +1739,16 @@ class CreationSimEntity {
   createSecondaryVehicleState(secGroup) {
     secGroup.rotation.order = "YXZ";
     secGroup.userData.creationId = this.id;
+    const secPhys = createVehiclePhysicsState(this.index + 31);
+    const secHull = computeVehicleHullExtents(
+      this.data,
+      getWorldVoxelSize(this.data?.scaleClass),
+      true,
+      true,
+    );
+    secPhys.hw = secHull.hw;
+    secPhys.hl = secHull.hl;
+    secPhys.mass = secHull.mass;
     return {
       group: secGroup,
       x: this.data?.x || 0,
@@ -1421,13 +1759,14 @@ class CreationSimEntity {
       routeDist: 0,
       routeDir: -1,
       initializedDist: false,
-      currentLaneOffset: 1.18,
+      currentLaneOffset: 1.24,
       buildingDetourOffset: 0,
       wheelAngle: 0,
       moveFactor: 1,
       dwellingStop: null,
       dwellTimer: 0,
       lastStoppedId: null,
+      phys: secPhys,
     };
   }
 
@@ -1519,7 +1858,7 @@ class CreationSimEntity {
         : null;
       if (splitGroups) {
         this.group = splitGroups.leftGroup;
-        this.effectiveSpeed = 8.4;
+        this.effectiveSpeed = 5.45;
         this.secondaryVehicle = this.createSecondaryVehicleState(splitGroups.rightGroup);
         creationsGroup.add(this.secondaryVehicle.group);
       } else {
@@ -1553,42 +1892,96 @@ class CreationSimEntity {
       this.footprintRadius = Math.max(this.footprintRadius, this.interactive.extraRadius);
     }
     const b = creation.behavior;
+    const rebuildVoxUnit = getWorldVoxelSize(creation.scaleClass);
+    const nextHull = computeVehicleHullExtents(creation, rebuildVoxUnit, false, this.isDualTransit);
+    this.phys.hw = nextHull.hw;
+    this.phys.hl = nextHull.hl;
+    this.phys.mass = nextHull.mass;
+    if (this.secondaryVehicle?.phys) {
+      const secHull = computeVehicleHullExtents(creation, rebuildVoxUnit, true, true);
+      this.secondaryVehicle.phys.hw = secHull.hw;
+      this.secondaryVehicle.phys.hl = secHull.hl;
+      this.secondaryVehicle.phys.mass = secHull.mass;
+    }
+
+    const hadRoute = Boolean(this.routeCurve);
     const isPingPong = b?.loopMode === "pingpong";
     const minRouteWps = isPingPong ? 2 : 3;
     if (b?.type === "vehicle_route" && Array.isArray(b.waypoints) && b.waypoints.length >= minRouteWps) {
-      const vecs = b.waypoints.map(([wx, wz]) => new THREE.Vector3(wx, 0, wz));
-      this.routeClosed = !isPingPong;
-      this.routeCurve = new THREE.CatmullRomCurve3(vecs, this.routeClosed, "centripetal", 0.5);
-      this.routeLength = Math.max(4, this.routeCurve.getLength());
-      this.routeDist = this.routeClosed
-        ? this.routeDist % this.routeLength
-        : Math.max(0.2, Math.min(this.routeLength - 0.2, this.routeDist % this.routeLength));
-      if (this.secondaryVehicle && !this.secondaryVehicle.initializedDist) {
-        this.secondaryVehicle.routeDist = this.routeClosed
-          ? (this.routeDist + this.routeLength * 0.5) % this.routeLength
-          : Math.max(0.4, this.routeLength * 0.82);
-        this.secondaryVehicle.routeDir = -1;
-        this.secondaryVehicle.initializedDist = true;
-      }
-
-      const samples = 160;
-      this.stopArcPositions = (b.stops || []).map((stop) => {
-        let bestU = 0;
-        let bestD = Infinity;
-        for (let i = 0; i <= samples; i++) {
-          const u = i / samples;
-          const pt = this.routeCurve.getPointAt(u);
-          const d = Math.hypot(pt.x - stop.x, pt.z - stop.z);
-          if (d < bestD) {
-            bestD = d;
-            bestU = u;
-          }
-        }
-        return { stop, distOnCurve: bestU * this.routeLength };
+      const nextRouteSig = JSON.stringify({
+        loopMode: b.loopMode || "loop",
+        waypoints: b.waypoints,
+        stops: b.stops || [],
       });
+
+      // Preserve active driving pose, routeDist, and any ongoing turnaround untouched if route geometry did not change!
+      if (!hadRoute || nextRouteSig !== this.routeSignature) {
+        this.routeSignature = nextRouteSig;
+        const vecs = b.waypoints.map(([wx, wz]) => new THREE.Vector3(wx, 0, wz));
+        this.routeClosed = !isPingPong;
+        this.routeCurve = new THREE.CatmullRomCurve3(vecs, this.routeClosed, "centripetal", 0.5);
+        this.routeLength = Math.max(4, this.routeCurve.getLength());
+
+        const samples = 160;
+        this.stopArcPositions = (b.stops || []).map((stop) => {
+          let bestU = 0;
+          let bestD = Infinity;
+          for (let i = 0; i <= samples; i++) {
+            const u = i / samples;
+            const pt = this.routeCurve.getPointAt(u);
+            const d = Math.hypot(pt.x - stop.x, pt.z - stop.z);
+            if (d < bestD) {
+              bestD = d;
+              bestU = u;
+            }
+          }
+          return { stop, distOnCurve: bestU * this.routeLength };
+        });
+
+        if (hadRoute) {
+          // Grounded local re-projection onto updated nearby curve — NEVER teleport (x, z, yaw)!
+          let bestU = 0;
+          let bestD = Infinity;
+          for (let s = 0; s <= 160; s++) {
+            const u = s / 160;
+            const pt = this.routeCurve.getPointAt(u);
+            const d = Math.hypot(pt.x - this.x, pt.z - this.z);
+            if (d < bestD) {
+              bestD = d;
+              bestU = u;
+            }
+          }
+          const targetDist = this.routeClosed
+            ? bestU * this.routeLength
+            : Math.max(0.8, Math.min(this.routeLength - 0.8, bestU * this.routeLength));
+          this.routeDist = targetDist;
+          if (!this.routeClosed) {
+            const tan = this.routeCurve.getTangentAt(bestU);
+            const curFx = Math.sin(this.yaw);
+            const curFz = Math.cos(this.yaw);
+            this.routeDir = curFx * tan.x + curFz * tan.z >= 0 ? 1 : -1;
+          }
+          this.y = 0.092;
+        } else {
+          this.routeDist = this.routeClosed
+            ? this.routeDist % this.routeLength
+            : Math.max(0.8, Math.min(this.routeLength - 0.8, this.routeDist % this.routeLength));
+          if (this.secondaryVehicle && !this.secondaryVehicle.initializedDist) {
+            this.secondaryVehicle.routeDist = this.routeClosed
+              ? (this.routeDist + this.routeLength * 0.5) % this.routeLength
+              : Math.max(0.8, this.routeLength * 0.82);
+            this.secondaryVehicle.routeDir = -1;
+            this.secondaryVehicle.initializedDist = true;
+          }
+          this.syncVehiclePoseToRoute();
+        }
+      }
     } else {
       this.routeCurve = null;
+      this.routeSignature = "";
       this.dwellingStop = null;
+      this.phys.turnState = null;
+      this.phys.pendingTurnAtEnd = null;
     }
 
     if (b?.type === "fly_circle" && Array.isArray(b.waypoints) && b.waypoints.length >= 3) {
@@ -1637,7 +2030,7 @@ class CreationSimEntity {
       for (const other of allEntities) {
         if (other === this) continue;
         if (other.data.category !== "building" && other.data.behavior?.type !== "landmark") continue;
-        const br = (other.footprintRadius || 4.0) + selfPad + 1.25;
+        const br = (other.footprintRadius || 3.4) * 0.76 + selfPad + 0.65;
         const dx = tx - other.x;
         const dz = tz - other.z;
         const d = Math.hypot(dx, dz);
@@ -1647,126 +2040,438 @@ class CreationSimEntity {
           tz = other.z + Math.sin(ang) * br;
         }
       }
-      [tx, tz] = clampPointToIsland(tx, tz, selfPad + 2.4);
+      [tx, tz] = clampPointToIsland(tx, tz, selfPad + 2.0);
     }
     return [tx, tz];
   }
 
-  stepSecondaryVehicle(dt, t, allEntities, popEase) {
-    const sv = this.secondaryVehicle;
-    if (!sv || !this.routeCurve) return;
+  syncVehiclePoseToRoute() {
+    if (!this.routeCurve) return;
+    const syncUnit = (veh, baseLane) => {
+      const u = this.routeClosed
+        ? (((veh.routeDist % this.routeLength) + this.routeLength) % this.routeLength) /
+          this.routeLength
+        : Math.max(0.004, Math.min(0.996, veh.routeDist / this.routeLength));
+      const pos = this.routeCurve.getPointAt(u);
+      const tan = this.routeCurve.getTangentAt(u);
+      const dirSign = this.routeClosed ? 1 : veh.routeDir || 1;
+      const yaw = Math.atan2(tan.x * dirSign, tan.z * dirSign);
+      const rightX = -Math.cos(yaw);
+      const rightZ = Math.sin(yaw);
+      veh.currentLaneOffset = baseLane;
+      veh.x = pos.x + rightX * baseLane;
+      veh.z = pos.z + rightZ * baseLane;
+      veh.y = 0.092;
+      veh.yaw = yaw;
+      if (veh === this) {
+        this.smoothVelX = Math.sin(yaw);
+        this.smoothVelZ = Math.cos(yaw);
+      }
+      if (veh.phys) {
+        veh.phys.turnState = null;
+        veh.phys.pendingTurnAtEnd = null;
+        veh.phys.currentSpeed = 0;
+        veh.phys.frameStartX = veh.x;
+        veh.phys.frameStartZ = veh.z;
+        veh.phys.anchorX = veh.x;
+        veh.phys.anchorZ = veh.z;
+      }
+    };
+    syncUnit(this, this.isDualTransit ? 0.68 : 1.12);
+    if (this.secondaryVehicle) {
+      syncUnit(this.secondaryVehicle, 1.24);
+    }
+  }
 
-    let targetLane = 1.22;
-    if (sv.dwellingStop) {
-      const isTurn = sv.dwellingStop.id === "__turn_end__" || sv.dwellingStop.id === "__turn_start__";
-      targetLane = isTurn ? 1.05 : 1.72;
-      sv.dwellTimer -= dt;
-      sv.moveFactor = 0;
-      if (sv.dwellTimer <= 0) {
-        sv.lastStoppedId = sv.dwellingStop.id;
-        sv.dwellingStop = null;
-      }
-    } else {
-      let speedScale = 1.0;
-      let pullingOver = false;
-      for (const sp of this.stopArcPositions) {
-        let ahead = this.routeClosed
-          ? sp.distOnCurve - sv.routeDist
-          : (sp.distOnCurve - sv.routeDist) * sv.routeDir;
-        if (this.routeClosed) {
-          if (ahead < -this.routeLength * 0.5) ahead += this.routeLength;
-          if (ahead > this.routeLength * 0.5) ahead -= this.routeLength;
-        }
-        if (Math.abs(ahead) > 4.2 && sv.lastStoppedId === sp.stop.id) {
-          sv.lastStoppedId = null;
-        }
-        if (sp.stop.id !== sv.lastStoppedId && ahead >= -0.4 && ahead < 4.6) {
-          pullingOver = true;
-          speedScale = Math.max(0.28, ahead / 4.6);
-          if (ahead <= 0.45) {
-            sv.routeDist = sp.distOnCurve;
-            sv.dwellingStop = sp.stop;
-            sv.dwellTimer = Math.min(2.0, sp.stop.dwellSec || 1.6);
-            if (!this.routeClosed) {
-              if (sv.routeDir > 0 && sp.distOnCurve >= this.routeLength - 2.2) sv.routeDir = -1;
-              else if (sv.routeDir < 0 && sp.distOnCurve <= 2.2) sv.routeDir = 1;
-            }
-            speedScale = 0;
-            break;
-          }
-        }
-      }
-      if (pullingOver) targetLane = 1.68;
+  stepVehicleUnitKinematics(veh, isSecondary, dt, t, vehiclePeers, buildingPeers, ponds) {
+    if (!this.routeCurve) return;
+    this.hasSteppedOnce = true;
 
-      // Pull slightly to the outer curb when the express Waratah Train is overtaking from behind!
-      const sameDir = this.routeClosed || sv.routeDir === this.routeDir;
-      if (sameDir && Math.hypot(this.x - sv.x, this.z - sv.z) < 13.5) {
-        targetLane = 1.62;
+    const safeDt = Math.max(0.001, Math.min(0.05, dt || 0.016));
+    const phys = veh.phys;
+    const prevX = veh.x;
+    const prevZ = veh.z;
+    phys.frameStartX = prevX;
+    phys.frameStartZ = prevZ;
+
+    const unitId = isSecondary ? `${this.id}#sec` : this.id;
+    const cruiseLane = isSecondary ? 1.24 : this.isDualTransit ? 0.68 : 1.12;
+    const baseSpeed = isSecondary
+      ? veh.speed || 4.35
+      : this.effectiveSpeed || this.data?.behavior?.speed || 5.5;
+
+    // 1. Active Smooth End-of-Route Turnaround (U-turn or 3-point K-turn — strictly <= 0.65 * baseSpeed!)
+    if (phys.turnState) {
+      const advice = computeProactiveTrafficControl({
+        selfUnitId: unitId,
+        x: veh.x,
+        z: veh.z,
+        yaw: veh.yaw,
+        cruiseLane,
+        hw: phys.hw,
+        hl: phys.hl,
+        speed: baseSpeed * 0.5,
+        pullingOver: false,
+        isSeed: Boolean(this.data?.isSeed),
+        phys,
+        vehicleEntities: vehiclePeers,
+        buildingPeers,
+        ponds,
+        selfEnt: this,
+        citySignPos: CITY_SIGN_POS,
+        clampPointToIslandFn: clampPointToIsland,
+        dt: safeDt,
+      });
+      const dtTurn = safeDt * Math.max(0.15, Math.min(1.0, advice.speedScale));
+      const tp = stepVehicleTurnaround(phys.turnState, dtTurn);
+      let nx = tp.x;
+      let nz = tp.z;
+      const maxTurnStep = baseSpeed * 0.68 * safeDt;
+      const rawStep = Math.hypot(nx - prevX, nz - prevZ);
+      if (rawStep > maxTurnStep && rawStep > 1e-6) {
+        const s = maxTurnStep / rawStep;
+        nx = prevX + (nx - prevX) * s;
+        nz = prevZ + (nz - prevZ) * s;
+      }
+      veh.x = nx;
+      veh.z = nz;
+      veh.y = 0.092;
+      let dTurnYaw = tp.yaw - veh.yaw;
+      while (dTurnYaw > Math.PI) dTurnYaw -= Math.PI * 2;
+      while (dTurnYaw < -Math.PI) dTurnYaw += Math.PI * 2;
+      const maxTurnYawStep = safeDt * 2.45;
+      veh.yaw += Math.max(-maxTurnYawStep, Math.min(maxTurnYawStep, dTurnYaw));
+      const stepArc = Math.hypot(veh.x - prevX, veh.z - prevZ);
+      phys.currentSpeed = stepArc / safeDt;
+      veh.wheelAngle += (tp.gear * stepArc) / 0.62;
+      veh.moveFactor = tp.speedFactor;
+      phys.turnBankRoll = tp.steerRoll;
+
+      if (veh === this) {
+        this.smoothVelX = Math.sin(veh.yaw);
+        this.smoothVelZ = Math.cos(veh.yaw);
       }
 
-      const stepDist = sv.speed * speedScale * dt;
-      if (this.routeClosed) {
-        sv.routeDist = (sv.routeDist + stepDist) % this.routeLength;
-      } else {
-        sv.routeDist += sv.routeDir * stepDist;
-        if (sv.routeDir > 0 && sv.routeDist >= this.routeLength - 0.12) {
-          sv.routeDist = this.routeLength - 0.12;
-          sv.routeDir = -1;
-          sv.dwellingStop = { id: "__turn_end__", dwellSec: 0.9 };
-          sv.dwellTimer = 0.9;
-          speedScale = 0;
-        } else if (sv.routeDir < 0 && sv.routeDist <= 0.12) {
-          sv.routeDist = 0.12;
-          sv.routeDir = 1;
-          sv.dwellingStop = { id: "__turn_start__", dwellSec: 0.9 };
-          sv.dwellTimer = 0.9;
-          speedScale = 0;
-        }
+      if (tp.done && Math.abs(dTurnYaw) <= 0.18) {
+        veh.routeDir = phys.turnState.nextDir;
+        veh.routeDist = phys.turnState.nextRouteDist;
+        veh.currentLaneOffset = phys.turnState.nextLaneOffset;
+        veh.buildingDetourOffset = 0;
+        phys.currentSpeed = Math.min(baseSpeed * 0.35, phys.currentSpeed);
+        phys.turnBankRoll = 0;
+        phys.turnState = null;
       }
-      sv.wheelAngle += stepDist / 0.62;
-      sv.moveFactor = speedScale;
+      return;
     }
 
-    const u = this.routeClosed
-      ? (((sv.routeDist % this.routeLength) + this.routeLength) % this.routeLength) / this.routeLength
-      : Math.max(0.002, Math.min(0.998, sv.routeDist / this.routeLength));
-    const pos = this.routeCurve.getPointAt(u);
-    const tan = this.routeCurve.getTangentAt(u);
-    const dirSign = this.routeClosed ? 1 : sv.routeDir;
-    const baseYaw = Math.atan2(tan.x * dirSign, tan.z * dirSign);
+    phys.turnBankRoll *= Math.exp(-safeDt * 8.0);
 
-    sv.currentLaneOffset += (targetLane - sv.currentLaneOffset) * Math.min(1, dt * 5.0);
-    const rightX = -Math.cos(baseYaw);
-    const rightZ = Math.sin(baseYaw);
+    // 2. Scheduled Stop Dwell (stays facing arrival direction; launches turnaround AFTER dwell if at terminus!)
+    if (veh.dwellingStop) {
+      veh.dwellTimer -= safeDt;
+      veh.moveFactor = 0;
+      phys.currentSpeed = 0;
+      phys.vx = 0;
+      phys.vz = 0;
+      if (veh === this) this.yieldTimer = 0;
+      if (veh.dwellTimer <= 0) {
+        veh.lastStoppedId = veh.dwellingStop.id;
+        veh.dwellingStop = null;
+        if (phys.pendingTurnAtEnd && !this.routeClosed) {
+          const whichEnd = phys.pendingTurnAtEnd;
+          phys.pendingTurnAtEnd = null;
+          phys.turnState = planVehicleTurnaround({
+            routeCurve: this.routeCurve,
+            routeLength: this.routeLength,
+            whichEnd,
+            curX: veh.x,
+            curZ: veh.z,
+            curYaw: veh.yaw,
+            curLaneOffset: veh.currentLaneOffset,
+            targetReturnLane: cruiseLane,
+            hw: phys.hw,
+            hl: phys.hl,
+            speed: baseSpeed,
+            buildingPeers,
+            ponds,
+            selfEnt: this,
+            citySignPos: CITY_SIGN_POS,
+            clampPointToIslandFn: clampPointToIsland,
+          });
+          return;
+        }
+      } else {
+        veh.y = 0.092;
+        return;
+      }
+    }
+
+    // 3. Position-Authoritative Pure-Pursuit Follower (NEVER speeds up above baseSpeed!)
+    let targetLane = cruiseLane;
+    let speedScale = 1.0;
+    let pullingOver = false;
+
+    for (let i = 0; i < this.stopArcPositions.length; i++) {
+      const sp = this.stopArcPositions[i];
+      let ahead = this.routeClosed
+        ? sp.distOnCurve - veh.routeDist
+        : (sp.distOnCurve - veh.routeDist) * veh.routeDir;
+      if (this.routeClosed) {
+        if (ahead < -this.routeLength * 0.5) ahead += this.routeLength;
+        if (ahead > this.routeLength * 0.5) ahead -= this.routeLength;
+      }
+
+      if (Math.abs(ahead) > 5.0 && veh.lastStoppedId === sp.stop.id) {
+        veh.lastStoppedId = null;
+      }
+      const worldDistToStop = Math.hypot(sp.stop.x - veh.x, sp.stop.z - veh.z);
+      if (
+        sp.stop.id !== veh.lastStoppedId &&
+        ahead >= -0.6 &&
+        ahead < 5.2 &&
+        worldDistToStop < 7.5
+      ) {
+        pullingOver = true;
+        speedScale = Math.min(speedScale, Math.max(0.22, ahead / 5.2));
+        if (ahead <= 0.55 || worldDistToStop <= 1.65) {
+          veh.routeDist = sp.distOnCurve;
+          veh.dwellingStop = sp.stop;
+          veh.dwellTimer = Math.min(2.2, sp.stop.dwellSec || 1.7);
+          if (!this.routeClosed) {
+            if (veh.routeDir > 0 && sp.distOnCurve >= this.routeLength - 2.8) {
+              phys.pendingTurnAtEnd = "end";
+            } else if (veh.routeDir < 0 && sp.distOnCurve <= 2.8) {
+              phys.pendingTurnAtEnd = "start";
+            }
+          }
+          veh.moveFactor = 0;
+          phys.currentSpeed = 0;
+          phys.vx = 0;
+          phys.vz = 0;
+          return;
+        }
+      }
+    }
+
+    if (pullingOver) {
+      targetLane = 1.62;
+    } else if (this.secondaryVehicle) {
+      const sv = this.secondaryVehicle;
+      const sameDir = this.routeClosed || sv.routeDir === this.routeDir;
+      if (sameDir && Math.hypot(sv.x - this.x, sv.z - this.z) < 13.5) {
+        targetLane = isSecondary ? 1.6 : 0.16;
+      }
+    }
+
+    const advice = computeProactiveTrafficControl({
+      selfUnitId: unitId,
+      x: veh.x,
+      z: veh.z,
+      yaw: veh.yaw,
+      cruiseLane,
+      hw: phys.hw,
+      hl: phys.hl,
+      speed: baseSpeed,
+      pullingOver,
+      isSeed: Boolean(this.data?.isSeed),
+      phys,
+      vehicleEntities: vehiclePeers,
+      buildingPeers,
+      ponds,
+      selfEnt: this,
+      citySignPos: CITY_SIGN_POS,
+      clampPointToIslandFn: clampPointToIsland,
+      dt: safeDt,
+    });
+
+    speedScale = Math.max(0, Math.min(1.0, Math.min(speedScale, advice.speedScale)));
+    targetLane = Math.max(-2.25, Math.min(2.65, targetLane + advice.extraLaneOffset));
+
+    if (veh === this) {
+      this.yieldTimer = advice.yielding
+        ? this.yieldTimer + safeDt
+        : Math.max(0, this.yieldTimer - safeDt * 2.0);
+    }
+
+    // Smoothly accelerate (<= 4.2 m/s²) and brake (<= 9.2 m/s²), strictly capped at baseSpeed!
+    const desiredSpeed = baseSpeed * speedScale;
+    const prevSpd = Number.isFinite(phys.currentSpeed) ? phys.currentSpeed : 0;
+    if (desiredSpeed >= prevSpd) {
+      phys.currentSpeed = Math.min(baseSpeed, Math.min(desiredSpeed, prevSpd + 4.2 * safeDt));
+    } else {
+      phys.currentSpeed = Math.max(0, Math.max(desiredSpeed, prevSpd - 9.2 * safeDt));
+    }
+
+    // Calm rate-limited lane change (<= 1.65 m/s lateral shift rate)
+    const laneErr = targetLane - veh.currentLaneOffset;
+    const maxLaneStep = 1.65 * safeDt;
+    veh.currentLaneOffset += Math.max(-maxLaneStep, Math.min(maxLaneStep, laneErr * Math.min(1, safeDt * 4.2)));
+
+    // Pure-pursuit carrot target 2.85m ahead along the route curve
+    const endStopMargin = 0.75;
+    const carrotLookAhead = 2.85;
+    const dirSign = this.routeClosed ? 1 : veh.routeDir || 1;
+    let carrotDist = veh.routeDist + dirSign * carrotLookAhead;
+    let carrotAtTerminus = false;
+    if (this.routeClosed) {
+      carrotDist = (((carrotDist % this.routeLength) + this.routeLength) % this.routeLength);
+    } else {
+      if (dirSign > 0 && carrotDist >= this.routeLength - endStopMargin) {
+        carrotDist = this.routeLength - endStopMargin;
+        carrotAtTerminus = true;
+      } else if (dirSign < 0 && carrotDist <= endStopMargin) {
+        carrotDist = endStopMargin;
+        carrotAtTerminus = true;
+      } else {
+        carrotDist = Math.max(endStopMargin, Math.min(this.routeLength - endStopMargin, carrotDist));
+      }
+    }
+
+    const uCarrot = this.routeClosed
+      ? carrotDist / this.routeLength
+      : Math.max(0.002, Math.min(0.998, carrotDist / this.routeLength));
+    const carrotPt = this.routeCurve.getPointAt(uCarrot);
+    const carrotTan = this.routeCurve.getTangentAt(uCarrot);
+    const carrotYaw = Math.atan2(carrotTan.x * dirSign, carrotTan.z * dirSign);
+    const carrotRx = -Math.cos(carrotYaw);
+    const carrotRz = Math.sin(carrotYaw);
+
     const detourTarget = computeRouteBuildingDetour(
-      pos.x,
-      pos.z,
-      rightX,
-      rightZ,
-      sv.currentLaneOffset,
-      allEntities,
+      carrotPt.x,
+      carrotPt.z,
+      carrotRx,
+      carrotRz,
+      veh.currentLaneOffset,
+      buildingPeers,
       this,
     );
-    sv.buildingDetourOffset += (detourTarget - sv.buildingDetourOffset) * Math.min(1, dt * 5.2);
-    const prevX = sv.x;
-    const prevZ = sv.z;
-    const totalLane = sv.currentLaneOffset + sv.buildingDetourOffset;
-    sv.x = pos.x + rightX * totalLane;
-    sv.z = pos.z + rightZ * totalLane;
-    sv.y = 0.092;
-    const mv = Math.hypot(sv.x - prevX, sv.z - prevZ);
-    if (mv > 0.002) {
-      const travelYaw = Math.atan2(sv.x - prevX, sv.z - prevZ);
-      let dYaw = travelYaw - sv.yaw;
-      while (dYaw > Math.PI) dYaw -= Math.PI * 2;
-      while (dYaw < -Math.PI) dYaw += Math.PI * 2;
-      sv.yaw += dYaw * Math.min(1, dt * 9.0);
-    } else {
-      sv.yaw = baseYaw;
+    const detErr = detourTarget - veh.buildingDetourOffset;
+    veh.buildingDetourOffset += Math.max(
+      -maxLaneStep,
+      Math.min(maxLaneStep, detErr * Math.min(1, safeDt * 4.2)),
+    );
+    const totalLane = Math.max(-3.0, Math.min(3.0, veh.currentLaneOffset + veh.buildingDetourOffset));
+
+    const goalX = carrotPt.x + carrotRx * totalLane;
+    const goalZ = carrotPt.z + carrotRz * totalLane;
+    const gx = goalX - veh.x;
+    const gz = goalZ - veh.z;
+    const gDist = Math.hypot(gx, gz);
+
+    // Smooth steering toward carrot goal (NEVER computed from post-collision rebound!)
+    const desiredYaw = gDist > 0.22 ? Math.atan2(gx, gz) : carrotYaw;
+    let dYaw = desiredYaw - veh.yaw;
+    while (dYaw > Math.PI) dYaw -= Math.PI * 2;
+    while (dYaw < -Math.PI) dYaw += Math.PI * 2;
+    const speedRatio = baseSpeed > 0.1 ? phys.currentSpeed / baseSpeed : 0;
+    const maxYawStep = safeDt * 2.35 * (0.18 + 0.82 * speedRatio);
+    veh.yaw += Math.max(-maxYawStep, Math.min(maxYawStep, dYaw * Math.min(1, safeDt * 6.5)));
+
+    // Step world position strictly <= phys.currentSpeed * safeDt <= baseSpeed * safeDt
+    const stepLen = gDist > 1e-4 ? Math.min(gDist, phys.currentSpeed * safeDt) : 0;
+    if (stepLen > 1e-6 && gDist > 1e-4) {
+      const hdgX = Math.sin(veh.yaw);
+      const hdgZ = Math.cos(veh.yaw);
+      const cUx = gx / gDist;
+      const cUz = gz / gDist;
+      let moveUx = hdgX * 0.65 + cUx * 0.35;
+      let moveUz = hdgZ * 0.65 + cUz * 0.35;
+      const mLen = Math.hypot(moveUx, moveUz) || 1;
+      moveUx /= mLen;
+      moveUz /= mLen;
+      veh.x += moveUx * stepLen;
+      veh.z += moveUz * stepLen;
     }
-    const secPitch = sv.dwellingStop ? 0 : Math.sin(t * 13 + 1.4) * 0.007 * sv.moveFactor;
+    veh.y = 0.092;
+
+    if (veh === this) {
+      this.smoothVelX = Math.sin(veh.yaw);
+      this.smoothVelZ = Math.cos(veh.yaw);
+    }
+
+    veh.wheelAngle += stepLen / 0.62;
+    veh.moveFactor = speedRatio;
+
+    // Advance routeDist locally ONLY as (veh.x, veh.z) actually progresses past refPt (zero wind-up / slingshot!)
+    const uRef = this.routeClosed
+      ? (((veh.routeDist % this.routeLength) + this.routeLength) % this.routeLength) / this.routeLength
+      : Math.max(0.002, Math.min(0.998, veh.routeDist / this.routeLength));
+    const refPt = this.routeCurve.getPointAt(uRef);
+    const refTan = this.routeCurve.getTangentAt(uRef);
+    const refFx = refTan.x * dirSign;
+    const refFz = refTan.z * dirSign;
+    const alongRef = (veh.x - refPt.x) * refFx + (veh.z - refPt.z) * refFz;
+    if (alongRef > 0) {
+      const ds = Math.min(alongRef, baseSpeed * safeDt * 1.32);
+      if (this.routeClosed) {
+        veh.routeDist = (((veh.routeDist + ds) % this.routeLength) + this.routeLength) % this.routeLength;
+      } else {
+        veh.routeDist = Math.max(
+          endStopMargin,
+          Math.min(this.routeLength - endStopMargin, veh.routeDist + dirSign * ds),
+        );
+      }
+    }
+
+    // Check smooth arrival at open-route terminus
+    let reachedTerminus = null;
+    if (!this.routeClosed && carrotAtTerminus && gDist <= 0.6) {
+      if (dirSign > 0) {
+        veh.routeDist = this.routeLength - endStopMargin;
+        reachedTerminus = "end";
+      } else {
+        veh.routeDist = endStopMargin;
+        reachedTerminus = "start";
+      }
+    }
+
+    if (reachedTerminus) {
+      const termStop =
+        reachedTerminus === "end"
+          ? this.stopArcPositions.find((s) => s.distOnCurve >= this.routeLength - 3.0)
+          : this.stopArcPositions.find((s) => s.distOnCurve <= 3.0);
+      if (termStop && termStop.stop.id !== veh.lastStoppedId) {
+        veh.dwellingStop = {
+          ...termStop.stop,
+          dwellSec: Math.min(2.0, termStop.stop.dwellSec || 1.5),
+        };
+        veh.dwellTimer = veh.dwellingStop.dwellSec || 1.5;
+        veh.moveFactor = 0;
+        phys.currentSpeed = 0;
+        phys.pendingTurnAtEnd = reachedTerminus;
+      } else {
+        phys.turnState = planVehicleTurnaround({
+          routeCurve: this.routeCurve,
+          routeLength: this.routeLength,
+          whichEnd: reachedTerminus,
+          curX: veh.x,
+          curZ: veh.z,
+          curYaw: veh.yaw,
+          curLaneOffset: totalLane,
+          targetReturnLane: cruiseLane,
+          hw: phys.hw,
+          hl: phys.hl,
+          speed: baseSpeed,
+          buildingPeers,
+          ponds,
+          selfEnt: this,
+          citySignPos: CITY_SIGN_POS,
+          clampPointToIslandFn: clampPointToIsland,
+        });
+      }
+    }
+  }
+
+  stepSecondaryVehicle(dt, t, buildingPeers, vehiclePeers, ponds, popEase) {
+    const sv = this.secondaryVehicle;
+    if (!sv || !this.routeCurve) return;
+    this.stepVehicleUnitKinematics(sv, true, dt, t, vehiclePeers, buildingPeers, ponds);
+    const secPitch =
+      (sv.dwellingStop && !sv.phys?.turnState ? 0 : Math.sin(t * 13 + 1.4) * 0.007 * Math.abs(sv.moveFactor || 0)) +
+      (sv.phys?.clashPitch || 0);
+    const secRoll = (sv.phys?.turnBankRoll || 0) + (sv.phys?.clashRoll || 0);
     sv.group.position.set(sv.x, sv.y, sv.z);
-    sv.group.rotation.set(secPitch, sv.yaw, 0);
+    sv.group.rotation.set(secPitch, sv.yaw, secRoll);
     sv.group.scale.setScalar(popEase);
     sv.group.userData.animate?.(t, {
       wheelAngle: sv.wheelAngle,
@@ -1946,202 +2651,15 @@ class CreationSimEntity {
     let rollZ = 0;
 
     if (bType === "vehicle_route" && this.routeCurve) {
-      const prevWorldX = this.x;
-      const prevWorldZ = this.z;
-      let targetLane = this.isDualTransit ? 0.58 : 0.92;
-      if (this.dwellingStop) {
-        const isTurnStop =
-          this.dwellingStop.id === "__turn_end__" || this.dwellingStop.id === "__turn_start__";
-        targetLane = isTurnStop ? 0.92 : 1.68;
-        this.dwellTimer -= dt;
-        this.moveFactor = 0;
-        this.yieldTimer = 0;
-        if (this.dwellTimer <= 0) {
-          this.lastStoppedId = this.dwellingStop.id;
-          this.dwellingStop = null;
-        }
-      } else {
-        let speedScale = 1.0;
-        let pullingOver = false;
-        for (const sp of this.stopArcPositions) {
-          let ahead = this.routeClosed
-            ? sp.distOnCurve - this.routeDist
-            : (sp.distOnCurve - this.routeDist) * this.routeDir;
-          if (this.routeClosed) {
-            if (ahead < -this.routeLength * 0.5) ahead += this.routeLength;
-            if (ahead > this.routeLength * 0.5) ahead -= this.routeLength;
-          }
-
-          if (Math.abs(ahead) > 4.2 && this.lastStoppedId === sp.stop.id) {
-            this.lastStoppedId = null;
-          }
-          if (sp.stop.id !== this.lastStoppedId && ahead >= -0.4 && ahead < 5.0) {
-            pullingOver = true;
-            speedScale = Math.max(0.28, ahead / 5.0);
-            if (ahead <= 0.45) {
-              this.routeDist = sp.distOnCurve;
-              this.dwellingStop = sp.stop;
-              this.dwellTimer = Math.min(2.2, sp.stop.dwellSec || 1.8);
-              if (!this.routeClosed) {
-                if (this.routeDir > 0 && sp.distOnCurve >= this.routeLength - 2.2) {
-                  this.routeDir = -1;
-                } else if (this.routeDir < 0 && sp.distOnCurve <= 2.2) {
-                  this.routeDir = 1;
-                }
-              }
-              speedScale = 0;
-              break;
-            }
-          }
-        }
-        if (pullingOver) {
-          targetLane = 1.65;
-        }
-
-        // Express Waratah Train pulls smoothly into the inner passing lane when overtaking the Melbourne Tram
-        if (this.secondaryVehicle) {
-          const sv = this.secondaryVehicle;
-          const sameDir = this.routeClosed || sv.routeDir === this.routeDir;
-          if (sameDir && Math.hypot(sv.x - this.x, sv.z - this.z) < 13.5 && !pullingOver) {
-            targetLane = 0.08;
-          }
-        }
-
-        if (speedScale > 0) {
-          const fwdX = Math.sin(this.yaw);
-          const fwdZ = Math.cos(this.yaw);
-          const curRightX = -Math.cos(this.yaw);
-          const curRightZ = Math.sin(this.yaw);
-          let yielding = false;
-
-          for (const other of vehiclePeers) {
-            if (other === this || other.data.behavior?.type !== "vehicle_route") continue;
-            const dx = other.x - this.x;
-            const dz = other.z - this.z;
-            const dist = Math.hypot(dx, dz);
-            if (dist >= 12.5 || dist < 0.01) continue;
-
-            const otherFwdX = Math.sin(other.yaw);
-            const otherFwdZ = Math.cos(other.yaw);
-            const headingDot = fwdX * otherFwdX + fwdZ * otherFwdZ;
-            const aheadDist = dx * fwdX + dz * fwdZ;
-            const latDist = Math.abs(dx * curRightX + dz * curRightZ);
-
-            // Oncoming traffic in the opposite lane (`headingDot < -0.25`) passes freely!
-            if (headingDot > 0.45) {
-              if (other.dwellingStop) {
-                // Overtake curb-parked vehicles cleanly so buses never queue or stall
-                if (aheadDist > -2.5 && aheadDist < 9.5 && !pullingOver) {
-                  targetLane = 0.18;
-                  speedScale = Math.min(speedScale, 0.92);
-                }
-              } else if (aheadDist > -1.2 && aheadDist < 11.2 && latDist < 2.2) {
-                // Single-file headway behind moving same-direction vehicles (never linger side-by-side!)
-                speedScale = Math.min(speedScale, Math.max(0.12, (aheadDist - 5.8) / 5.4));
-              }
-            } else if (
-              headingDot >= -0.25 &&
-              !other.dwellingStop &&
-              other.moveFactor > 0.15 &&
-              aheadDist > 0.4 &&
-              aheadDist < 5.6 &&
-              dist < 5.8 &&
-              this.id > other.id
-            ) {
-              if (this.yieldTimer < 1.6) {
-                speedScale = Math.min(speedScale, Math.max(0.05, (dist - 3.8) / 2.0));
-                yielding = true;
-              }
-            }
-          }
-
-          if (yielding) {
-            this.yieldTimer += dt;
-          } else {
-            this.yieldTimer = Math.max(0, this.yieldTimer - dt * 2.0);
-          }
-        }
-
-        const baseSpeed = this.effectiveSpeed || b.speed || 6.0;
-        const stepDist = baseSpeed * speedScale * dt;
-        if (this.routeClosed) {
-          this.routeDist = (this.routeDist + stepDist) % this.routeLength;
-        } else {
-          this.routeDist += this.routeDir * stepDist;
-          if (this.routeDir > 0 && this.routeDist >= this.routeLength - 0.12) {
-            this.routeDist = this.routeLength - 0.12;
-            this.routeDir = -1;
-            const termStop = this.stopArcPositions.find((s) => s.distOnCurve >= this.routeLength - 3.0);
-            this.dwellingStop = termStop
-              ? { ...termStop.stop, dwellSec: Math.min(2.0, termStop.stop.dwellSec || 1.6) }
-              : { id: "__turn_end__", dwellSec: 1.0 };
-            this.dwellTimer = this.dwellingStop.dwellSec || 1.0;
-            speedScale = 0;
-          } else if (this.routeDir < 0 && this.routeDist <= 0.12) {
-            this.routeDist = 0.12;
-            this.routeDir = 1;
-            const startStop = this.stopArcPositions.find((s) => s.distOnCurve <= 3.0);
-            this.dwellingStop = startStop
-              ? { ...startStop.stop, dwellSec: Math.min(2.0, startStop.stop.dwellSec || 1.6) }
-              : { id: "__turn_start__", dwellSec: 1.0 };
-            this.dwellTimer = this.dwellingStop.dwellSec || 1.0;
-            speedScale = 0;
-          }
-        }
-        this.wheelAngle += stepDist / 0.62;
-        this.moveFactor = speedScale;
-      }
-
-      const u = this.routeClosed
-        ? (((this.routeDist % this.routeLength) + this.routeLength) % this.routeLength) / this.routeLength
-        : Math.max(0.002, Math.min(0.998, this.routeDist / this.routeLength));
-      const pos = this.routeCurve.getPointAt(u);
-      const tan = this.routeCurve.getTangentAt(u);
-      const dirSign = this.routeClosed ? 1 : this.routeDir;
-      const curveYaw = Math.atan2(tan.x * dirSign, tan.z * dirSign);
-
-      this.currentLaneOffset += (targetLane - this.currentLaneOffset) * Math.min(1, dt * 5.2);
-      const rightX = -Math.cos(curveYaw);
-      const rightZ = Math.sin(curveYaw);
-      const detourTarget = computeRouteBuildingDetour(
-        pos.x,
-        pos.z,
-        rightX,
-        rightZ,
-        this.currentLaneOffset,
-        buildingPeers,
-        this,
-      );
-      this.buildingDetourOffset += (detourTarget - this.buildingDetourOffset) * Math.min(1, dt * 5.2);
-      const laneOffset = this.currentLaneOffset + this.buildingDetourOffset;
-      this.x = pos.x + rightX * laneOffset;
-      this.z = pos.z + rightZ * laneOffset;
-      this.y = 0.092;
-
-      const movedDist = Math.hypot(this.x - prevWorldX, this.z - prevWorldZ);
-      if (movedDist > 0.003 && !this.dwellingStop) {
-        const vx = (this.x - prevWorldX) / movedDist;
-        const vz = (this.z - prevWorldZ) / movedDist;
-        this.smoothVelX += (vx - this.smoothVelX) * Math.min(1, dt * 10.0);
-        this.smoothVelZ += (vz - this.smoothVelZ) * Math.min(1, dt * 10.0);
-        const sLen = Math.hypot(this.smoothVelX, this.smoothVelZ) || 1;
-        this.smoothVelX /= sLen;
-        this.smoothVelZ /= sLen;
-        const desiredYaw = Math.atan2(this.smoothVelX, this.smoothVelZ);
-        let dYaw = desiredYaw - this.yaw;
-        while (dYaw > Math.PI) dYaw -= Math.PI * 2;
-        while (dYaw < -Math.PI) dYaw += Math.PI * 2;
-        this.yaw += dYaw * Math.min(1, dt * 10.0);
-      } else {
-        this.yaw = curveYaw;
-        this.smoothVelX = Math.sin(curveYaw);
-        this.smoothVelZ = Math.cos(curveYaw);
-      }
-
+      this.stepVehicleUnitKinematics(this, false, dt, t, vehiclePeers, buildingPeers, ponds);
+      const rightX = -Math.cos(this.yaw);
+      const rightZ = Math.sin(this.yaw);
       this.doorX = this.x + rightX * 1.9 + Math.sin(this.yaw) * 0.9;
       this.doorZ = this.z + rightZ * 1.9 + Math.cos(this.yaw) * 0.9;
-
-      pitchX = this.dwellingStop ? 0 : Math.sin(t * 14) * 0.008 * this.moveFactor;
+      pitchX =
+        (this.dwellingStop && !this.phys?.turnState ? 0 : Math.sin(t * 14) * 0.008 * Math.abs(this.moveFactor || 0)) +
+        (this.phys?.clashPitch || 0);
+      rollZ = (this.phys?.turnBankRoll || 0) + (this.phys?.clashRoll || 0);
     } else if (b?.type === "wander") {
       const isGlide = b.style === "glide";
       const glideBaseY = b.hoverHeight || 1.9;
@@ -2452,7 +2970,7 @@ class CreationSimEntity {
     }
 
     if (this.secondaryVehicle) {
-      this.stepSecondaryVehicle(dt, t, buildingPeers, popEase);
+      this.stepSecondaryVehicle(dt, t, buildingPeers, vehiclePeers, ponds, popEase);
     }
 
     if (this.feedMesh && this.feedMesh.visible) {
@@ -2513,7 +3031,7 @@ function deBunchVehicleRoutes(creationEntities) {
   if (vehicles.length < 2) return;
 
   const visited = new Set();
-  const sharedSpeedSlots = [6.45, 4.55, 5.45];
+  const corridorFactors = [1.0, 0.86, 0.93];
 
   for (let i = 0; i < vehicles.length; i++) {
     if (visited.has(i)) continue;
@@ -2538,7 +3056,6 @@ function deBunchVehicleRoutes(creationEntities) {
     }
 
     if (cluster.length < 2) continue;
-    // Sort deterministically so seed vehicles keep slot 0
     cluster.sort((a, b) => {
       if (Boolean(a.ent.data.isSeed) !== Boolean(b.ent.data.isSeed)) {
         return a.ent.data.isSeed ? -1 : 1;
@@ -2551,7 +3068,7 @@ function deBunchVehicleRoutes(creationEntities) {
       ? (((anchor.routeDist % anchor.routeLength) + anchor.routeLength) % anchor.routeLength) /
         anchor.routeLength
       : 0.16;
-    if (!anchor.deBunchedOnce && !anchor.routeClosed) {
+    if (!anchor.deBunchedOnce && !anchor.hasSteppedOnce && !anchor.routeClosed) {
       anchor.routeDist = anchor.routeLength * 0.16;
       anchor.routeDir = 1;
     }
@@ -2561,11 +3078,14 @@ function deBunchVehicleRoutes(creationEntities) {
     for (let k = 0; k < cluster.length; k++) {
       const v = cluster[k].ent;
       if (!v.isDualTransit) {
-        v.effectiveSpeed = sharedSpeedSlots[k % sharedSpeedSlots.length];
+        const authored = v.data?.behavior?.speed || 5.4;
+        const factor = corridorFactors[k % corridorFactors.length];
+        // NEVER speed up a vehicle above its authored cruise speed!
+        v.effectiveSpeed = Math.max(3.6, Math.min(authored, authored * factor));
       }
-      if (k > 0 && !v.deBunchedOnce) {
+      const canPlaceInitial = !v.deBunchedOnce && !v.hasSteppedOnce;
+      if (k > 0 && canPlaceInitial) {
         if (v.routeClosed) {
-          // Find u on `v.routeCurve` matching `anchorPos` in world space, then offset by +k/N of the loop!
           let bestU = 0;
           let bestD = Infinity;
           for (let s = 0; s < 64; s++) {
@@ -2588,6 +3108,9 @@ function deBunchVehicleRoutes(creationEntities) {
         }
       }
       v.deBunchedOnce = true;
+      if (canPlaceInitial) {
+        v.syncVehiclePoseToRoute?.();
+      }
     }
   }
 }
@@ -2759,6 +3282,9 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   citySignboard.group.updateMatrixWorld(true);
   citySignboard.group.matrixAutoUpdate = false;
   scene.add(citySignboard.group);
+
+  const floatingSkyBanner = createFloatingSkyBanner();
+  scene.add(floatingSkyBanner.group);
 
   // Scattered scenic perimeter Meadow Groves + Coastal Shoreline Boulders (batched into 1 static mesh)
   const perimeterTreesGroup = new THREE.Group();
@@ -3891,15 +4417,17 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     return ent;
   }
 
-  const yieldToMain = () =>
-    typeof globalThis.scheduler?.yield === "function"
-      ? globalThis.scheduler.yield()
+  const yieldToNextFrame = () =>
+    typeof requestAnimationFrame === "function" &&
+    typeof document !== "undefined" &&
+    document.visibilityState === "visible"
+      ? new Promise((resolve) => requestAnimationFrame(() => resolve()))
       : new Promise((resolve) => setTimeout(resolve, 0));
 
   async function streamRemainingCreations(gen) {
     isStreamingCreations = true;
     while (gen === worldSnapshotGen && pendingCreationSpecs.size > 0) {
-      await yieldToMain();
+      await yieldToNextFrame();
       if (gen !== worldSnapshotGen || pendingCreationSpecs.size === 0) break;
       const sliceStart = performance.now();
       let builtVehicle = false;
@@ -3907,7 +4435,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         pendingCreationSpecs.delete(id);
         const ent = instantiateCreationSpec(spec);
         if (ent.data.behavior?.type === "vehicle_route") builtVehicle = true;
-        if (performance.now() - sliceStart >= 10) break;
+        if (performance.now() - sliceStart >= 6.5) break;
       }
       if (builtVehicle) {
         deBunchVehicleRoutes(creationEntities);
@@ -3917,6 +4445,18 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       isStreamingCreations = false;
       deBunchVehicleRoutes(creationEntities);
       markSceneListsDirty();
+      if (!ogMode && !hasWalkedOnce && !fp.active && !introSweep.firedWalk) {
+        const [rx, rz] = resolveWalkPosition(fp.x, fp.z);
+        fp.x = rx;
+        fp.z = rz;
+        fp.feetY = getIslandGroundHeight(rx, rz);
+        fp.y = fp.feetY + FP_EYE_HEIGHT;
+        introSweep.walkX = rx;
+        introSweep.walkZ = rz;
+        const nextYaw = Math.atan2(-(2.4 - rx), -(-18.5 - rz));
+        introSweep.walkYaw = nextYaw;
+        fp.yaw = fp.goalYaw = nextYaw;
+      }
     }
   }
 
@@ -3930,7 +4470,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       typeof world.contributionCount === "number"
         ? world.contributionCount
         : (world.creations || []).filter((c) => !c.isSeed && !c.isCompanion).length;
-    citySignboard.updateCount(contribCount);
+    citySignboard.setTargetCount(contribCount, ogMode || prefersReducedMotion);
     updateBiomeShaderUniforms(world.terrainZones || []);
     updatePerimeterTreeClearance(world);
     rebuildPathsAndProps(world);
@@ -3956,7 +4496,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       }
     }
 
-    if (ogMode || newSpecs.length <= 16) {
+    if (ogMode || newSpecs.length <= 8) {
       for (const spec of newSpecs) {
         instantiateCreationSpec(spec);
       }
@@ -3964,21 +4504,12 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       const refX = fp.active ? fp.x : cam.tx;
       const refZ = fp.active ? fp.z : cam.tz;
       newSpecs.sort((a, b) => {
-        const pa =
-          a.c.isSeed ||
-          a.c.behavior?.type === "vehicle_route" ||
-          a.c.id === world.myCreationId ||
-          a.c.id === highlightedId
-            ? 0
-            : 1;
-        const pb =
-          b.c.isSeed ||
-          b.c.behavior?.type === "vehicle_route" ||
-          b.c.id === world.myCreationId ||
-          b.c.id === highlightedId
-            ? 0
-            : 1;
+        const pa = a.c.id === world.myCreationId || a.c.id === highlightedId ? 0 : 1;
+        const pb = b.c.id === world.myCreationId || b.c.id === highlightedId ? 0 : 1;
         if (pa !== pb) return pa - pb;
+        const va = a.c.behavior?.type === "vehicle_route" ? 0 : 1;
+        const vb = b.c.behavior?.type === "vehicle_route" ? 0 : 1;
+        if (va !== vb) return va - vb;
         const da = (a.c.x - refX) ** 2 + (a.c.z - refZ) ** 2;
         const db = (b.c.x - refX) ** 2 + (b.c.z - refZ) ** 2;
         return da - db;
@@ -3989,12 +4520,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       while (cursor < newSpecs.length) {
         const spec = newSpecs[cursor];
         const mustBuildNow =
-          cursor < 14 ||
-          spec.c.isSeed ||
-          spec.c.behavior?.type === "vehicle_route" ||
+          cursor < 4 ||
           spec.c.id === world.myCreationId ||
-          spec.c.id === highlightedId;
-        if (!mustBuildNow && performance.now() - syncStart >= 14) {
+          spec.c.id === highlightedId ||
+          spec.c.behavior?.type === "vehicle_route";
+        if (!mustBuildNow && performance.now() - syncStart >= 6.5) {
           break;
         }
         instantiateCreationSpec(spec);
@@ -4176,27 +4706,201 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     return "grab";
   }
 
-  function isWalkPointClear(x, z, extraMargin = 0) {
-    if (getIslandInlandMargin(x, z) < -5.0 + extraMargin) return false;
-    if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < 2.35 + extraMargin) return false;
-    for (const pr of currentWorld?.props || []) {
-      if (pr.kind === "pond") {
-        if (Math.hypot(x - pr.x, z - pr.z) < (pr.radius || 6.6) + 0.75 + extraMargin) return false;
-      } else if (pr.kind === "bus_stop" || pr.kind === "bench" || pr.kind === "lamp_post") {
-        if (Math.hypot(x - pr.x, z - pr.z) < 0.72 + extraMargin) return false;
+  function isSkateHalfpipeEntity(ent) {
+    if (!ent?.data) return false;
+    if (ent.id === "c-mvne3zub-216636") return true;
+    const name = ent.data.name || "";
+    return /\b(half\s*pipe|half-pipe|skate\s*ramp|skatepark\s*halfpipe)\b/i.test(name);
+  }
+
+  function getSkateHalfpipeSpec(ent) {
+    if (ent._halfpipeSpec) return ent._halfpipeSpec;
+    const sc = ent.data?.scaleClass || ent.data?.blueprint?.scaleClass || "medium";
+    const voxSize = getWorldVoxelSize(sc);
+    const stats = ent.data?.blueprint?.stats || {};
+    const halfVoxX = Math.max(6, (Number(stats.footprintX) || 28) * 0.5);
+    const halfVoxZ = Math.max(6, (Number(stats.footprintZ) || 20) * 0.5);
+    const ops = ent.data?.blueprint?.ops || [];
+    const carveCyl = ops.find((op) => op.op === "cylinder" && op.carve);
+    const troughAxis = carveCyl?.axis === "x" ? "x" : "z";
+    const halfAlongVox = troughAxis === "z" ? halfVoxZ : halfVoxX;
+    const halfAcrossVox = troughAxis === "z" ? halfVoxX : halfVoxZ;
+    const deckVoxY = Number(carveCyl?.cy) > 2 ? Number(carveCyl.cy) : 9.0;
+    const pipeRadiusVox =
+      Number(carveCyl?.radius) > 2
+        ? Number(carveCyl.radius)
+        : Math.max(4.5, halfAcrossVox - 5.0);
+    const spec = {
+      voxSize,
+      troughAxis,
+      halfAlongVox,
+      halfAcrossVox,
+      deckVoxY,
+      pipeRadiusVox,
+      floorVoxY: 1.0,
+    };
+    ent._halfpipeSpec = spec;
+    return spec;
+  }
+
+  function resolveHalfpipeCollision(ent, px, pz, curFeetY) {
+    const spec = getSkateHalfpipeSpec(ent);
+    const yaw = ent.yaw || 0;
+    const cosY = Math.cos(yaw);
+    const sinY = Math.sin(yaw);
+    const dx = px - ent.x;
+    const dz = pz - ent.z;
+    const lx = dx * cosY - dz * sinY;
+    const lz = dx * sinY + dz * cosY;
+
+    const voxX = lx / spec.voxSize;
+    const voxZ = lz / spec.voxSize;
+    let alongVox = spec.troughAxis === "z" ? voxZ : voxX;
+    let acrossVox = spec.troughAxis === "z" ? voxX : voxZ;
+
+    const padVox = 0.28 / spec.voxSize;
+    const maxAlong = spec.halfAlongVox + padVox;
+    const maxAcross = spec.halfAcrossVox + padVox;
+    if (Math.abs(alongVox) >= maxAlong || Math.abs(acrossVox) >= maxAcross) {
+      return [px, pz];
+    }
+
+    const openMouthHalfVox = Math.max(2.5, spec.pipeRadiusVox - 0.65);
+    // Open middle U-trough: walk freely in from either open end, right through the middle, and up/down the curved walls!
+    if (Math.abs(acrossVox) <= openMouthHalfVox) {
+      return [px, pz];
+    }
+    if (
+      Math.abs(alongVox) <= spec.halfAlongVox - 0.55 &&
+      Math.abs(acrossVox) <= spec.pipeRadiusVox + 0.15
+    ) {
+      return [px, pz];
+    }
+
+    const deckWorldY = (ent.y || 0) + spec.deckVoxY * spec.voxSize;
+    const onElevatedLevel = (curFeetY ?? 0) >= deckWorldY - 0.65;
+    if (onElevatedLevel) {
+      // Standing on elevated skate deck: allow walking on the deck, bounded by outer safety railings (unless jumping over)
+      if ((curFeetY ?? 0) < deckWorldY + 0.55) {
+        const railAcross = Math.max(spec.pipeRadiusVox, spec.halfAcrossVox - 1.35);
+        const railAlong = Math.max(1.0, spec.halfAlongVox - 1.25);
+        acrossVox = Math.max(-railAcross, Math.min(railAcross, acrossVox));
+        if (Math.abs(acrossVox) > openMouthHalfVox) {
+          alongVox = Math.max(-railAlong, Math.min(railAlong, alongVox));
+        }
+      }
+    } else {
+      // Ground-level approach against solid side back-walls or deck end-wings: push/slide along nearest clear face
+      const penOuterSide = maxAcross - Math.abs(acrossVox);
+      const penOuterEnd = maxAlong - Math.abs(alongVox);
+      const penInnerMouth = Math.abs(acrossVox) - openMouthHalfVox;
+
+      if (penInnerMouth <= penOuterSide && penInnerMouth <= penOuterEnd) {
+        acrossVox = (acrossVox >= 0 ? 1 : -1) * openMouthHalfVox;
+      } else if (penOuterSide <= penOuterEnd) {
+        acrossVox = (acrossVox >= 0 ? 1 : -1) * maxAcross;
+      } else {
+        alongVox = (alongVox >= 0 ? 1 : -1) * maxAlong;
       }
     }
+
+    const outVoxX = spec.troughAxis === "z" ? acrossVox : alongVox;
+    const outVoxZ = spec.troughAxis === "z" ? alongVox : acrossVox;
+    const outLx = outVoxX * spec.voxSize;
+    const outLz = outVoxZ * spec.voxSize;
+    return [
+      ent.x + outLx * cosY + outLz * sinY,
+      ent.z - outLx * sinY + outLz * cosY,
+    ];
+  }
+
+  function getWalkSurfaceHeight(px, pz, curFeetY) {
+    let bestY = getIslandGroundHeight(px, pz);
+    for (const ent of creationEntities.values()) {
+      if (!isSkateHalfpipeEntity(ent)) continue;
+      const spec = getSkateHalfpipeSpec(ent);
+      const yaw = ent.yaw || 0;
+      const cosY = Math.cos(yaw);
+      const sinY = Math.sin(yaw);
+      const dx = px - ent.x;
+      const dz = pz - ent.z;
+      const lx = dx * cosY - dz * sinY;
+      const lz = dx * sinY + dz * cosY;
+      const voxX = lx / spec.voxSize;
+      const voxZ = lz / spec.voxSize;
+      const alongVox = spec.troughAxis === "z" ? voxZ : voxX;
+      const acrossVox = spec.troughAxis === "z" ? voxX : voxZ;
+
+      if (
+        Math.abs(alongVox) > spec.halfAlongVox + 0.4 ||
+        Math.abs(acrossVox) > spec.halfAcrossVox + 0.2
+      ) {
+        continue;
+      }
+
+      const endRampT = Math.max(
+        0,
+        Math.min(1, (spec.halfAlongVox + 0.4 - Math.abs(alongVox)) / 0.8),
+      );
+      const endBlend = endRampT * endRampT * (3 - 2 * endRampT);
+
+      if (Math.abs(acrossVox) <= spec.pipeRadiusVox + 0.15) {
+        const r = spec.pipeRadiusVox;
+        const ax = Math.min(r, Math.abs(acrossVox));
+        const rampVoxY = Math.max(
+          spec.floorVoxY,
+          spec.deckVoxY - Math.sqrt(Math.max(0, r * r - ax * ax)),
+        );
+        const rawPipeY = Math.max(bestY, (ent.y || 0) + rampVoxY * spec.voxSize);
+        const blendedY = bestY + (rawPipeY - bestY) * endBlend;
+        if (blendedY > bestY) bestY = blendedY;
+      } else {
+        const deckY = (ent.y || 0) + spec.deckVoxY * spec.voxSize;
+        if ((curFeetY ?? bestY) >= deckY - 0.75 && deckY > bestY) {
+          bestY = deckY;
+        }
+      }
+    }
+    return bestY;
+  }
+
+  function isWalkPointClear(x, z, extraMargin = 0) {
+    if (getIslandInlandMargin(x, z) < -5.0 + extraMargin) return false;
+    if (Math.hypot(x - CITY_SIGN_POS[0], z - CITY_SIGN_POS[1]) < 1.85 + extraMargin) return false;
+    for (const pr of currentWorld?.props || []) {
+      if (pr.kind === "pond") {
+        if (Math.hypot(x - pr.x, z - pr.z) < (pr.radius || 6.6) + 0.25 + extraMargin) return false;
+      } else if (pr.kind === "bus_stop" || pr.kind === "bench" || pr.kind === "lamp_post") {
+        if (Math.hypot(x - pr.x, z - pr.z) < 0.48 + extraMargin) return false;
+      }
+    }
+    const baseFeetY = getIslandGroundHeight(x, z);
     for (const ent of creationEntities.values()) {
       if (ent.interactive?.allowWalkOver) continue;
+      if (isSkateHalfpipeEntity(ent)) {
+        const [hx, hz] = resolveHalfpipeCollision(ent, x, z, baseFeetY);
+        if (Math.hypot(hx - x, hz - z) > 0.02) return false;
+        continue;
+      }
       if (ent.data.category === "building" || ent.data.behavior?.type === "landmark") {
-        const r = (ent.footprintRadius || 3.4) + 0.6 + extraMargin;
-        if (Math.hypot(x - ent.x, z - ent.z) < r) return false;
+        const box = getBuildingTightBox(ent, 0.8);
+        const pushed = pushPointOutOfVehicleOBB(
+          x,
+          z,
+          0.34 + extraMargin,
+          ent.x,
+          ent.z,
+          ent.yaw || 0,
+          box.halfX,
+          box.halfZ,
+        );
+        if (pushed) return false;
       }
     }
     return true;
   }
 
-  function resolveWalkPosition(rawX, rawZ) {
+  function resolveWalkPosition(rawX, rawZ, curFeetY = fp.feetY) {
     let x = rawX;
     let z = rawZ;
 
@@ -4215,28 +4919,71 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     };
 
     for (let pass = 0; pass < 2; pass++) {
-      pushOut(CITY_SIGN_POS[0], CITY_SIGN_POS[1], 2.35);
+      pushOut(CITY_SIGN_POS[0], CITY_SIGN_POS[1], 1.85);
       for (const pr of currentWorld?.props || []) {
         if (pr.kind === "pond") {
-          pushOut(pr.x, pr.z, (pr.radius || 6.6) + 0.75);
+          pushOut(pr.x, pr.z, (pr.radius || 6.6) + 0.25);
         } else if (pr.kind === "bus_stop" || pr.kind === "bench" || pr.kind === "lamp_post") {
-          pushOut(pr.x, pr.z, 0.7);
+          pushOut(pr.x, pr.z, 0.48);
         }
       }
       for (const ent of creationEntities.values()) {
         if (ent.interactive?.allowWalkOver) continue;
-        if (ent.data.category === "building" || ent.data.behavior?.type === "landmark") {
-          pushOut(ent.x, ent.z, (ent.footprintRadius || 3.4) + 0.58);
+        if (isSkateHalfpipeEntity(ent)) {
+          [x, z] = resolveHalfpipeCollision(ent, x, z, curFeetY);
+        } else if (ent.data.category === "building" || ent.data.behavior?.type === "landmark") {
+          const box = getBuildingTightBox(ent, 0.8);
+          const pushedBld = pushPointOutOfVehicleOBB(
+            x,
+            z,
+            0.34,
+            ent.x,
+            ent.z,
+            ent.yaw || 0,
+            box.halfX,
+            box.halfZ,
+          );
+          if (pushedBld) {
+            x = pushedBld[0];
+            z = pushedBld[1];
+          }
         } else if (ent.data.behavior?.type === "vehicle_route") {
-          pushOut(ent.x, ent.z, 2.35);
+          const pushedMain = pushPointOutOfVehicleOBB(
+            x,
+            z,
+            0.38,
+            ent.x,
+            ent.z,
+            ent.yaw || 0,
+            ent.phys?.hw || 0.92,
+            ent.phys?.hl || 2.1,
+          );
+          if (pushedMain) {
+            x = pushedMain[0];
+            z = pushedMain[1];
+          }
           if (ent.secondaryVehicle) {
-            pushOut(ent.secondaryVehicle.x, ent.secondaryVehicle.z, 2.35);
+            const sv = ent.secondaryVehicle;
+            const pushedSec = pushPointOutOfVehicleOBB(
+              x,
+              z,
+              0.38,
+              sv.x,
+              sv.z,
+              sv.yaw || 0,
+              sv.phys?.hw || 0.84,
+              sv.phys?.hl || 2.32,
+            );
+            if (pushedSec) {
+              x = pushedSec[0];
+              z = pushedSec[1];
+            }
           }
         }
       }
       for (const sc of perimeterScenery) {
         if ((sc.isTree || sc.isCoastalRock) && !sc.blocked) {
-          pushOut(sc.x, sc.z, sc.isCoastalRock ? 1.15 : 0.72);
+          pushOut(sc.x, sc.z, sc.isCoastalRock ? 0.85 : 0.52);
         }
       }
       [x, z] = clampPointToIsland(x, z, -5.0);
@@ -4245,10 +4992,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   {
-    const [bootX, bootZ] = resolveWalkPosition(fp.x, fp.z);
+    const [bootX, bootZ] = resolveWalkPosition(fp.x, fp.z, 0);
     fp.x = bootX;
     fp.z = bootZ;
-    fp.feetY = getIslandGroundHeight(bootX, bootZ);
+    fp.walkSurfaceY = getWalkSurfaceHeight(bootX, bootZ, 0);
+    fp.feetY = fp.walkSurfaceY;
     fp.y = fp.feetY + FP_EYE_HEIGHT;
     introSweep.walkX = bootX;
     introSweep.walkZ = bootZ;
@@ -4275,7 +5023,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
   }
 
   function triggerLocalWave() {
-    waveTimer = 1.45;
+    waveTimer = 1.85;
     callbacks.onLocalEmote?.("wave");
     return true;
   }
@@ -4353,7 +5101,6 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     }
 
     if (fp.active) {
-      const groundY = getIslandGroundHeight(fp.x, fp.z);
       const anim =
         fp.jumpY > 0.03
           ? "jump"
@@ -4367,7 +5114,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       return {
         mode: "walk",
         x: fp.x,
-        y: groundY + fp.jumpY,
+        y: fp.feetY,
         z: fp.z,
         yaw: fp.yaw,
         pitch: fp.pitch,
@@ -4383,7 +5130,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     return {
       mode,
       x: fp.x,
-      y: getIslandGroundHeight(fp.x, fp.z),
+      y: getWalkSurfaceHeight(fp.x, fp.z, fp.feetY),
       z: fp.z,
       yaw: fp.yaw,
       pitch: 0,
@@ -4461,7 +5208,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
           kind: target.kind,
           id: target.id,
           label: target.label,
-          keyHint: target.keyHint || "F",
+          keyHint: target.keyHint || "E",
         }
       : null;
     const nextKey = promptInfo
@@ -4480,7 +5227,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       kind: activeInteractionTarget.kind,
       id: activeInteractionTarget.id,
       label: activeInteractionTarget.label,
-      keyHint: activeInteractionTarget.keyHint || "F",
+      keyHint: activeInteractionTarget.keyHint || "E",
     };
   }
 
@@ -4730,7 +5477,8 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         } else {
           fp.x = res.pose.x;
           fp.z = res.pose.z;
-          const gY = getIslandGroundHeight(res.pose.x, res.pose.z);
+          const gY = getWalkSurfaceHeight(res.pose.x, res.pose.z, fp.feetY);
+          fp.walkSurfaceY = gY;
           fp.feetY = gY;
           fp.y = gY + FP_EYE_HEIGHT;
         }
@@ -4821,7 +5569,8 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     fp.jumpY = 0;
     fp.jumpVy = 0;
     fp.settleT = prefersReducedMotion ? 1 : 0;
-    const gY = getIslandGroundHeight(fp.x, fp.z);
+    const gY = getWalkSurfaceHeight(fp.x, fp.z, 0);
+    fp.walkSurfaceY = gY;
     fp.feetY = gY;
     fp.y = gY + (prefersReducedMotion ? FP_EYE_HEIGHT : FP_EYE_HEIGHT + 1.15);
   }
@@ -4843,7 +5592,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         Math.hypot(cam.goalTx - lastExitCamTarget.x, cam.goalTz - lastExitCamTarget.z) < 2.5);
 
     if (stayedAtStandingAvatar && isWalkPointClear(fp.x, fp.z, 0.1)) {
-      const [rx, rz] = resolveWalkPosition(fp.x, fp.z);
+      const [rx, rz] = resolveWalkPosition(fp.x, fp.z, fp.feetY);
       fp.x = rx;
       fp.z = rz;
       fp.vx = 0;
@@ -4852,7 +5601,8 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       fp.jumpVy = 0;
       fp.pitch = fp.goalPitch = -0.02;
       fp.settleT = prefersReducedMotion ? 1 : 0;
-      const gY = getIslandGroundHeight(fp.x, fp.z);
+      const gY = getWalkSurfaceHeight(fp.x, fp.z, fp.feetY);
+      fp.walkSurfaceY = gY;
       fp.feetY = gY;
       fp.y = gY + (prefersReducedMotion ? FP_EYE_HEIGHT : FP_EYE_HEIGHT + 1.15);
     } else {
@@ -5579,14 +6329,20 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
     const lowerKey = e.key ? String(e.key).toLowerCase() : "";
 
-    if (!e.repeat && (e.code === "KeyF" || lowerKey === "f")) {
+    if (!e.repeat && (e.code === "KeyE" || lowerKey === "e")) {
       if (triggerActiveInteraction()) {
         e.preventDefault();
       }
       return;
     }
 
-    if (!e.repeat && (e.code === "KeyG" || lowerKey === "g")) {
+    if (
+      !e.repeat &&
+      ((fp.active && (e.code === "KeyQ" || lowerKey === "q")) ||
+        e.code === "KeyG" ||
+        lowerKey === "g")
+    ) {
+      e.preventDefault();
       triggerLocalWave();
       return;
     }
@@ -5834,6 +6590,10 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     }
 
     grassUniforms.uTime.value = t;
+    citySignboard.stepCount(dt, !introSweep.active || introSweep.elapsed >= 0.24);
+    if (!ogMode && !prefersReducedMotion) {
+      floatingSkyBanner.step(t);
+    }
 
     // 1. Step all world entities (vehicles, contraptions, landmarks) & villagers FIRST
     // so passenger riding poses, doorway beacons, and remote peers lock onto exact frame-t transforms!
@@ -5860,6 +6620,21 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         preViewerPos,
         simCtx,
       );
+    }
+
+    // Global Solid-Body Vehicle Clash Solver & Self-Restoration Pass (before villagers & riding poses!)
+    if (cachedVehicles.length > 0) {
+      stepWorldVehiclePhysicsPass({
+        dt,
+        t,
+        vehicleEntities: cachedVehicles,
+        buildingEntities: cachedBuildings,
+        pondProps: cachedPonds,
+        allEntities: cachedAllEntities,
+        citySignPos: CITY_SIGN_POS,
+        clampPointToIslandFn: clampPointToIsland,
+        onTrafficIncident: !ogMode ? callbacks.onTrafficIncident : null,
+      });
     }
 
     for (let i = 1; i < cachedVillagerObstacles.length; i++) {
@@ -5946,10 +6721,10 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
     // 3. Update active camera (Walk / Ride / Interior / Seated / Aerial) & local embodied character
     if (fp.active) {
       const turnRate = 1.95;
-      if (isKeyDown("ArrowLeft", "arrowleft", "KeyQ", "q")) {
+      if (isKeyDown("ArrowLeft", "arrowleft")) {
         fp.goalYaw += turnRate * dt;
       }
-      if (isKeyDown("ArrowRight", "arrowright", "KeyE", "e")) {
+      if (isKeyDown("ArrowRight", "arrowright")) {
         fp.goalYaw -= turnRate * dt;
       }
       if (isKeyDown("PageUp", "pageup")) {
@@ -6235,7 +7010,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
 
         const prevX = fp.x;
         const prevZ = fp.z;
-        const [rx, rz] = resolveWalkPosition(fp.x + fp.vx * dt, fp.z + fp.vz * dt);
+        const [rx, rz] = resolveWalkPosition(fp.x + fp.vx * dt, fp.z + fp.vz * dt, fp.feetY);
         fp.x = rx;
         fp.z = rz;
 
@@ -6265,7 +7040,13 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
         const bobY = Math.sin(fp.bobPhase * 2) * 0.036 * bobBlend;
         const swayX = Math.cos(fp.bobPhase) * 0.016 * bobBlend;
 
-        const groundY = getIslandGroundHeight(fp.x, fp.z);
+        const targetSurfaceY = getWalkSurfaceHeight(fp.x, fp.z, fp.feetY);
+        if (!Number.isFinite(fp.walkSurfaceY)) {
+          fp.walkSurfaceY = targetSurfaceY;
+        } else {
+          fp.walkSurfaceY += (targetSurfaceY - fp.walkSurfaceY) * (1 - Math.exp(-dt * 22));
+        }
+        const groundY = fp.walkSurfaceY;
         fp.feetY = groundY + fp.jumpY;
         fp.y = groundY + FP_EYE_HEIGHT + settleLift + fp.jumpY + bobY;
         fpCamera.position.set(fp.x + rightX * swayX, fp.y, fp.z + rightZ * swayX);
@@ -6384,14 +7165,18 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
             handledByFpSwoop = true;
             swoopHideHead = rawW > 0.78;
             const e = smootherstep01(rawW);
-            const fov0 = 14;
             const fov1 = getBaseFpFov();
-            const curFov = fov0 + (fov1 - fov0) * (e * e);
             const lookDist1 = 14.0;
             const h0 = BASE_FRUSTUM / overviewZoom;
-            const h1 = lookDist1 * Math.tan(THREE.MathUtils.degToRad(fov1 * 0.5));
+            const tanHalf1 = Math.tan(THREE.MathUtils.degToRad(fov1 * 0.5));
+            const h1 = lookDist1 * tanHalf1;
+            // Start at 5600m quasi-orthographic distance (<1% foreshortening across the island)
+            // so switching from OrthographicCamera (end of Orbit) to PerspectiveCamera (start of Walk) has zero jump!
+            const tanHalf0 = h0 / 5600;
             const curH = h0 * Math.pow(h1 / h0, e);
-            const curDist = curH / Math.tan(THREE.MathUtils.degToRad(curFov * 0.5));
+            const curTanHalf = tanHalf0 + (tanHalf1 - tanHalf0) * Math.pow(e, 1.35);
+            const curFov = THREE.MathUtils.radToDeg(Math.atan(curTanHalf) * 2);
+            const curDist = curH / curTanHalf;
 
             const wYaw = introSweep.walkYaw;
             const wPitch = introSweep.walkPitch;
@@ -6403,10 +7188,11 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
             const t1Y = walkGroundY + FP_EYE_HEIGHT + fwd1Y * lookDist1;
             const t1Z = introSweep.walkZ + fwd1Z * lookDist1;
 
+            const orbitEndAz = HOME_AZ + Math.PI * 2;
             const curTx = HOME_TX + (t1X - HOME_TX) * e;
             const curTy = t1Y * e;
             const curTz = HOME_TZ + (t1Z - HOME_TZ) * e;
-            const curAz = HOME_AZ + wrapPi(wYaw - HOME_AZ) * e;
+            const curAz = orbitEndAz + wrapPi(wYaw - orbitEndAz) * e;
             const curEl = HOME_EL + (-wPitch - HOME_EL) * e;
 
             const px = curTx + Math.sin(curAz) * Math.cos(curEl) * curDist;
@@ -6414,10 +7200,10 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
             const pz = curTz + Math.cos(curAz) * Math.cos(curEl) * curDist;
 
             skyDome.visible = true;
-            skyDome.position.set(px, Math.max(0, py - FP_EYE_HEIGHT), pz);
+            skyDome.position.set(px, py, pz);
             fpCamera.fov = curFov;
-            fpCamera.near = 0.14 + (18.0 - 0.14) * ((1 - e) * (1 - e));
-            fpCamera.far = 820 + 260 * (1 - e);
+            fpCamera.near = Math.max(0.14, Math.min(120, curDist * 0.25));
+            fpCamera.far = Math.max(820, curDist + 950);
             fpCamera.position.set(px, py, pz);
             fpCamera.rotation.set(-curEl, curAz, 0);
             fpCamera.updateProjectionMatrix();
@@ -6607,7 +7393,7 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       }
     }
 
-    // 4. Step remote multiplayer peers & contextual [F] interaction scanner
+    // 4. Step remote multiplayer peers & contextual [E] interaction scanner
     remotePlayers.group.visible = !ogMode;
     if (!ogMode) {
       remotePlayers.step(dt, t, {
@@ -6665,6 +7451,26 @@ export function createMeadowWorldEngine(canvas, callbacks = {}, options = {}) {
       }
     }
   }
+
+  // Pre-warm WebGL shaders for both perspective (walk/swoop) and orthographic cameras + GTAO variants once scene is populated
+  try {
+    const prevSkyVis = skyDome.visible;
+    skyDome.visible = true;
+    renderer.compile(scene, fpCamera);
+    skyDome.visible = prevSkyVis;
+    renderer.compile(scene, camera);
+    if (gtaoPass && gtaoPass._fsQuad?._mesh) {
+      const quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+      gtaoPass._fsQuad.material = gtaoPass.gtaoMaterial;
+      syncComposerCamera(fpCamera);
+      renderer.compile(gtaoPass._fsQuad._mesh, quadCam);
+      syncComposerCamera(camera);
+      renderer.compile(gtaoPass._fsQuad._mesh, quadCam);
+    }
+  } catch {
+    // ignore shader pre-warm warnings on software WebGL contexts
+  }
+
   requestAnimationFrame(animate);
 
   return {

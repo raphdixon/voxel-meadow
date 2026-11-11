@@ -281,7 +281,7 @@ export interface WorldVillager {
 export interface BuildQueueJobInfo {
   jobId: string;
   status: "queued" | "sculpting" | "done" | "failed";
-  phase?: "queued" | "sculpting" | "reviewing" | "refining";
+  phase?: "queued" | "approving" | "sculpting" | "reviewing" | "refining" | "placing";
   /** 0 when actively sculpting right now; >= 1 for your spot in the waiting queue */
   position: number;
   activeCount: number;
@@ -407,3 +407,21 @@ export type MultiplayerServerMessage =
       id: string;
       onlineCount: number;
     };
+
+export type TrafficIncidentReason =
+  | "clash_gridlock"
+  | "turnaround_blocked"
+  | "building_obstruction"
+  | "self_restored";
+
+export interface TrafficIncidentRecord {
+  id: string;
+  vehicleId: string;
+  peerVehicleId?: string | null;
+  x: number;
+  z: number;
+  reason: TrafficIncidentReason;
+  count: number;
+  lastReportedAt: number;
+}
+

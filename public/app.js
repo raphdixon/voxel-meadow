@@ -30,6 +30,7 @@ const formError = document.getElementById("form-error");
 
 const buildingPill = document.getElementById("building-pill");
 const buildingPillLabel = document.getElementById("building-pill-label");
+const buildingPillSub = document.getElementById("building-pill-sub");
 const readyGotoBtn = document.getElementById("ready-goto-btn");
 const readyGotoLabel = document.getElementById("ready-goto-label");
 const locateMineBtn = document.getElementById("locate-mine-btn");
@@ -74,7 +75,6 @@ let toastTimer = null;
 
 // Live multi-user build queue state
 let activeJob = null;
-let jobTickInterval = null;
 let jobPollInterval = null;
 let jobPollInFlight = false;
 
@@ -88,61 +88,32 @@ function showToast(text, durationMs = 4200) {
   }, durationMs);
 }
 
-function formatEta(seconds) {
-  const s = Math.max(4, Math.round(Number(seconds) || 30));
-  if (s < 60) return `~${s}s`;
-  const m = Math.floor(s / 60);
-  const rem = s % 60;
-  return rem > 0 ? `~${m}m ${rem}s` : `~${m}m`;
-}
-
-function stepActiveJobEta() {
-  if (!activeJob) return;
-  const now = Date.now();
-  const dt = Math.min(2.5, Math.max(0, (now - (activeJob.lastFrameMs || now)) / 1000));
-  activeJob.lastFrameMs = now;
-  if (dt <= 0) return;
-
-  const pollAgeSec = Math.max(0, (now - (activeJob.syncedAtMs || now)) / 1000);
-  const serverAnchor = Math.max(4, Number(activeJob.etaSeconds) || 30);
-  const serverProjected =
-    serverAnchor > 16
-      ? Math.max(8, serverAnchor - pollAgeSec * 0.92)
-      : Math.max(4.5, serverAnchor - pollAgeSec * 0.35);
-
-  const disp = Number(activeJob.displayEtaSec) || serverAnchor;
-  if (disp > serverProjected + 0.6) {
-    const rate = Math.min(1.65, 0.9 + (disp - serverProjected) * 0.16);
-    activeJob.displayEtaSec = Math.max(serverProjected * 0.92, disp - rate * dt);
-  } else {
-    const tailRate = disp > 12 ? 0.52 : 0.2;
-    activeJob.displayEtaSec = Math.max(4.2, Math.max(serverProjected - 1.2, disp - tailRate * dt));
-  }
-}
-
 function renderActiveJobLabel() {
+  if (buildingPillSub) {
+    buildingPillSub.textContent = "Being built with Gemini 4 Hydrogen";
+  }
   if (!activeJob) {
-    buildingPillLabel.textContent = "Queueing…";
+    buildingPillLabel.textContent = "Approving query…";
     return;
   }
-  const remSec = Math.round(Number(activeJob.displayEtaSec ?? activeJob.etaSeconds) || 30);
   if (activeJob.status === "queued" && activeJob.position >= 1) {
-    buildingPillLabel.textContent = `Queue #${activeJob.position} · ${formatEta(remSec)}`;
+    buildingPillLabel.textContent =
+      activeJob.position === 1 ? "Next in queue…" : `Waiting in queue (#${activeJob.position})…`;
+  } else if (activeJob.phase === "approving") {
+    buildingPillLabel.textContent = "Approving query…";
   } else if (activeJob.phase === "reviewing") {
-    buildingPillLabel.textContent = remSec <= 5 ? "Reviewing…" : `Reviewing · ${formatEta(remSec)}`;
+    buildingPillLabel.textContent = "Reviewing 3D model…";
   } else if (activeJob.phase === "refining") {
-    buildingPillLabel.textContent = remSec <= 5 ? "Polishing…" : `Polishing · ${formatEta(remSec)}`;
+    buildingPillLabel.textContent = "Polishing details…";
+  } else if (activeJob.phase === "placing") {
+    buildingPillLabel.textContent = "Placing on island…";
   } else {
-    buildingPillLabel.textContent = remSec <= 5 ? "Finishing up…" : `Sculpting · ${formatEta(remSec)}`;
+    buildingPillLabel.textContent = "Sculpting voxels…";
   }
 }
 
 function stopJobTracking() {
   activeJob = null;
-  if (jobTickInterval) {
-    clearInterval(jobTickInterval);
-    jobTickInterval = null;
-  }
   if (jobPollInterval) {
     clearInterval(jobPollInterval);
     jobPollInterval = null;
@@ -252,6 +223,34 @@ function triggerCameraButtonClickFX(mode) {
   );
 }
 
+const lastIncidentSentByVehicle = new Map();
+
+async function reportTrafficIncidentToObserver(incident) {
+  if (isOgCapture || !incident || typeof incident.vehicleId !== "string") return;
+  const nowMs = Date.now();
+  const prevMs = lastIncidentSentByVehicle.get(incident.vehicleId) || 0;
+  if (nowMs - prevMs < 25_000) return;
+  lastIncidentSentByVehicle.set(incident.vehicleId, nowMs);
+  try {
+    await fetch("/api/traffic-incident", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-meadow-client": "1",
+      },
+      body: JSON.stringify({
+        vehicleId: incident.vehicleId,
+        peerVehicleId: incident.peerVehicleId || null,
+        x: incident.x,
+        z: incident.z,
+        reason: incident.reason || "self_restored",
+      }),
+    });
+  } catch {
+    // Ignore transient network errors during background telemetry
+  }
+}
+
 engine = createMeadowWorldEngine(
   worldCanvas,
   {
@@ -324,7 +323,7 @@ engine = createMeadowWorldEngine(
         return;
       }
       if (interactKeyEl) {
-        interactKeyEl.textContent = promptInfo.keyHint || "F";
+        interactKeyEl.textContent = promptInfo.keyHint || "E";
       }
       if (interactLabelEl) {
         interactLabelEl.textContent = promptInfo.label || "Interact";
@@ -351,6 +350,9 @@ engine = createMeadowWorldEngine(
       }
       hoverCard.hidden = true;
       mpClient?.forcePoseSync();
+    },
+    onTrafficIncident(incident) {
+      void reportTrafficIncidentToObserver(incident);
     },
   },
   { ogMode: isOgCapture },
@@ -637,28 +639,7 @@ async function pollActiveJob() {
       return;
     }
 
-    const prevPhase = activeJob.phase || activeJob.status;
-    const nextPhase = job.phase || job.status;
-    const prevDisp = Number(activeJob.displayEtaSec) || Number(job.etaSeconds) || 30;
-    const serverEta = Math.max(4, Number(job.etaSeconds) || 30);
-
-    let nextDisp = prevDisp;
-    if (prevPhase !== "refining" && nextPhase === "refining") {
-      // Argon triggered a Round-2 refinement pass: show honest Round-2 estimate alongside "Polishing"
-      nextDisp = Math.max(prevDisp, serverEta);
-    } else if (job.status === "queued" && (job.position || 0) < (activeJob.position || 0)) {
-      nextDisp = Math.min(prevDisp, serverEta);
-    } else if (serverEta > prevDisp + 12) {
-      nextDisp = prevDisp + (serverEta - prevDisp) * 0.35;
-    }
-
-    const now = Date.now();
-    activeJob = {
-      ...job,
-      displayEtaSec: nextDisp,
-      syncedAtMs: now,
-      lastFrameMs: activeJob.lastFrameMs || now,
-    };
+    activeJob = { ...job };
     renderActiveJobLabel();
   } catch {
     // ignore transient poll hiccups; next tick or WS broadcast will recover
@@ -669,29 +650,15 @@ async function pollActiveJob() {
 
 function startTrackingJob(jobInfo) {
   stopJobTracking();
-  const now = Date.now();
-  const initSec = Math.max(4, Number(jobInfo.etaSeconds) || 48);
-  activeJob = {
-    ...jobInfo,
-    displayEtaSec: initSec,
-    syncedAtMs: now,
-    lastFrameMs: now,
-  };
+  activeJob = { ...jobInfo };
   uiState = "building";
   syncDockUI();
-
-  jobTickInterval = setInterval(() => {
-    if (uiState === "building" && activeJob) {
-      stepActiveJobEta();
-      renderActiveJobLabel();
-    }
-  }, 500);
 
   jobPollInterval = setInterval(() => {
     if (uiState === "building" && activeJob) {
       pollActiveJob();
     }
-  }, 3000);
+  }, 2500);
 }
 
 // Dynamically resize the 3D staked plot on the island as the visitor describes tiny vs colossal subjects!
@@ -885,7 +852,7 @@ window.addEventListener("paste", (e) => {
   }
 });
 
-// Enqueue build into the multi-user workshop queue -> close builder immediately so visitor can explore while watching live Queue #N & ~ETA!
+// Enqueue build into the multi-user workshop queue -> close builder immediately so visitor can explore while watching live build stages!
 sculptBtn.addEventListener("click", async () => {
   if (uiState === "building") return;
   hideError();
@@ -901,7 +868,10 @@ sculptBtn.addEventListener("click", async () => {
 
   uiState = "building";
   sculptBtn.disabled = true;
-  buildingPillLabel.textContent = "Joining queue…";
+  buildingPillLabel.textContent = "Approving query…";
+  if (buildingPillSub) {
+    buildingPillSub.textContent = "Being built with Gemini 4 Hydrogen";
+  }
   syncDockUI();
 
   try {
@@ -1020,8 +990,8 @@ function handleWorldMessage(msg) {
       renderActiveJobLabel();
     } else if (activeEntry) {
       activeJob.status = "sculpting";
-      if (activeEntry.phase === "refining") {
-        activeJob.phase = "refining";
+      if (activeEntry.phase) {
+        activeJob.phase = activeEntry.phase;
       } else if (activeJob.phase === "queued") {
         activeJob.phase = "sculpting";
       }
@@ -1045,9 +1015,7 @@ function handleWorldMessage(msg) {
     }
     refreshLiveFeeds();
 
-    if (msg.type === "world_updated" && msg.note) {
-      showToast(msg.note, 4600);
-    } else if (
+    if (
       msg.type === "creation_placed" &&
       msg.creation &&
       msg.creation.id !== myCreationId &&

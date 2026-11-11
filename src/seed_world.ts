@@ -6,6 +6,7 @@ import type {
   WorldTerrainZone,
   WorldVillager,
 } from "./types";
+import { OUTER_RING_ROAD_POINTS } from "./voxel_audit";
 import { normalizeAndGroundBlueprint } from "./voxel_dsl";
 
 export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
@@ -589,6 +590,12 @@ export function buildSeedWorld(): Omit<WorldStateSnapshot, "myCreationId"> {
       id: "path-main-loop",
       kind: "road",
       points: mainLoopPoints,
+      closed: true,
+    },
+    {
+      id: "path-outer-ring",
+      kind: "road",
+      points: OUTER_RING_ROAD_POINTS.map(([x, z]) => [x, z] as [number, number]),
       closed: true,
     },
     {

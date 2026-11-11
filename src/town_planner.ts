@@ -3,13 +3,53 @@ import type {
   PathKind,
   RouteStop,
   ScaleClass,
+  TrafficIncidentRecord,
   WorldCreation,
   WorldPath,
   WorldProp,
   WorldStateSnapshot,
 } from "./types";
-import { distPointToPolyline2D, sampleCatmullRom2D } from "./voxel_audit";
+import { distPointToPolyline2D, OUTER_RING_ROAD_POINTS, sampleCatmullRom2D } from "./voxel_audit";
 import { detectBlueprintFrontAngle, getCreationFootprintRadius } from "./voxel_dsl";
+
+export function ensureOuterRingRoad(paths: WorldPath[]): boolean {
+  if (paths.some((p) => p.id === "path-outer-ring")) return false;
+  const insertIdx = paths.findIndex((p) => p.id === "path-main-loop");
+  const outerRing: WorldPath = {
+    id: "path-outer-ring",
+    kind: "road",
+    points: OUTER_RING_ROAD_POINTS.map(([x, z]) => [x, z] as [number, number]),
+    closed: true,
+  };
+  if (insertIdx >= 0) {
+    paths.splice(insertIdx + 1, 0, outerRing);
+  } else {
+    paths.unshift(outerRing);
+  }
+  return true;
+}
+
+function rotateClosedWaypointsNear(
+  pts: [number, number][],
+  refX: number,
+  refZ: number,
+): [number, number][] {
+  if (pts.length < 3) return pts;
+  let bestIdx = 0;
+  let bestD = Infinity;
+  for (let i = 0; i < pts.length; i++) {
+    const d = Math.hypot(pts[i][0] - refX, pts[i][1] - refZ);
+    if (d < bestD) {
+      bestD = d;
+      bestIdx = i;
+    }
+  }
+  if (bestIdx === 0) return pts.map(([x, z]) => [x, z]);
+  return pts.map((_, i) => {
+    const p = pts[(bestIdx + i) % pts.length];
+    return [p[0], p[1]];
+  });
+}
 
 export const ISLAND_HALF_EXTENT = 163.5;
 export const ISLAND_SUPERELLIPSE_EXP = 3.1;
@@ -842,6 +882,9 @@ export interface WorldTrafficCongestionReport {
   overloadedCorridors: CorridorLoadSummary[];
   pingPongLoopIntrusionIds: string[];
   longDwellVehicleIds: string[];
+  roadBlockedVehicleIds: string[];
+  crampedTurnaroundVehicleIds: string[];
+  activeIncidents: TrafficIncidentRecord[];
   summaryText: string;
 }
 
@@ -925,6 +968,7 @@ function sanitizeStopsAlongWaypoints(
 export function analyzeWorldTrafficCongestion(
   creations: WorldCreation[],
   paths: WorldPath[],
+  incidents: TrafficIncidentRecord[] = [],
 ): WorldTrafficCongestionReport {
   const drivablePaths = paths
     .filter((p) => (p.kind === "road" || p.kind === "cottage_road") && p.points.length >= 2)
@@ -937,12 +981,19 @@ export function analyzeWorldTrafficCongestion(
 
   const mainLoop = drivablePaths.find((rc) => rc.path.id === "path-main-loop");
   const vehicles = creations.filter((c) => c.behavior?.type === "vehicle_route");
+  const solidStructures = creations.filter(
+    (c) =>
+      c.behavior?.type !== "vehicle_route" &&
+      (c.category === "building" || c.behavior?.type === "landmark"),
+  );
 
   const corridorLoads = new Map<string, string[]>();
   for (const rc of drivablePaths) corridorLoads.set(rc.path.id, []);
 
   const pingPongLoopIntrusionIds: string[] = [];
   const longDwellVehicleIds: string[] = [];
+  const roadBlockedVehicleIds: string[] = [];
+  const crampedTurnaroundVehicleIds: string[] = [];
 
   for (const v of vehicles) {
     if (v.behavior.type !== "vehicle_route") continue;
@@ -956,12 +1007,59 @@ export function analyzeWorldTrafficCongestion(
       longDwellVehicleIds.push(v.id);
     }
 
-    if (mainLoop && v.behavior.loopMode === "pingpong") {
-      const ringHits = wps.filter(
-        ([wx, wz]) => distPointToPolyline2D(wx, wz, mainLoop.curve).dist <= 2.2,
-      ).length;
-      if (ringHits >= 2) {
-        pingPongLoopIntrusionIds.push(v.id);
+    const closed = v.behavior.loopMode !== "pingpong";
+    const sampledRoute = sampleCatmullRom2D(wps, closed, 1.5);
+    let routeObstructed = false;
+    for (const pt of sampledRoute) {
+      for (const bld of solidStructures) {
+        const bldR = getCreationFootprintRadius(
+          bld.scaleClass,
+          bld.blueprint?.stats?.footprintX ?? 14,
+          bld.blueprint?.stats?.footprintZ ?? 14,
+        );
+        if (Math.hypot(pt[0] - bld.x, pt[1] - bld.z) < bldR * 0.72) {
+          routeObstructed = true;
+          break;
+        }
+      }
+      if (routeObstructed) break;
+    }
+    if (routeObstructed) {
+      roadBlockedVehicleIds.push(v.id);
+    }
+
+    if (!closed) {
+      const endpoints = [wps[0], wps[wps.length - 1]];
+      let crampedEnd = false;
+      for (const ep of endpoints) {
+        if (getIslandInlandMargin(ep[0], ep[1]) < 3.5) {
+          crampedEnd = true;
+          break;
+        }
+        for (const bld of solidStructures) {
+          const bldR = getCreationFootprintRadius(
+            bld.scaleClass,
+            bld.blueprint?.stats?.footprintX ?? 14,
+            bld.blueprint?.stats?.footprintZ ?? 14,
+          );
+          if (Math.hypot(ep[0] - bld.x, ep[1] - bld.z) < bldR * 0.8 + 1.0) {
+            crampedEnd = true;
+            break;
+          }
+        }
+        if (crampedEnd) break;
+      }
+      if (crampedEnd) {
+        crampedTurnaroundVehicleIds.push(v.id);
+      }
+
+      if (mainLoop) {
+        const ringHits = wps.filter(
+          ([wx, wz]) => distPointToPolyline2D(wx, wz, mainLoop.curve).dist <= 2.2,
+        ).length;
+        if (ringHits >= 2) {
+          pingPongLoopIntrusionIds.push(v.id);
+        }
       }
     }
 
@@ -979,13 +1077,11 @@ export function analyzeWorldTrafficCongestion(
   const corridors: CorridorLoadSummary[] = drivablePaths.map((rc) => {
     const vehicleIds = corridorLoads.get(rc.path.id) ?? [];
     const capacity =
-      rc.path.id === "path-main-loop"
-        ? 2
-        : rc.lengthM >= 95
+      rc.path.id === "path-outer-ring"
+        ? 4
+        : Boolean(rc.path.closed) || rc.lengthM >= 55
           ? 2
-          : rc.path.kind === "road"
-            ? 2
-            : 2;
+          : 1;
     return {
       pathId: rc.path.id,
       kind: rc.path.kind,
@@ -997,11 +1093,17 @@ export function analyzeWorldTrafficCongestion(
     };
   });
 
+  const activeIncidents = incidents.filter((inc) =>
+    vehicles.some((v) => v.id === inc.vehicleId),
+  );
   const overloadedCorridors = corridors.filter((c) => c.overloaded);
   const congested =
     overloadedCorridors.length > 0 ||
     pingPongLoopIntrusionIds.length > 0 ||
-    longDwellVehicleIds.length > 0;
+    longDwellVehicleIds.length > 0 ||
+    roadBlockedVehicleIds.length > 0 ||
+    crampedTurnaroundVehicleIds.length > 0 ||
+    activeIncidents.length > 0;
 
   const summaryParts: string[] = [];
   if (overloadedCorridors.length > 0) {
@@ -1014,6 +1116,17 @@ export function analyzeWorldTrafficCongestion(
       `Regional ping-pong vehicles intruding onto path-main-loop: ${pingPongLoopIntrusionIds.join(", ")}`,
     );
   }
+  if (roadBlockedVehicleIds.length > 0) {
+    summaryParts.push(`Vehicles with building-obstructed waypoints: ${roadBlockedVehicleIds.join(", ")}`);
+  }
+  if (crampedTurnaroundVehicleIds.length > 0) {
+    summaryParts.push(`Open-route vehicles needing clear turnaround space: ${crampedTurnaroundVehicleIds.join(", ")}`);
+  }
+  if (activeIncidents.length > 0) {
+    summaryParts.push(
+      `Live vehicle clash/stuck incidents reported: ${activeIncidents.map((inc) => `${inc.vehicleId} (${inc.reason} x${inc.count} at [${inc.x}, ${inc.z}])`).join(", ")}`,
+    );
+  }
   if (longDwellVehicleIds.length > 0) {
     summaryParts.push(`Vehicles with excessive stop dwell/count: ${longDwellVehicleIds.join(", ")}`);
   }
@@ -1024,6 +1137,9 @@ export function analyzeWorldTrafficCongestion(
     overloadedCorridors,
     pingPongLoopIntrusionIds,
     longDwellVehicleIds,
+    roadBlockedVehicleIds,
+    crampedTurnaroundVehicleIds,
+    activeIncidents,
     summaryText: summaryParts.length > 0 ? summaryParts.join(" | ") : "All corridors within traffic capacity",
   };
 }
@@ -1039,6 +1155,7 @@ export function chooseLeastCongestedRoad(
   creations: WorldCreation[],
   paths: WorldPath[],
   excludeVehicleId?: string,
+  maxDistanceM?: number,
 ): WorldPath | null {
   const filteredCreations = excludeVehicleId
     ? creations.filter((c) => c.id !== excludeVehicleId)
@@ -1058,10 +1175,12 @@ export function chooseLeastCongestedRoad(
     const info = loadById.get(p.id)!;
     const curve = sampleCatmullRom2D(p.points, Boolean(p.closed), 0.75);
     const d = distPointToPolyline2D(targetX, targetZ, curve).dist;
+    if (typeof maxDistanceM === "number" && d > maxDistanceM) continue;
     const loadRatio = info.vehicleIds.length / Math.max(1, info.capacity);
     const overloadPenalty = info.vehicleIds.length >= info.capacity ? 240 + info.vehicleIds.length * 90 : loadRatio * 55;
+    const closedBonus = p.closed ? -28 : 0;
     const kindPenalty = p.kind === preferredKind ? 0 : 18;
-    const score = d * 0.65 + overloadPenalty + kindPenalty;
+    const score = d * 1.15 + overloadPenalty + kindPenalty + closedBonus;
     if (score < bestScore) {
       bestScore = score;
       best = p;
@@ -1154,6 +1273,7 @@ export function decongestWorldTraffic(
               creations,
               paths.filter((p) => p.id !== "path-main-loop"),
               c.id,
+              24,
             );
             if (alt && alt.points.length >= 3) {
               wps = dedupeConsecutiveWaypoints(alt.points);
@@ -1188,7 +1308,7 @@ export function decongestWorldTraffic(
     }
   }
 
-  // Step 2: Enforce corridor capacity (max 2 vehicles per corridor) & stagger speeds
+  // Step 2: Enforce corridor capacity (max 2 vehicles per corridor) on nearby roads only
   const report = analyzeWorldTrafficCongestion(creations, paths);
   for (const overloaded of report.overloadedCorridors) {
     const movableIds = overloaded.vehicleIds.filter((vid) => {
@@ -1201,18 +1321,33 @@ export function decongestWorldTraffic(
       const vc = creations.find((x) => x.id === vid);
       if (!vc || vc.behavior?.type !== "vehicle_route") continue;
 
-      const altRoad = chooseLeastCongestedRoad(
-        vc.x,
-        vc.z,
-        overloaded.kind,
-        creations,
-        paths.filter((p) => p.id !== overloaded.pathId),
-        vc.id,
-      );
+      // Only transition onto a nearby / intersecting road (such as path-outer-ring <= 24m away) — NEVER jump across the island!
+      const refPts: [number, number][] =
+        vc.behavior.waypoints.length >= 2
+          ? [
+              [vc.x, vc.z],
+              vc.behavior.waypoints[0],
+              vc.behavior.waypoints[vc.behavior.waypoints.length - 1],
+            ]
+          : [[vc.x, vc.z]];
+      let altRoad: WorldPath | null = null;
+      for (const [rx, rz] of refPts) {
+        altRoad = chooseLeastCongestedRoad(
+          rx,
+          rz,
+          overloaded.kind,
+          creations,
+          paths.filter((p) => p.id !== overloaded.pathId),
+          vc.id,
+          24,
+        );
+        if (altRoad) break;
+      }
       if (!altRoad || altRoad.points.length < 2) continue;
 
       const isClosed = Boolean(altRoad.closed) && altRoad.points.length >= 4;
-      const newWps = dedupeConsecutiveWaypoints(altRoad.points);
+      const rawWps = dedupeConsecutiveWaypoints(altRoad.points);
+      const newWps = isClosed ? rotateClosedWaypointsNear(rawWps, vc.x, vc.z) : rawWps;
       const newStops = sanitizeStopsAlongWaypoints(vc.behavior.stops, newWps, isClosed, vc.id);
       vc.behavior = {
         ...vc.behavior,
@@ -1220,23 +1355,28 @@ export function decongestWorldTraffic(
         waypoints: newWps,
         stops: newStops,
       };
-      vc.x = newWps[0][0];
-      vc.z = newWps[0][1];
+      const nearCurve = sampleCatmullRom2D(newWps, isClosed, 1.0);
+      const proj = distPointToPolyline2D(vc.x, vc.z, nearCurve);
+      vc.x = Number(proj.closestX.toFixed(1));
+      vc.z = Number(proj.closestZ.toFixed(1));
       changedIds.add(vc.id);
       notes.push(`rerouted "${vc.name}" (${vc.id}) from congested ${overloaded.pathId} onto ${altRoad.id}`);
     }
   }
 
-  // Step 3: Stagger speeds clearly among vehicles sharing any corridor so they never pace side-by-side
+  // Step 3: Stagger speeds gently downward (NEVER speeding up above authored speed!) when sharing a corridor
   const postReport = analyzeWorldTrafficCongestion(creations, paths);
-  const corridorSpeedSlots = [6.4, 4.65, 5.55];
+  const corridorFactors = [1.0, 0.86, 0.93];
   for (const corr of postReport.corridors) {
     if (corr.vehicleIds.length < 2) continue;
     corr.vehicleIds.forEach((vid, slotIdx) => {
+      if (slotIdx === 0) return;
       const vc = creations.find((x) => x.id === vid);
       if (!vc || vc.behavior?.type !== "vehicle_route" || vc.isSeed) return;
-      const desiredSpeed = corridorSpeedSlots[slotIdx % corridorSpeedSlots.length];
-      if (Math.abs((vc.behavior.speed || 5.8) - desiredSpeed) > 0.25) {
+      const curSpd = vc.behavior.speed || 5.4;
+      const factor = corridorFactors[slotIdx % corridorFactors.length];
+      const desiredSpeed = Number(Math.max(3.6, Math.min(curSpd, curSpd * factor)).toFixed(2));
+      if (curSpd - desiredSpeed > 0.2) {
         vc.behavior = { ...vc.behavior, speed: desiredSpeed };
         changedIds.add(vc.id);
       }
@@ -1245,3 +1385,103 @@ export function decongestWorldTraffic(
 
   return { changedIds: [...changedIds], notes };
 }
+
+/**
+ * Observer Agent deterministic resolution pass for vehicle clearance:
+ * - Clears route waypoints that genuinely clip inside newly placed solid buildings/landmarks.
+ * - Never swaps active driving vehicles onto distant roads mid-session so live vehicles never jump or fly.
+ */
+export function resolveTrafficIncidentsWithObserver(
+  creations: WorldCreation[],
+  _paths: WorldPath[],
+  incidents: TrafficIncidentRecord[],
+): {
+  changedIds: string[];
+  resolvedIncidentIds: string[];
+  notes: string[];
+} {
+  const changedIds = new Set<string>();
+  const resolvedIncidentIds: string[] = incidents.map((inc) => inc.id);
+  const notes: string[] = [];
+
+  const solidStructures = creations.filter(
+    (c) =>
+      c.behavior?.type !== "vehicle_route" &&
+      (c.category === "building" || c.behavior?.type === "landmark"),
+  );
+
+  const nudgeWaypointClearOfStructures = (
+    wx: number,
+    wz: number,
+    extraPad: number,
+  ): [number, number] => {
+    let [nx, nz] = clampPointToIsland(wx, wz, 5.5);
+    for (let pass = 0; pass < 2; pass++) {
+      for (const bld of solidStructures) {
+        const bldR =
+          getCreationFootprintRadius(
+            bld.scaleClass,
+            bld.blueprint?.stats?.footprintX ?? 14,
+            bld.blueprint?.stats?.footprintZ ?? 14,
+          ) *
+            0.76 +
+          extraPad;
+        const dx = nx - bld.x;
+        const dz = nz - bld.z;
+        const d = Math.hypot(dx, dz);
+        if (d < bldR) {
+          const ang = d > 0.01 ? Math.atan2(dz, dx) : 0.7;
+          nx = bld.x + Math.cos(ang) * bldR;
+          nz = bld.z + Math.sin(ang) * bldR;
+        }
+      }
+      [nx, nz] = clampPointToIsland(nx, nz, 4.8);
+    }
+    return [Number(nx.toFixed(2)), Number(nz.toFixed(2))];
+  };
+
+  for (const vc of creations) {
+    if (vc.behavior?.type !== "vehicle_route" || vc.isSeed) continue;
+    const wps = vc.behavior.waypoints ?? [];
+    if (wps.length < 2) continue;
+
+    const isPingPong = vc.behavior.loopMode === "pingpong";
+    let modified = false;
+    const adjustedWps: [number, number][] = wps.map(([wx, wz], idx) => {
+      const isEndpoint = isPingPong && (idx === 0 || idx === wps.length - 1);
+      const reqPad = isEndpoint ? 1.2 : 0.45;
+      const [cx, cz] = nudgeWaypointClearOfStructures(wx, wz, reqPad);
+      const shift = Math.hypot(cx - wx, cz - wz);
+      if (shift > 0.45 && shift <= 3.5) {
+        modified = true;
+        return [cx, cz];
+      }
+      return [wx, wz];
+    });
+
+    if (modified) {
+      const cleanWps = dedupeConsecutiveWaypoints(adjustedWps);
+      if (cleanWps.length >= (isPingPong ? 2 : 3)) {
+        const cleanStops = sanitizeStopsAlongWaypoints(
+          vc.behavior.stops,
+          cleanWps,
+          !isPingPong,
+          vc.id,
+        );
+        vc.behavior = {
+          ...vc.behavior,
+          waypoints: cleanWps,
+          stops: cleanStops,
+        };
+        changedIds.add(vc.id);
+      }
+    }
+  }
+
+  return {
+    changedIds: [...changedIds],
+    resolvedIncidentIds,
+    notes,
+  };
+}
+

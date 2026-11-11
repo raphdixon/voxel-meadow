@@ -1,5 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+  approveBuildQueryWithOrchestrator,
+  approveSculptedCreationWithOrchestrator,
   buildInitialIntegration,
   CITY_SIGN_POS,
   inferBiomeAndPathStyle,
@@ -9,6 +11,10 @@ import {
   type WorldPatch,
 } from "./argon_director";
 import { sculptWithArgon } from "./argon_sculptor";
+import {
+  checkIslandContentPolicy,
+  filterWorldCollectionsByPolicy,
+} from "./content_policy";
 import {
   type BuildComplexityBucket,
   type BuildEtaTelemetrySummary,
@@ -38,6 +44,8 @@ import type {
   MultiplayerPose,
   MultiplayerServerMessage,
   MultiplayerSocketAttachment,
+  TrafficIncidentReason,
+  TrafficIncidentRecord,
   WorldCreation,
   WorldPath,
   WorldProp,
@@ -72,11 +80,13 @@ import {
   chooseSimCityPlot,
   computeIntelligentBuildingYaw,
   decongestWorldTraffic,
+  ensureOuterRingRoad,
   FACTUAL_CREATION_DESCRIPTIONS,
   getIslandInlandMargin,
   normalizeFactualDescription,
   nudgeWanderPointClearOfWorld,
   PERIMETER_TITAN_SEED_LOOP,
+  resolveTrafficIncidentsWithObserver,
   sanitizeWanderTargetsForWorld,
 } from "./town_planner";
 
@@ -151,7 +161,7 @@ interface BuildJobRow {
   ip_hash: string;
   day_key: string;
   status: "queued" | "sculpting" | "done" | "failed";
-  phase: "queued" | "sculpting" | "reviewing" | "refining";
+  phase: "queued" | "approving" | "sculpting" | "reviewing" | "refining" | "placing";
   round1_ms: number | null;
   has_image: number;
   retry_count: number;
@@ -428,6 +438,9 @@ export class WorldDO extends DurableObject<Env> {
     WebSocket,
     { windowStartMs: number; count: number; lastProfileMs: number; lastEmoteMs?: number }
   >();
+  private trafficIncidents = new Map<string, TrafficIncidentRecord>();
+  private pendingObserverWeaveAt = 0;
+  private lastObserverWeaveAt = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -836,6 +849,16 @@ export class WorldDO extends DurableObject<Env> {
     if (upgradedV19.length === 0) {
       this.runUpgradeV19TrafficAndIntent();
       sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v19_traffic_and_intent', '1')`);
+    }
+
+    // One-time v20 Outer Ring Road beltway & Island Stewardship policy cleanup
+    // (non-destructive: keeps all persistent allowed community creations intact)
+    const upgradedV20 = sql
+      .exec(`SELECT value FROM meta WHERE key = 'upgrade_v20_outer_ring_and_policy' LIMIT 1`)
+      .toArray();
+    if (upgradedV20.length === 0) {
+      this.runUpgradeV20OuterRingAndPolicy();
+      sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_v20_outer_ring_and_policy', '1')`);
     }
 
     // Lightweight startup overlap & planar road-crossing repair (< 4ms, zero LLM calls)
@@ -1713,6 +1736,60 @@ export class WorldDO extends DurableObject<Env> {
     this.bumpVersion();
   }
 
+  private runUpgradeV20OuterRingAndPolicy(): void {
+    const sql = this.ctx.storage.sql;
+    const creationRows = sql.exec(`SELECT id, json FROM creations ORDER BY created_at ASC`).toArray();
+    const creations = creationRows.map((r) => JSON.parse(String(r.json)) as WorldCreation);
+    const pathRows = sql.exec(`SELECT id, json FROM paths`).toArray();
+    const paths = pathRows.map((r) => JSON.parse(String(r.json)) as WorldPath);
+    const propRows = sql.exec(`SELECT id, json FROM props`).toArray();
+    const props = propRows.map((r) => JSON.parse(String(r.json)) as WorldProp);
+
+    const filtered = filterWorldCollectionsByPolicy({ creations, paths, props });
+    const keptCreationIds = new Set(filtered.creations.map((c) => c.id));
+    for (const row of creationRows) {
+      const cid = String(row.id);
+      if (!keptCreationIds.has(cid)) {
+        sql.exec(`DELETE FROM creations WHERE id = ?`, cid);
+        sql.exec(`DELETE FROM integration_queue WHERE creation_id = ?`, cid);
+        sql.exec(`DELETE FROM terrain_zones WHERE id = ?`, `initzone-${cid}`);
+      }
+    }
+
+    ensureOuterRingRoad(filtered.paths);
+    const keptPathIds = new Set(filtered.paths.map((p) => p.id));
+    for (const row of pathRows) {
+      const pid = String(row.id);
+      if (!keptPathIds.has(pid)) {
+        sql.exec(`DELETE FROM paths WHERE id = ?`, pid);
+      }
+    }
+    const ring = filtered.paths.find((p) => p.id === "path-outer-ring");
+    if (ring) {
+      sql.exec(`INSERT OR REPLACE INTO paths (id, json) VALUES (?, ?)`, ring.id, JSON.stringify(ring));
+    }
+
+    const keptPropIds = new Set(filtered.props.map((pr) => pr.id));
+    for (const row of propRows) {
+      const prid = String(row.id);
+      if (!keptPropIds.has(prid)) {
+        sql.exec(`DELETE FROM props WHERE id = ?`, prid);
+      }
+    }
+    for (const pr of filtered.props) {
+      sql.exec(`INSERT OR REPLACE INTO props (id, json) VALUES (?, ?)`, pr.id, JSON.stringify(pr));
+    }
+
+    const currentNote = this.getMeta("lastWeaveNote", "");
+    if (!currentNote || !checkIslandContentPolicy(currentNote).allowed) {
+      this.setMeta(
+        "lastWeaveNote",
+        "Outer Ring Road beltway connected and traffic balanced across districts.",
+      );
+    }
+    this.bumpVersion();
+  }
+
   private auditAndRepairWorld(): { repairedCount: number; repairs: string[] } {
     const sql = this.ctx.storage.sql;
     const repairs: string[] = [];
@@ -1755,6 +1832,13 @@ export class WorldDO extends DurableObject<Env> {
 
     const pathRows = sql.exec(`SELECT id, json FROM paths`).toArray();
     const paths = pathRows.map((r) => JSON.parse(String(r.json)) as WorldPath);
+    if (ensureOuterRingRoad(paths)) {
+      const ring = paths.find((p) => p.id === "path-outer-ring");
+      if (ring) {
+        sql.exec(`INSERT OR REPLACE INTO paths (id, json) VALUES (?, ?)`, ring.id, JSON.stringify(ring));
+      }
+      repairs.push("added outer ring road beltway");
+    }
     const propRows = sql.exec(`SELECT id, json FROM props`).toArray();
     const props = propRows.map((r) => JSON.parse(String(r.json)) as WorldProp);
 
@@ -1888,6 +1972,27 @@ export class WorldDO extends DurableObject<Env> {
       repairs.push(...decong.notes);
     }
 
+    // Observer Agent deterministic resolution of any live client-reported traffic incidents
+    const activeIncidents = this.getActiveTrafficIncidents();
+    const obsRes = resolveTrafficIncidentsWithObserver(
+      creations,
+      spatial.paths,
+      activeIncidents,
+    );
+    if (obsRes.resolvedIncidentIds.length > 0) {
+      for (const rid of obsRes.resolvedIncidentIds) {
+        this.trafficIncidents.delete(rid);
+      }
+    }
+    if (obsRes.changedIds.length > 0) {
+      for (const cid of obsRes.changedIds) {
+        const target = creations.find((c) => c.id === cid);
+        if (!target) continue;
+        sql.exec(`UPDATE creations SET json = ? WHERE id = ?`, JSON.stringify(target), cid);
+      }
+      repairs.push(...obsRes.notes);
+    }
+
     // Align non-seed stationary buildings & landmarks to face their approach road/lane naturally
     const frontage = alignLandmarksToFrontage(creations, spatial.paths);
     if (frontage.changedIds.length > 0) {
@@ -2011,7 +2116,7 @@ export class WorldDO extends DurableObject<Env> {
       const refreshed = this.readBaseWorld();
       this.broadcast({
         type: "world_updated",
-        note: `Orchestrator repaired ${res.repairedCount} voxel overlap(s).`,
+        note: "",
         world: { ...refreshed, myCreationId: null },
       });
     }
@@ -2103,6 +2208,7 @@ export class WorldDO extends DurableObject<Env> {
     ) {
       this.runUpgradeV19TrafficAndIntent();
     }
+    this.runUpgradeV20OuterRingAndPolicy();
     const repairRes = this.auditAndRepairWorld();
     const after = this.readBaseWorld();
     this.bumpVersion();
@@ -2236,7 +2342,7 @@ export class WorldDO extends DurableObject<Env> {
           : null;
       const isSafetyRejection =
         typeof rawErrMsg === "string" &&
-        /^(I cannot|That creation doesn't fit|Let's keep our shared meadow|Please try creating something family-friendly)/i.test(
+        /^(I cannot|That creation doesn't fit|Let's keep (?:our shared meadow|GeminIsland)|GeminIsland is a welcoming|Please try creating something family-friendly)/i.test(
           rawErrMsg.trim(),
         );
       return {
@@ -2418,7 +2524,11 @@ export class WorldDO extends DurableObject<Env> {
   private parseJobRow(r: Record<string, unknown>): BuildJobRow {
     const rawPhase = String(r.phase ?? "queued");
     const phase: BuildJobRow["phase"] =
-      rawPhase === "refining" || rawPhase === "reviewing" || rawPhase === "sculpting"
+      rawPhase === "placing" ||
+      rawPhase === "refining" ||
+      rawPhase === "reviewing" ||
+      rawPhase === "sculpting" ||
+      rawPhase === "approving"
         ? rawPhase
         : "queued";
     const hasImg =
@@ -2509,16 +2619,17 @@ export class WorldDO extends DurableObject<Env> {
     const targetFeatures = classifyBuildFeatures(target.prompt, target.has_image === 1);
 
     if (target.status === "sculpting" || (target.status === "queued" && target.retry_count > 0)) {
-      const elapsed =
-        target.status === "queued" && target.retry_count > 0
-          ? 8_000
-          : Math.max(0, now - (target.started_at ?? now));
-      const activePhase: "sculpting" | "reviewing" | "refining" =
-        target.phase === "refining"
-          ? "refining"
-          : target.phase === "reviewing"
-            ? "reviewing"
-            : "sculpting";
+      const elapsed = Math.max(0, now - (target.started_at ?? target.created_at ?? now));
+      const activePhase: "approving" | "sculpting" | "reviewing" | "refining" | "placing" =
+        target.phase === "placing"
+          ? "placing"
+          : target.phase === "refining"
+            ? "refining"
+            : target.phase === "reviewing"
+              ? "reviewing"
+              : target.phase === "approving"
+                ? "approving"
+                : "sculpting";
       const remainingMs =
         typeof target.sim_delay_ms === "number" && target.sim_delay_ms > 0
           ? Math.max(1_500, target.sim_delay_ms - elapsed)
@@ -2654,6 +2765,17 @@ export class WorldDO extends DurableObject<Env> {
         myCreationId: existingTodayId,
         error: "You've already added your creation for today — come back tomorrow to add another!",
       };
+    }
+
+    if (input.prompt) {
+      const policyCheck = checkIslandContentPolicy(input.prompt);
+      if (!policyCheck.allowed) {
+        return {
+          ok: false,
+          status: 400,
+          error: policyCheck.reason,
+        };
+      }
     }
 
     // 2. Idempotent resume if this browser already has a job queued or sculpting right now
@@ -2894,14 +3016,14 @@ export class WorldDO extends DurableObject<Env> {
       const row = this.parseJobRow(nextRows[0] as Record<string, unknown>);
       if (this.activeJobPromises.has(row.job_id)) break;
 
-      const startedAt = Date.now();
+      const startedAt = row.started_at ?? Date.now();
       sql.exec(
-        `UPDATE build_jobs SET status = 'sculpting', phase = 'sculpting', started_at = ? WHERE job_id = ?`,
+        `UPDATE build_jobs SET status = 'sculpting', phase = 'approving', started_at = ? WHERE job_id = ?`,
         startedAt,
         row.job_id,
       );
       row.status = "sculpting";
-      row.phase = "sculpting";
+      row.phase = "approving";
       row.started_at = startedAt;
       promoted = true;
 
@@ -2998,6 +3120,56 @@ export class WorldDO extends DurableObject<Env> {
       const hasImg = Boolean(job.has_image || (job.image_base64 && job.image_mime));
       const features = classifyBuildFeatures(job.prompt, hasImg);
 
+      // Step 1: Orchestration Agent double-check & approval gate on EVERY query (text + image)
+      sql.exec(`UPDATE build_jobs SET phase = 'approving' WHERE job_id = ?`, job.job_id);
+      this.broadcastQueueTick();
+
+      const queryApproval = await approveBuildQueryWithOrchestrator({
+        prompt: job.prompt,
+        imageBase64: job.image_base64 ?? undefined,
+        imageMimeType: job.image_mime ?? undefined,
+        apiKey: this.env.GEMINI_API_KEY,
+        hydrogenModel: this.env.HYDROGEN_MODEL,
+        hydrogenModels: this.env.HYDROGEN_MODELS,
+        primaryModel: this.env.ARGON_MODEL,
+        bariumModels: this.env.BARIUM_MODELS,
+        fallbackModel: this.env.FALLBACK_MODEL,
+      });
+
+      if (!queryApproval.approved) {
+        if (queryApproval.retryable && (job.retry_count || 0) < 3) {
+          const nextRetries = (job.retry_count || 0) + 1;
+          const retryDelayMs = Math.min(6_000, 1_500 * nextRetries);
+          sql.exec(
+            `UPDATE build_jobs
+             SET status = 'queued', phase = 'approving', retry_count = ?, next_retry_at = ?, started_at = ?
+             WHERE job_id = ?`,
+            nextRetries,
+            Date.now() + retryDelayMs,
+            job.started_at ?? t0,
+            job.job_id,
+          );
+          this.broadcastQueueTick();
+          await this.ctx.storage.setAlarm(Date.now() + retryDelayMs);
+          return;
+        }
+        sql.exec(
+          `UPDATE build_jobs
+           SET status = 'failed', finished_at = ?, model_used = ?, error_msg = ?, image_base64 = NULL
+           WHERE job_id = ?`,
+          Date.now(),
+          queryApproval.modelUsed,
+          queryApproval.reason,
+          job.job_id,
+        );
+        this.broadcastQueueTick();
+        return;
+      }
+
+      // Step 2: Sculpt with Gemini 4 Hydrogen cascade
+      sql.exec(`UPDATE build_jobs SET phase = 'sculpting' WHERE job_id = ?`, job.job_id);
+      this.broadcastQueueTick();
+
       const sculpted = await sculptWithArgon(
         {
           prompt: job.prompt,
@@ -3022,13 +3194,16 @@ export class WorldDO extends DurableObject<Env> {
       );
 
       if (!sculpted.ok) {
-        if (sculpted.unsafe) {
+        if (sculpted.unsafe || sculpted.retryable === false || (job.retry_count || 0) >= 3) {
           sql.exec(
             `UPDATE build_jobs
              SET status = 'failed', finished_at = ?, error_msg = ?, error_detail = ?, image_base64 = NULL
              WHERE job_id = ?`,
             Date.now(),
-            sculpted.error || "Please try creating something family-friendly.",
+            sculpted.unsafe
+              ? sculpted.error || "Please try creating something family-friendly."
+              : sculpted.error ||
+                  "Gemini 4 Hydrogen is busy sculpting right now — please try again in a moment.",
             sculpted.errorDetail
               ? redactSecrets(sculpted.errorDetail, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET])
               : null,
@@ -3038,8 +3213,7 @@ export class WorldDO extends DurableObject<Env> {
           return;
         }
 
-        // Transient timeout / upstream overload: NEVER surface an "Argon took too long" error!
-        // Keep image_base64 intact and re-queue via DO alarm until sculpting succeeds.
+        // Transient timeout / upstream overload: re-queue via DO alarm up to 3 attempts
         const nextRetries = (job.retry_count || 0) + 1;
         const retryDelayMs = Math.min(8_000, 1_500 * nextRetries);
         sql.exec(
@@ -3048,7 +3222,7 @@ export class WorldDO extends DurableObject<Env> {
            WHERE job_id = ?`,
           nextRetries,
           Date.now() + retryDelayMs,
-          Date.now(),
+          job.started_at ?? t0,
           sculpted.errorDetail
             ? redactSecrets(sculpted.errorDetail, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET])
             : null,
@@ -3056,6 +3230,37 @@ export class WorldDO extends DurableObject<Env> {
         );
         this.broadcastQueueTick();
         await this.ctx.storage.setAlarm(Date.now() + retryDelayMs);
+        return;
+      }
+
+      // Step 3: Orchestration Agent post-sculpt double-check before placing on the island
+      sql.exec(`UPDATE build_jobs SET phase = 'placing' WHERE job_id = ?`, job.job_id);
+      this.broadcastQueueTick();
+
+      const postApproval = await approveSculptedCreationWithOrchestrator({
+        prompt: job.prompt,
+        blueprintName: sculpted.blueprint.name,
+        blueprintDescription: sculpted.blueprint.description,
+        extractedSubject: sculpted.extractedSubject,
+        apiKey: this.env.GEMINI_API_KEY,
+        hydrogenModel: this.env.HYDROGEN_MODEL,
+        hydrogenModels: this.env.HYDROGEN_MODELS,
+        primaryModel: this.env.ARGON_MODEL,
+        bariumModels: this.env.BARIUM_MODELS,
+        fallbackModel: this.env.FALLBACK_MODEL,
+      });
+
+      if (!postApproval.approved) {
+        sql.exec(
+          `UPDATE build_jobs
+           SET status = 'failed', finished_at = ?, model_used = ?, error_msg = ?, image_base64 = NULL
+           WHERE job_id = ?`,
+          Date.now(),
+          postApproval.modelUsed,
+          postApproval.reason,
+          job.job_id,
+        );
+        this.broadcastQueueTick();
         return;
       }
 
@@ -3112,6 +3317,19 @@ export class WorldDO extends DurableObject<Env> {
     } catch (err) {
       const redactedDetail = redactSecrets(err, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET]);
       safeLogError("build_queue_worker_retrying", err, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET]);
+      if ((job.retry_count || 0) >= 3) {
+        sql.exec(
+          `UPDATE build_jobs
+           SET status = 'failed', finished_at = ?, error_msg = ?, error_detail = ?, image_base64 = NULL
+           WHERE job_id = ?`,
+          Date.now(),
+          "Gemini 4 Hydrogen is busy sculpting right now — please try again in a moment.",
+          redactedDetail,
+          job.job_id,
+        );
+        this.broadcastQueueTick();
+        return;
+      }
       const nextRetries = (job.retry_count || 0) + 1;
       const retryDelayMs = Math.min(8_000, 1_500 * nextRetries);
       sql.exec(
@@ -3120,7 +3338,7 @@ export class WorldDO extends DurableObject<Env> {
          WHERE job_id = ?`,
         nextRetries,
         Date.now() + retryDelayMs,
-        Date.now(),
+        job.started_at ?? t0,
         redactedDetail,
         job.job_id,
       );
@@ -3325,6 +3543,7 @@ export class WorldDO extends DurableObject<Env> {
     if (patch.removePathIds && patch.removePathIds.length > 0) {
       const protectedSeed = new Set([
         "path-main-loop",
+        "path-outer-ring",
         "path-clocktower-spur",
         "path-bakery-spur",
         "path-bookshop-spur",
@@ -3338,7 +3557,7 @@ export class WorldDO extends DurableObject<Env> {
     }
 
     const pathCount = Number(sql.exec(`SELECT COUNT(*) AS c FROM paths`).toArray()[0]?.c ?? 0);
-    if (pathCount < 64) {
+    if (pathCount < 96) {
       for (const p of patch.newPaths) {
         sql.exec(`INSERT OR REPLACE INTO paths (id, json) VALUES (?, ?)`, p.id, JSON.stringify(p));
       }
@@ -3358,7 +3577,7 @@ export class WorldDO extends DurableObject<Env> {
     }
 
     const propCount = Number(sql.exec(`SELECT COUNT(*) AS c FROM props`).toArray()[0]?.c ?? 0);
-    if (propCount < 76) {
+    if (propCount < 96) {
       for (const pr of patch.newProps) {
         sql.exec(`INSERT OR REPLACE INTO props (id, json) VALUES (?, ?)`, pr.id, JSON.stringify(pr));
       }
@@ -3391,7 +3610,7 @@ export class WorldDO extends DurableObject<Env> {
           );
           continue;
         }
-        if (companionCount >= 6) break;
+        if (companionCount >= 8) break;
         const bp = buildCompanionVehicleBlueprint(spec.archetype, spec.name, spec.description);
         const startWp =
           spec.behavior.type === "vehicle_route" && spec.behavior.waypoints.length > 0
@@ -3482,6 +3701,10 @@ export class WorldDO extends DurableObject<Env> {
     const cleanDesc = normalizeFactualDescription(bp.description);
     bp.description = cleanDesc;
     const contextText = `${bp.name} ${cleanDesc} ${cleanPrompt}`;
+    const placementPolicy = checkIslandContentPolicy(contextText);
+    if (!placementPolicy.allowed) {
+      return { ok: false, error: placementPolicy.reason };
+    }
     const [x, z] = this.chooseMeadowSpot(
       input.x,
       input.z,
@@ -3624,6 +3847,8 @@ export class WorldDO extends DurableObject<Env> {
           this.env.ARGON_MODEL,
           this.env.FALLBACK_MODEL,
           this.env.BARIUM_MODELS,
+          this.env.HYDROGEN_MODEL,
+          this.env.HYDROGEN_MODELS,
         );
         if (patch) {
           this.applyWorldPatch(patch);
@@ -3631,13 +3856,20 @@ export class WorldDO extends DurableObject<Env> {
           const refreshed = this.readBaseWorld();
           this.broadcast({
             type: "world_updated",
-            note: patch.weaveNote,
+            note: "",
             world: { ...refreshed, myCreationId: null },
           });
         }
       } catch (err) {
         safeLogError("alarm_integration", err, [this.env.GEMINI_API_KEY, this.env.CREATOR_HMAC_SECRET]);
       }
+    }
+
+    // 3. Process scheduled Observer Agent traffic weave if due
+    if (this.pendingObserverWeaveAt > 0 && Date.now() >= this.pendingObserverWeaveAt) {
+      this.pendingObserverWeaveAt = 0;
+      this.lastObserverWeaveAt = Date.now();
+      await this.runCronWeaver();
     }
 
     const remainingIntegrations = Number(
@@ -3648,7 +3880,111 @@ export class WorldDO extends DurableObject<Env> {
     );
     if (remainingIntegrations > 0 || remainingQueued > 0 || this.activeJobPromises.size > 0) {
       await this.ctx.storage.setAlarm(Date.now() + 800);
+    } else if (this.pendingObserverWeaveAt > Date.now()) {
+      await this.ctx.storage.setAlarm(this.pendingObserverWeaveAt);
     }
+  }
+
+  public getActiveTrafficIncidents(): TrafficIncidentRecord[] {
+    const now = Date.now();
+    const out: TrafficIncidentRecord[] = [];
+    for (const [key, rec] of this.trafficIncidents.entries()) {
+      if (now - rec.lastReportedAt > 25 * 60_000) {
+        this.trafficIncidents.delete(key);
+        continue;
+      }
+      out.push(rec);
+    }
+    return out;
+  }
+
+  public async reportTrafficIncident(input: {
+    vehicleId: string;
+    peerVehicleId?: string | null;
+    x: number;
+    z: number;
+    reason: TrafficIncidentReason;
+  }): Promise<{
+    ok: boolean;
+    resolvedImmediately: boolean;
+    scheduledObserverWeave: boolean;
+    note: string;
+  }> {
+    const sql = this.ctx.storage.sql;
+    const vehRows = sql.exec(`SELECT json FROM creations WHERE id = ? LIMIT 1`, input.vehicleId).toArray();
+    if (vehRows.length === 0) {
+      return {
+        ok: false,
+        resolvedImmediately: false,
+        scheduledObserverWeave: false,
+        note: "Unknown vehicle creation",
+      };
+    }
+    const veh = JSON.parse(String(vehRows[0].json)) as WorldCreation;
+    if (veh.behavior?.type !== "vehicle_route") {
+      return {
+        ok: false,
+        resolvedImmediately: false,
+        scheduledObserverWeave: false,
+        note: "Unknown vehicle creation",
+      };
+    }
+
+    const now = Date.now();
+    const key = `${input.vehicleId}:${input.reason}`;
+    const existing = this.trafficIncidents.get(key);
+    const updated: TrafficIncidentRecord = {
+      id: key,
+      vehicleId: input.vehicleId,
+      peerVehicleId: input.peerVehicleId || existing?.peerVehicleId || null,
+      x: Number(Math.max(-180, Math.min(180, input.x || veh.x)).toFixed(1)),
+      z: Number(Math.max(-180, Math.min(180, input.z || veh.z)).toFixed(1)),
+      reason: input.reason,
+      count: (existing?.count || 0) + 1,
+      lastReportedAt: now,
+    };
+    this.trafficIncidents.set(key, updated);
+    if (this.trafficIncidents.size > 64) {
+      const oldestKey = this.trafficIncidents.keys().next().value;
+      if (oldestKey) this.trafficIncidents.delete(oldestKey);
+    }
+
+    const auditRes = this.auditAndRepairWorld();
+    let resolvedImmediately = false;
+    let note = "Recorded vehicle telemetry for Observer Agent.";
+
+    if (auditRes.repairedCount > 0) {
+      resolvedImmediately = true;
+      note = "Updated traffic routing.";
+      const refreshed = this.readBaseWorld();
+      this.broadcast({
+        type: "world_updated",
+        note: "",
+        world: { ...refreshed, myCreationId: null },
+      });
+    }
+
+    const stillActive = this.trafficIncidents.has(key);
+    let scheduledObserverWeave = false;
+    if (
+      (stillActive || updated.count >= 2) &&
+      this.pendingObserverWeaveAt === 0 &&
+      now - this.lastObserverWeaveAt >= 40_000
+    ) {
+      scheduledObserverWeave = true;
+      this.pendingObserverWeaveAt = now + 4_500;
+      const curAlarm = await this.ctx.storage.getAlarm();
+      if (!curAlarm || curAlarm > this.pendingObserverWeaveAt) {
+        await this.ctx.storage.setAlarm(this.pendingObserverWeaveAt);
+      }
+    }
+
+    return {
+      ok: true,
+      resolvedImmediately,
+      scheduledObserverWeave,
+      note,
+    };
   }
 
   /**
@@ -3690,6 +4026,8 @@ export class WorldDO extends DurableObject<Env> {
         blueprint: priorityTarget.blueprint,
         promptText: priorityTarget.creatorPrompt!,
         apiKey: this.env.GEMINI_API_KEY,
+        hydrogenModel: this.env.HYDROGEN_MODEL,
+        hydrogenModels: this.env.HYDROGEN_MODELS,
         primaryModel: this.env.ARGON_MODEL,
         bariumModels: this.env.BARIUM_MODELS,
         fallbackModel: this.env.FALLBACK_MODEL,
@@ -3784,7 +4122,7 @@ export class WorldDO extends DurableObject<Env> {
       const refreshed = this.readBaseWorld();
       this.broadcast({
         type: "world_updated",
-        note: healNote,
+        note: "",
         world: { ...refreshed, myCreationId: null },
       });
 
@@ -3810,7 +4148,7 @@ export class WorldDO extends DurableObject<Env> {
       const healedWorld = this.readBaseWorld();
       this.broadcast({
         type: "world_updated",
-        note: `Orchestrator auto-repaired ${auditRes.repairedCount} voxel overlap(s).`,
+        note: "",
         world: { ...healedWorld, myCreationId: null },
       });
     }
@@ -3825,6 +4163,7 @@ export class WorldDO extends DurableObject<Env> {
     }
 
     const world = this.readBaseWorld();
+    const activeIncidents = this.getActiveTrafficIncidents();
     const hasUnintegrated = world.creations.some((c) => !c.isCompanion && c.integratedLevel < 2);
     const hasStuckMobile = world.creations.some(
       (c) => !c.isSeed && !c.isCompanion && needsMobilityAmendment(c),
@@ -3832,11 +4171,18 @@ export class WorldDO extends DurableObject<Env> {
     const hasTrafficCongestion = analyzeWorldTrafficCongestion(
       world.creations,
       world.paths,
+      activeIncidents,
     ).congested;
     const lastWeaveCount = Number(this.getMeta("lastWeaveCount", "0")) || 0;
     const hasNewCreations = world.creations.length > lastWeaveCount;
 
-    if (!hasUnintegrated && !hasStuckMobile && !hasTrafficCongestion && !hasNewCreations) {
+    if (
+      !hasUnintegrated &&
+      !hasStuckMobile &&
+      !hasTrafficCongestion &&
+      !hasNewCreations &&
+      activeIncidents.length === 0
+    ) {
       return {
         ok: true,
         note: criticAudit.note
@@ -3854,15 +4200,19 @@ export class WorldDO extends DurableObject<Env> {
         this.env.ARGON_MODEL,
         this.env.FALLBACK_MODEL,
         this.env.BARIUM_MODELS,
+        this.env.HYDROGEN_MODEL,
+        this.env.HYDROGEN_MODELS,
+        activeIncidents,
       );
       if (patch) {
         this.applyWorldPatch(patch);
+        this.trafficIncidents.clear();
         this.auditAndRepairWorld();
         const refreshed = this.readBaseWorld();
         this.setMeta("lastWeaveCount", String(refreshed.creations.length));
         this.broadcast({
           type: "world_updated",
-          note: patch.weaveNote,
+          note: "",
           world: { ...refreshed, myCreationId: null },
         });
         return { ok: true, note: patch.weaveNote };

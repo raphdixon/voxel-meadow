@@ -805,8 +805,28 @@ export function autoRepairBlueprintOverlaps(bp: VoxelBlueprint): BlueprintRepair
   };
 }
 
+export const OUTER_RING_ROAD_POINTS: [number, number][] = [
+  [-81, -6],
+  [-78, -44],
+  [-58, -60],
+  [-32, -82],
+  [0, -86],
+  [36, -80],
+  [58, -58],
+  [78, -36],
+  [79, 0],
+  [76, 34],
+  [62, 60],
+  [26, 56],
+  [-8, 66],
+  [-34, 74],
+  [-68, 42],
+  [-85, 18],
+];
+
 const SEED_PATH_IDS = new Set([
   "path-main-loop",
+  "path-outer-ring",
   "path-clocktower-spur",
   "path-bakery-spur",
   "path-bookshop-spur",
@@ -1639,7 +1659,7 @@ export function auditAndRepairWorldSpatial(
   // 4. Remaining initpath-* spurs
   // 5. Auto-generated Stage 5 radial spurs ("spur-*", sorted by owner landmark radial distance)
   const kindRank = (p: WorldPath): number => {
-    if (p.id === "path-main-loop") return 0;
+    if (p.id === "path-main-loop" || p.id === "path-outer-ring") return 0;
     if (SEED_PATH_IDS.has(p.id)) return 1;
     if (p.kind === "road") return 2;
     if (p.id.startsWith("spur-")) return 5;

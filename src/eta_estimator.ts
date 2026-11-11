@@ -13,7 +13,7 @@
  */
 
 export type BuildComplexityBucket = "compact" | "standard" | "complex";
-export type ActiveBuildPhase = "sculpting" | "reviewing" | "refining";
+export type ActiveBuildPhase = "approving" | "sculpting" | "reviewing" | "refining" | "placing";
 
 export interface BuildTelemetrySample {
   durationMs: number;

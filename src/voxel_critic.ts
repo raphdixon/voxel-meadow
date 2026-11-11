@@ -744,6 +744,8 @@ export async function reviewBlueprintWithCritic(opts: {
   userImageBase64?: string;
   userImageMimeType?: string;
   apiKey: string;
+  hydrogenModel?: string;
+  hydrogenModels?: string | readonly string[];
   primaryModel?: string;
   bariumModels?: string | readonly string[];
   fallbackModel?: string;
@@ -773,6 +775,8 @@ export async function reviewBlueprintWithCritic(opts: {
   const res = await callGeminiWithFallbacks({
     apiKey: opts.apiKey,
     mode: "critic",
+    hydrogenModel: opts.hydrogenModel,
+    hydrogenModels: opts.hydrogenModels,
     primaryModel: opts.primaryModel,
     bariumModels: opts.bariumModels,
     fallbackModel: opts.fallbackModel,

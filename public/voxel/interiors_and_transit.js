@@ -2063,7 +2063,7 @@ export function createInteriorAndTransitSystem({
         kind: "hop_off",
         id: activeRideId,
         label: "Hop off",
-        keyHint: "F",
+        keyHint: "E",
         execute: () => hopOffVehicle(),
       };
     }
@@ -2074,7 +2074,7 @@ export function createInteriorAndTransitSystem({
         kind: "stand_up",
         id: seatState.id || "seat",
         label: "Stand up",
-        keyHint: "F",
+        keyHint: "E",
         execute: () => standUp(),
       };
     }
@@ -2109,7 +2109,7 @@ export function createInteriorAndTransitSystem({
             kind: "exit_building",
             id: activeRoom.roomId,
             label: "Exit",
-            keyHint: "F",
+            keyHint: "E",
             execute: () => exitBuilding(),
           };
         }
@@ -2134,7 +2134,7 @@ export function createInteriorAndTransitSystem({
             kind: hs.kind,
             id: `${activeRoom.roomId}:${hs.id}`,
             label: hs.label,
-            keyHint: "F",
+            keyHint: "E",
             execute: () => {
               if (hs.kind === "sit" && hs.seatTarget) {
                 return sitAt(hs.seatTarget);
@@ -2188,7 +2188,7 @@ export function createInteriorAndTransitSystem({
             kind: "board_vehicle",
             id: c.rideId,
             label: `Board ${vName}`,
-            keyHint: "F",
+            keyHint: "E",
             execute: () => boardVehicle(c.rideId, 0),
           };
         }
@@ -2231,7 +2231,7 @@ export function createInteriorAndTransitSystem({
           kind: "enter_building",
           id: ent.id,
           label: `Enter ${shortBld}`,
-          keyHint: "F",
+          keyHint: "E",
           execute: () => enterBuilding(ent.id, { x: wx, z: wz, yaw, pitch }),
         };
       }
@@ -2262,7 +2262,7 @@ export function createInteriorAndTransitSystem({
           kind: "interactive_creation",
           id: ent.id,
           label: `${verb} ${shortTitle}`,
-          keyHint: "F",
+          keyHint: "E",
           execute: () => ({
             ok: true,
             creation: ent.data,
@@ -2293,7 +2293,7 @@ export function createInteriorAndTransitSystem({
           kind: "sit",
           id: pr.id || `prop-${pr.kind}`,
           label: "Sit",
-          keyHint: "F",
+          keyHint: "E",
           execute: () => sitAt(buildOutdoorPropSeatTarget(pr)),
         };
       }
